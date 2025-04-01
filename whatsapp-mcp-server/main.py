@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
+from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 from whatsapp import (
@@ -12,6 +13,10 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message
 )
+
+class DateRange(BaseModel):
+    start: datetime
+    end: datetime
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -28,7 +33,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
 
 @mcp.tool()
 def list_messages(
-    date_range: Optional[Tuple[datetime, datetime]] = None,
+    date_range: Optional[DateRange] = None,
     sender_phone_number: Optional[str] = None,
     chat_jid: Optional[str] = None,
     query: Optional[str] = None,
@@ -52,7 +57,7 @@ def list_messages(
         context_after: Number of messages to include after each match (default 1)
     """
     messages = whatsapp_list_messages(
-        date_range=date_range,
+        date_range=(date_range.start, date_range.end) if date_range else None,
         sender_phone_number=sender_phone_number,
         chat_jid=chat_jid,
         query=query,
