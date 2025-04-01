@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
