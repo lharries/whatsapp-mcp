@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP # type: ignore
 from datetime import datetime
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
