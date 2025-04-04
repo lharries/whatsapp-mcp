@@ -1,3 +1,5 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+.DS_Store
+**/.DS_Store
