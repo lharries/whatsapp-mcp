@@ -409,7 +409,7 @@ with tab1:
         """.format(len(filtered_df)), unsafe_allow_html=True)
     
     with col2:
-        my_number = '971566136280'
+        my_number = ''
         sent_messages = filtered_df[filtered_df['sender'] == my_number].shape[0]
         
         # Update sender display names
