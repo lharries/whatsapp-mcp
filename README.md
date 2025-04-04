@@ -2,13 +2,15 @@
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
-With this you can search you personal Whatsapp messages, search your contacts and send messages.
+With this you can search you personal Whatsapp messages, search your contacts and send messages to either individuals or groups.
 
 It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
 
 Here's an example of what you can do when it's connected to Claude.
 
 ![WhatsApp MCP](./example-use.png)
+
+> To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
 
 ## Installation
 
@@ -41,7 +43,7 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
-3. **Connect to the the MCP server**
+3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
 
@@ -49,10 +51,10 @@ Here's an example of what you can do when it's connected to Claude.
    {
      "mcpServers": {
        "whatsapp": {
-         "command": "{{PATH}}/.local/bin/uv", // Run `which uv` and place the output here
+         "command": "{{PATH_TO_UV}}", // Run `which uv` and place the output here
          "args": [
            "--directory",
-           "{{PATH}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
+           "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
            "run",
            "main.py"
          ]
@@ -78,6 +80,27 @@ Here's an example of what you can do when it's connected to Claude.
    Open Claude Desktop and you should now see WhatsApp as an available integration.
 
    Or restart Cursor.
+
+### Windows Compatibility
+
+If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
+
+#### Steps to get it working:
+
+1. **Install a C compiler**  
+   We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
+   → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
+
+2. **Enable CGO and run the app**  
+
+   ```bash
+   cd whatsapp-bridge
+   go env -w CGO_ENABLED=1
+   go run main.go
+   ```
+
+Without this setup, you'll likely run into errors like:
+> `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
 ## Architecture Overview
 

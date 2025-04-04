@@ -150,17 +150,29 @@ def get_message_context(
     return context
 
 @mcp.tool()
-def send_message(phone_number: str, message: str) -> Dict[str, Any]:
-    """Send a WhatsApp message to the specified phone number.
-    
+def send_message(
+    recipient: str,
+    message: str
+) -> Dict[str, Any]:
+    """Send a WhatsApp message to a person or group. For group chats use the JID.
+
     Args:
-        phone_number: The recipient's phone number, with country code but no + or other symbols
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
     
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_send_message(phone_number, message)
+    # Validate input
+    if not recipient:
+        return {
+            "success": False,
+            "message": "Recipient must be provided"
+        }
+    
+    # Call the whatsapp_send_message function with the unified recipient parameter
+    success, status_message = whatsapp_send_message(recipient, message)
     return {
         "success": success,
         "message": status_message

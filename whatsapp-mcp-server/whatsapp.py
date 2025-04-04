@@ -662,20 +662,25 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(phone_number: str, message: str) -> Tuple[bool, str]:
-    """Send a WhatsApp message to the specified phone number.
+def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+    """Send a WhatsApp message to the specified recipient. For group messages use the JID.
     
     Args:
-        phone_number (str): The recipient's phone number, with country code but no + or other symbols
-        message (str): The message text to send
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us").
+        message: The message text to send
         
     Returns:
         Tuple[bool, str]: A tuple containing success status and a status message
     """
     try:
+        # Validate input
+        if not recipient:
+            return False, "Recipient must be provided"
+        
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
-            "phone": phone_number,
+            "recipient": recipient,
             "message": message
         }
         
