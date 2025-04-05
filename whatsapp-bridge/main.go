@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
@@ -226,6 +227,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 func startRESTServer(client *whatsmeow.Client, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		// Endpoint: POST /api/send
+		// Description: Sends a WhatsApp message to a recipient.
+		// Request Body: JSON with "recipient" (string) and "message" (string).
+		// Response: JSON with "success" (bool) and "message" (string).
+		// Example: {"recipient": "1234567890", "message": "Hello, World!"}
+
 		// Only allow POST requests
 		fmt.Println("Received request to send message")
 		if r.Method != http.MethodPost {
@@ -272,6 +279,82 @@ func startRESTServer(client *whatsmeow.Client, port int) {
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
+		}
+	}()
+}
+
+// WebSocket upgrader
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins (adjust as needed for security)
+	},
+}
+
+// Start a WebSocket server to stream new messages
+func startWebSocketServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/ws/messages", func(w http.ResponseWriter, r *http.Request) {
+		// Upgrade HTTP connection to WebSocket
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Printf("WebSocket upgrade error: %v\n", err)
+			return
+		}
+		defer conn.Close()
+
+		// Channel to signal when the connection is closed
+		closeChan := make(chan struct{})
+
+		// Listen for new messages and send them to the WebSocket client
+		client.AddEventHandler(func(evt interface{}) {
+			select {
+			case <-closeChan:
+				// Stop processing events if the connection is closed
+				return
+			default:
+				// Process events
+				switch v := evt.(type) {
+				case *events.Message:
+					content := extractTextContent(v.Message)
+					if content == "" {
+						return // Skip non-text messages
+					}
+
+					message := Message{
+						Time:     v.Info.Timestamp,
+						Sender:   v.Info.Sender.User,
+						Content:  content,
+						IsFromMe: v.Info.IsFromMe,
+					}
+
+					// Send the message as JSON to the WebSocket client
+					err := conn.WriteJSON(message)
+					if err != nil {
+						fmt.Printf("WebSocket write error: %v\n", err)
+						closeChan <- struct{}{}
+						return
+					}
+				}
+			}
+		})
+
+		// Handle WebSocket connection closure
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				fmt.Printf("WebSocket connection closed: %v\n", err)
+				closeChan <- struct{}{}
+				break
+			}
+		}
+	})
+
+	// Start the WebSocket server
+	serverAddr := fmt.Sprintf(":%d", port)
+	fmt.Printf("Starting WebSocket server on %s...\n", serverAddr)
+
+	go func() {
+		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+			fmt.Printf("WebSocket server error: %v\n", err)
 		}
 	}()
 }
@@ -397,6 +480,9 @@ func main() {
 
 	// Start REST API server
 	startRESTServer(client, 8080)
+
+	// Start WebSocket server for real-time message streaming
+	startWebSocketServer(client, messageStore, 8081)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
