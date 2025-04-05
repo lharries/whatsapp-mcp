@@ -1,17 +1,35 @@
 import websocket
 import json
 import time
+from whatsapp import send_message  # Import the send_message function
+
+DEFAULT_CONTACT = "912266006022"
+DEFAULT_MESSAGE = "hi"
+current_contact = DEFAULT_CONTACT
 
 def on_message(ws, message):
     try:
         # Parse the incoming message
         data = json.loads(message)
+        sender = data.get("Sender")
+        content = data.get("Content")
+        is_from_me = data.get("IsFromMe")
+
         print(f"New message received:")
         print(f"Time: {data['Time']}")
-        print(f"Sender: {data['Sender']}")
-        print(f"Content: {data['Content']}")
-        print(f"IsFromMe: {data['IsFromMe']}")
+        print(f"Sender: {sender}")
+        print(f"Content: {content}")
+        print(f"IsFromMe: {is_from_me}")
         print("-" * 40)
+
+        # If the message is from the current contact and not from us, prompt for a response
+        if sender == current_contact and not is_from_me:
+            new_message = input("Enter your response: ")
+            success, status = send_message(current_contact, new_message)
+            if success:
+                print("Message sent successfully!")
+            else:
+                print(f"Failed to send message: {status}")
     except json.JSONDecodeError:
         print("Failed to decode message:", message)
 
@@ -25,6 +43,12 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     print("Connected to WebSocket server. Listening for new messages...")
+    # Send the default message to the default contact
+    success, status = send_message(DEFAULT_CONTACT, DEFAULT_MESSAGE)
+    if success:
+        print(f"Default message sent to {DEFAULT_CONTACT}: {DEFAULT_MESSAGE}")
+    else:
+        print(f"Failed to send default message: {status}")
 
 def connect_to_websocket():
     ws_url = "ws://localhost:8081/ws/messages"  # Update the URL if needed

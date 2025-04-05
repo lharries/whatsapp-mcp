@@ -292,6 +292,19 @@ var upgrader = websocket.Upgrader{
 
 // Start a WebSocket server to stream new messages
 func startWebSocketServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	restartChan := make(chan struct{}) // Channel to signal WebSocket restart
+
+	go func() {
+		for {
+			select {
+			case <-restartChan:
+				fmt.Println("Restarting WebSocket server...")
+				startWebSocketServer(client, messageStore, port) // Restart WebSocket server
+				return
+			}
+		}
+	}()
+
 	http.HandleFunc("/ws/messages", func(w http.ResponseWriter, r *http.Request) {
 		// Upgrade HTTP connection to WebSocket
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -331,6 +344,7 @@ func startWebSocketServer(client *whatsmeow.Client, messageStore *MessageStore, 
 					if err != nil {
 						fmt.Printf("WebSocket write error: %v\n", err)
 						closeChan <- struct{}{}
+						restartChan <- struct{}{} // Signal to restart WebSocket server
 						return
 					}
 				}
@@ -343,6 +357,7 @@ func startWebSocketServer(client *whatsmeow.Client, messageStore *MessageStore, 
 			if err != nil {
 				fmt.Printf("WebSocket connection closed: %v\n", err)
 				closeChan <- struct{}{}
+				restartChan <- struct{}{} // Signal to restart WebSocket server
 				break
 			}
 		}
@@ -355,6 +370,7 @@ func startWebSocketServer(client *whatsmeow.Client, messageStore *MessageStore, 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
 			fmt.Printf("WebSocket server error: %v\n", err)
+			restartChan <- struct{}{} // Signal to restart WebSocket server
 		}
 	}()
 }
