@@ -2,7 +2,7 @@
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
-With this you can search you personal Whatsapp messages, search your contacts and send messages to either individuals or groups.
+With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
 It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
 
@@ -20,6 +20,7 @@ Here's an example of what you can do when it's connected to Claude.
 - Python 3.6+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
 
 ### Steps
 
@@ -51,10 +52,10 @@ Here's an example of what you can do when it's connected to Claude.
    {
      "mcpServers": {
        "whatsapp": {
-         "command": "{{PATH}}/.local/bin/uv", // Run `which uv` and place the output here
+         "command": "{{PATH_TO_UV}}", // Run `which uv` and place the output here
          "args": [
            "--directory",
-           "{{PATH}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
+           "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
            "run",
            "main.py"
          ]
@@ -91,7 +92,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
    → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
 
-2. **Enable CGO and run the app**  
+2. **Enable CGO and run the app**
 
    ```bash
    cd whatsapp-bridge
@@ -100,6 +101,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```
 
 Without this setup, you'll likely run into errors like:
+
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
 ## Architecture Overview
@@ -132,7 +134,28 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number
+- **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
+- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **download_media**: Download media from a WhatsApp message and get the local file path
+
+### Media Handling Features
+
+The MCP server supports both sending and receiving various media types:
+
+#### Media Sending
+
+You can send various media types to your WhatsApp contacts:
+
+- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type.
+- **Voice Messages**: Use the `send_audio_message` tool to send audio files as playable WhatsApp voice messages.
+  - For optimal compatibility, audio files should be in `.ogg` Opus format.
+  - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
+  - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
+
+#### Media Downloading
+
+By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
 ## Technical Details
 
