@@ -38,6 +38,14 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+type Contact struct {
+	JID         string `json:"jid"`
+	PhoneNumber string `json:"phone"`
+	Name        string `json:"name,omitempty"`
+}
+
+var logger = waLog.Stdout("Client", "INFO", true)
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -185,6 +193,18 @@ type SendMessageRequest struct {
 
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string) (bool, string) {
+	if client == nil {
+		return false, "WhatsApp client not initialized"
+	}
+
+	if recipient == "" {
+		return false, "Recipient cannot be empty"
+	}
+
+	if message == "" {
+		return false, "Message cannot be empty"
+	}
+
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -224,56 +244,91 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, port int) {
-	// Handler for sending messages
+	if client == nil {
+		logger.Errorf("Cannot start REST server: WhatsApp client not initialized")
+		return
+	}
+
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		fmt.Println("Received request to send message")
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" || req.Message == "" {
-			http.Error(w, "Recipient and message are required", http.StatusBadRequest)
-			return
-		}
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
+		handleSendMessage(w, r, client, logger)
+	})
+	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		handleGetContacts(w, r, client, logger)
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	addr := fmt.Sprintf(":%d", port)
+	fmt.Printf("Starting REST server on %s...\n", addr)
 
-	// Run server in a goroutine so it doesn't block
-	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+	server := &http.Server{
+		Addr:         addr,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Errorf("Error starting REST server: %v\n", err)
+	}
+}
+
+func handleGetContacts(w http.ResponseWriter, r *http.Request, client *whatsmeow.Client, logger waLog.Logger) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !client.IsConnected() {
+		http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
+		return
+	}
+
+	query := r.URL.Query().Get("query")
+	contacts := []Contact{}
+
+	// Access the contact store directly
+	contactStore := client.Store.Contacts
+	if contactStore == nil {
+		http.Error(w, "Contact store not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Get all contacts
+	allContacts, err := contactStore.GetAllContacts()
+	if err != nil {
+		http.Error(w, "Failed to get contacts", http.StatusInternalServerError)
+		return
+	}
+	for jid, contact := range allContacts {
+		if jid.Server != "s.whatsapp.net" { // Only individual contacts
+			continue
 		}
-	}()
+		name := contact.FullName
+		if name == "" {
+			name = contact.PushName
+		}
+		if name == "" {
+			name = jid.User
+		}
+
+		if query != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(query)) &&
+			!strings.Contains(jid.User, query) {
+			continue
+		}
+
+		contacts = append(contacts, Contact{
+			JID:         jid.String(),
+			PhoneNumber: jid.User,
+			Name:        name,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"contacts": contacts,
+	}); err != nil {
+		logger.Errorf("Failed to encode contacts response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 func main() {
@@ -410,6 +465,65 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+func handleSendMessage(w http.ResponseWriter, r *http.Request, client *whatsmeow.Client, logger waLog.Logger) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		Recipient string `json:"recipient"`
+		Message   string `json:"message"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	recipient, err := types.ParseJID(request.Recipient)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid recipient JID: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	msg := &waProto.Message{
+		Conversation: proto.String(request.Message),
+	}
+
+	maxRetries := 3
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(time.Second * time.Duration(i))
+			logger.Infof("Retrying message send (attempt %d/%d)...", i+1, maxRetries)
+		}
+
+		_, err = client.SendMessage(context.Background(), recipient, msg)
+		if err == nil {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Message sent successfully",
+			})
+			return
+		}
+
+		lastErr = err
+		if strings.Contains(err.Error(), "usync query") {
+			continue
+		}
+		break
+	}
+
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"message": fmt.Sprintf("Error sending message: %v", lastErr),
+	})
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

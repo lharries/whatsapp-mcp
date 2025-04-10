@@ -435,46 +435,55 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number, falling back to WhatsApp API."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+        search_pattern = f'%{query}%'
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
+            SELECT DISTINCT jid, name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
         
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
+        contacts = [
+            Contact(
                 phone_number=contact_data[0].split('@')[0],
                 name=contact_data[1],
                 jid=contact_data[0]
             )
-            result.append(contact)
-            
-        return result
+            for contact_data in cursor.fetchall()
+        ]
+        
+        # If no results, query the Go bridge
+        if not contacts:
+            response = requests.get(f"{WHATSAPP_API_BASE_URL}/contacts", params={"query": query})
+            if response.status_code == 200:
+                api_contacts = response.json().get("contacts", [])
+                contacts.extend([
+                    Contact(
+                        phone_number=c.get("phone"),
+                        name=c.get("name"),
+                        jid=c.get("jid")
+                    )
+                    for c in api_contacts
+                ])
+        
+        return contacts
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
+    except requests.RequestException as e:
+        print(f"API error: {e}")
+        return []
     finally:
         if 'conn' in locals():
             conn.close()
-
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
@@ -663,39 +672,21 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             conn.close()
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
-    """Send a WhatsApp message to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us").
-        message: The message text to send
-        
-    Returns:
-        Tuple[bool, str]: A tuple containing success status and a status message
-    """
+    """Send a WhatsApp message to the specified recipient (JID expected)."""
     try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
+        if not recipient.endswith(("@s.whatsapp.net", "@g.us")):
+            return False, "Recipient must be a valid JID"
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "message": message
-        }
+        payload = {"recipient": recipient, "message": message}
         
         response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"

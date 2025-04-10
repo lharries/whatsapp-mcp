@@ -15,6 +15,7 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -22,9 +23,27 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     
     Args:
         query: Search term to match against contact names or phone numbers
+    Returns:
+        List of contacts with name, phone_number, and jid
     """
-    contacts = whatsapp_search_contacts(query)
-    return contacts
+    try:
+        # First, try local database (existing implementation)
+        contacts = whatsapp_search_contacts(query)
+        
+        # If no results or partial results, query the Go bridge for all contacts
+        if not contacts:
+            response = requests.get(f"{WHATSAPP_API_BASE_URL}/contacts", params={"query": query})
+            if response.status_code == 200:
+                api_contacts = response.json().get("contacts", [])
+                contacts.extend([
+                    {"name": c.get("name"), "phone_number": c.get("phone"), "jid": c.get("jid")}
+                    for c in api_contacts
+                ])
+        
+        return contacts
+    except Exception as e:
+        print(f"Error in search_contacts: {e}")
+        return []
 
 @mcp.tool()
 def list_messages(
@@ -150,33 +169,51 @@ def get_message_context(
     return context
 
 @mcp.tool()
-def send_message(
-    recipient: str,
-    message: str
-) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+def send_message(recipient: str, message: str) -> Dict[str, Any]:
+    """Send a WhatsApp message to a person or group. Supports name, phone number, or JID.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        recipient: The recipient - either a contact name, phone number (country code, no +), 
+                  or JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us")
         message: The message text to send
     
     Returns:
         A dictionary containing success status and a status message
     """
-    # Validate input
     if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
+        return {"success": False, "message": "Recipient must be provided"}
+
+    # Check if recipient is already a JID
+    if recipient.endswith(("@s.whatsapp.net", "@g.us")):
+        success, status_message = whatsapp_send_message(recipient, message)
+        return {"success": success, "message": status_message}
+
+    # Try to resolve as a phone number
+    if recipient.isdigit():
+        jid = f"{recipient}@s.whatsapp.net"
+        success, status_message = whatsapp_send_message(jid, message)
+        return {"success": success, "message": status_message}
+
+    # Try to resolve as a contact name
+    contacts = search_contacts(recipient)
+    if not contacts:
+        return {"success": False, "message": f"No contact found for '{recipient}'"}
     
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    # Filter for exact or best match (case-insensitive)
+    matching_contacts = [c for c in contacts if c.get("name", "").lower() == recipient.lower()]
+    if not matching_contacts and contacts:
+        matching_contacts = [contacts[0]]  # Fallback to first match if no exact match
+    
+    if len(matching_contacts) > 1:
+        return {"success": False, "message": f"Multiple contacts found for '{recipient}'. Please use phone number or JID."}
+    
+    contact = matching_contacts[0]
+    jid = contact.get("jid")
+    if not jid:
+        return {"success": False, "message": f"No JID available for contact '{recipient}'"}
+    
+    success, status_message = whatsapp_send_message(jid, message)
+    return {"success": success, "message": status_message}
 
 if __name__ == "__main__":
     # Initialize and run the server
