@@ -31,6 +31,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Default data directory - can be overridden with DATA_DIR env var
+var dataDir = "/data" // Default for container
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -49,12 +52,14 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	storePath := filepath.Join(dataDir, "store")
+	if err := os.MkdirAll(storePath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	dbPath := fmt.Sprintf("file:%s/messages.db?_foreign_keys=on", storePath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -562,7 +567,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	storePath := filepath.Join(dataDir, "store")
+	chatDir := fmt.Sprintf("%s/%s", storePath, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -775,7 +781,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Listen only on localhost within the container for security
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -787,6 +794,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	// Check for environment variable override for data directory
+	if envDir := os.Getenv("DATA_DIR"); envDir != "" {
+		dataDir = envDir
+	}
+	fmt.Printf("Using data directory: %s\n", dataDir)
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -795,12 +808,14 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	storePath := filepath.Join(dataDir, "store")
+	if err := os.MkdirAll(storePath, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	containerDbPath := fmt.Sprintf("file:%s/whatsapp.db?_foreign_keys=on", storePath)
+	container, err := sqlstore.New("sqlite3", containerDbPath, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return

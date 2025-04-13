@@ -7,8 +7,10 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+# Updated path to use the container's volume path
+MESSAGES_DB_PATH = "/data/store/messages.db"
+# Ensure API points to the internal localhost address
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
 
 @dataclass
 class Message:
