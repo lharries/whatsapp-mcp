@@ -1,0 +1,7 @@
+# Add patterns (like .gitignore) to exclude files or folders from llm-full.md
+# Each pattern should be on a new line.
+# Lines starting with # are comments.
+# Examples:
+# node_modules/
+# *.log
+# specific_file_to_ignore.txt

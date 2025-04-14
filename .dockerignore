@@ -1,0 +1,29 @@
+# Git files
+.git
+.gitignore
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Local data/config (should use volume)
+whatsapp-bridge/store/
+whatsapp-bridge/*.db
+whatsapp-bridge/whatsapp.log
+claude_desktop_config.json
+
+# Python cache/build files
+whatsapp-mcp-server/__pycache__/
+whatsapp-mcp-server/*.py[oc]
+whatsapp-mcp-server/.venv
+whatsapp-mcp-server/build/
+whatsapp-mcp-server/dist/
+whatsapp-mcp-server/wheels/
+whatsapp-mcp-server/*.egg-info
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Example image (if present)
+example-use.png

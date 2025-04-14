@@ -18,7 +18,6 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal"
 
 	"bytes"
 
@@ -30,6 +29,9 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// Default data directory - can be overridden with DATA_DIR env var
+var dataDir = "/data" // Default for container
 
 // Message represents a chat message for our client
 type Message struct {
@@ -49,12 +51,14 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	storePath := filepath.Join(dataDir, "store")
+	if err := os.MkdirAll(storePath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	dbPath := fmt.Sprintf("file:%s/messages.db?_foreign_keys=on", storePath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -83,6 +87,11 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS control_state (
+			key TEXT PRIMARY KEY,
+			value TEXT
 		);
 	`)
 	if err != nil {
@@ -170,6 +179,25 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// Get a value from the control_state table
+func (store *MessageStore) GetControlState(key string) (string, error) {
+	var value string
+	err := store.db.QueryRow("SELECT value FROM control_state WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil // No value set yet
+	}
+	return value, err
+}
+
+// Set a value in the control_state table
+func (store *MessageStore) SetControlState(key, value string) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO control_state (key, value) VALUES (?, ?)",
+		key, value,
+	)
+	return err
 }
 
 // Extract text content from a message
@@ -562,7 +590,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	storePath := filepath.Join(dataDir, "store")
+	chatDir := fmt.Sprintf("%s/%s", storePath, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -774,8 +803,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Add a health check endpoint
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{
+			"healthy": true,
+		})
+	})
+
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Listen on all interfaces instead of just localhost for container communication
+	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -787,6 +825,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	// Check for environment variable override for data directory
+	if envDir := os.Getenv("DATA_DIR"); envDir != "" {
+		dataDir = envDir
+	}
+	fmt.Printf("Using data directory: %s\n", dataDir)
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -795,12 +839,14 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	storePath := filepath.Join(dataDir, "store")
+	if err := os.MkdirAll(storePath, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	containerDbPath := fmt.Sprintf("file:%s/whatsapp.db?_foreign_keys=on", storePath)
+	container, err := sqlstore.New("sqlite3", containerDbPath, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -834,6 +880,20 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Initialize default state in control_state table
+	err = messageStore.SetControlState("connect_requested", "false")
+	if err != nil {
+		logger.Warnf("Failed to initialize connect_requested state: %v", err)
+	}
+	err = messageStore.SetControlState("connection_status", "disconnected")
+	if err != nil {
+		logger.Warnf("Failed to initialize connection_status state: %v", err)
+	}
+	err = messageStore.SetControlState("qr_code", "")
+	if err != nil {
+		logger.Warnf("Failed to initialize qr_code state: %v", err)
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -847,79 +907,98 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Update status in database
+			err := messageStore.SetControlState("connection_status", "connected")
+			if err != nil {
+				logger.Warnf("Failed to update connection status: %v", err)
+			}
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			// Update status in database
+			err := messageStore.SetControlState("connection_status", "disconnected")
+			if err != nil {
+				logger.Warnf("Failed to update connection status: %v", err)
+			}
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start REST API server - still needed for sending/downloading after connection
+	startRESTServer(client, messageStore, 8080)
 
-	// Connect to WhatsApp
-	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
+	// Main control loop goroutine
+	go func() {
+		connTicker := time.NewTicker(1 * time.Second) // Check every second
+		defer connTicker.Stop()
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		for {
+			select {
+			case <-connTicker.C:
+				// Get current connection state
+				connectRequested, err := messageStore.GetControlState("connect_requested")
+				if err != nil {
+					logger.Warnf("Failed to get connect_requested state: %v", err)
+					continue
+				}
+
+				connectionStatus, err := messageStore.GetControlState("connection_status")
+				if err != nil {
+					logger.Warnf("Failed to get connection_status state: %v", err)
+					continue
+				}
+
+				// Check if connection is requested and we're not already connected
+				if connectRequested == "true" && (connectionStatus == "disconnected" || connectionStatus == "error") {
+					// Update status to connecting
+					err := messageStore.SetControlState("connection_status", "connecting")
+					if err != nil {
+						logger.Warnf("Failed to update connection status: %v", err)
+					}
+					logger.Infof("Connection requested, attempting to connect...")
+
+					// Start connection in a separate goroutine
+					go connectToWhatsApp(client, messageStore, logger)
+				} else if connectRequested == "false" && (connectionStatus == "connected" ||
+					connectionStatus == "connecting" || connectionStatus == "needs_qr") {
+					// Disconnect requested
+					err := messageStore.SetControlState("connection_status", "disconnecting")
+					if err != nil {
+						logger.Warnf("Failed to update connection status: %v", err)
+					}
+
+					logger.Infof("Disconnect requested, disconnecting...")
+					client.Disconnect()
+
+					err = messageStore.SetControlState("connection_status", "disconnected")
+					if err != nil {
+						logger.Warnf("Failed to update connection status: %v", err)
+					}
+					err = messageStore.SetControlState("qr_code", "")
+					if err != nil {
+						logger.Warnf("Failed to clear QR code: %v", err)
+					}
+
+					logger.Infof("Disconnected from WhatsApp")
+				}
 			}
 		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
-	}
-
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	}()
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	fmt.Println("WhatsApp bridge is running. Waiting for connection request.")
+	logger.Infof("WhatsApp bridge ready. To connect, call connect_whatsapp() from the MCP server.")
 
 	// Wait for termination signal
 	<-exitChan
 
-	fmt.Println("Disconnecting...")
+	fmt.Println("Received termination signal, shutting down...")
 	// Disconnect client
-	client.Disconnect()
+	if client.IsConnected() {
+		client.Disconnect()
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -1164,17 +1243,39 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	// Ensure we have initialized destination to send to
+	destination := types.JID{
+		Server: "s.whatsapp.net",
+		User:   "status",
+	}
+
+	// Add a safety check and sleep to ensure the connection is fully established
+	// Sometimes the client's internal state might not be fully initialized yet
+	time.Sleep(3 * time.Second)
+
+	// Create a variable for the history message
+	var historyMsg *waProto.Message
+
+	// Try with additional safety
+	func() {
+		// Use a deferred recover to prevent panics
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recovered from panic in BuildHistorySyncRequest: %v\n", r)
+				historyMsg = nil
+			}
+		}()
+
+		// Build history sync request with nil (proper parameter type)
+		historyMsg = client.BuildHistorySyncRequest(nil, 100)
+	}()
+
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		fmt.Println("Failed to build history sync request, skipping history sync.")
 		return
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
+	_, err := client.SendMessage(context.Background(), destination, historyMsg)
 
 	if err != nil {
 		fmt.Printf("Failed to request history sync: %v\n", err)
@@ -1345,4 +1446,106 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// Function to handle the WhatsApp connection process
+func connectToWhatsApp(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	// Check if we have an existing session
+	if client.Store.ID == nil {
+		// No existing session, need to pair with phone via QR code
+		qrChan, _ := client.GetQRChannel(context.Background())
+
+		// Start the connection
+		err := client.Connect()
+		if err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			// Update control state to indicate error
+			messageStore.SetControlState("connection_status", "error")
+			messageStore.SetControlState("connection_error", fmt.Sprintf("Failed to connect: %v", err))
+			return
+		}
+
+		// Wait for QR code or successful connection
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				logger.Infof("Got QR code, waiting for scan...")
+				// Store the QR code in the database
+				err := messageStore.SetControlState("qr_code", evt.Code)
+				if err != nil {
+					logger.Warnf("Failed to store QR code: %v", err)
+				}
+				// Update connection status
+				err = messageStore.SetControlState("connection_status", "needs_qr")
+				if err != nil {
+					logger.Warnf("Failed to update connection status: %v", err)
+				}
+			} else if evt.Event == "timeout" {
+				// QR code scanning timed out
+				logger.Warnf("QR code scanning timed out")
+				err := messageStore.SetControlState("connection_status", "error")
+				if err != nil {
+					logger.Warnf("Failed to update connection status: %v", err)
+				}
+				err = messageStore.SetControlState("connection_error", "QR code scanning timed out")
+				if err != nil {
+					logger.Warnf("Failed to update connection error: %v", err)
+				}
+				err = messageStore.SetControlState("qr_code", "")
+				if err != nil {
+					logger.Warnf("Failed to clear QR code: %v", err)
+				}
+				return
+			} else if evt.Event == "success" {
+				// Successfully connected
+				logger.Infof("Successfully connected and authenticated!")
+				err := messageStore.SetControlState("connection_status", "connected")
+				if err != nil {
+					logger.Warnf("Failed to update connection status: %v", err)
+				}
+				err = messageStore.SetControlState("qr_code", "")
+				if err != nil {
+					logger.Warnf("Failed to clear QR code: %v", err)
+				}
+				break
+			}
+		}
+
+		// Wait for connection to stabilize
+		time.Sleep(2 * time.Second)
+
+		if !client.IsConnected() {
+			logger.Errorf("Failed to establish stable connection")
+			messageStore.SetControlState("connection_status", "error")
+			messageStore.SetControlState("connection_error", "Failed to establish stable connection")
+			return
+		}
+
+		// Attempt to sync history after successful connection
+		requestHistorySync(client)
+	} else {
+		// Already have a session, just connect
+		err := client.Connect()
+		if err != nil {
+			logger.Errorf("Failed to connect with existing session: %v", err)
+			// Update control state to indicate error
+			messageStore.SetControlState("connection_status", "error")
+			messageStore.SetControlState("connection_error", fmt.Sprintf("Failed to connect with existing session: %v", err))
+			return
+		}
+
+		// Wait for connection to stabilize
+		time.Sleep(2 * time.Second)
+
+		if client.IsConnected() {
+			logger.Infof("Successfully connected with existing session!")
+			messageStore.SetControlState("connection_status", "connected")
+
+			// Attempt to sync history after successful connection
+			requestHistorySync(client)
+		} else {
+			logger.Errorf("Failed to establish stable connection with existing session")
+			messageStore.SetControlState("connection_status", "error")
+			messageStore.SetControlState("connection_error", "Failed to establish stable connection with existing session")
+		}
+	}
 }

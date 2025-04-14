@@ -1,5 +1,8 @@
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
+import time
+import requests
+import sys
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -12,11 +15,46 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_control_state as whatsapp_get_control_state,
+    set_control_state as whatsapp_set_control_state
 )
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+def check_bridge_health(max_attempts=30, delay=1):
+    """Check if the WhatsApp bridge is up and healthy
+    
+    Args:
+        max_attempts: Maximum number of attempts to connect to bridge
+        delay: Delay between attempts in seconds
+    
+    Returns:
+        bool: True if bridge is healthy, False otherwise
+    """
+    print("Checking WhatsApp bridge health...")
+    for attempt in range(max_attempts):
+        try:
+            # Try to connect to the health endpoint
+            response = requests.get("http://localhost:8080/api/health", timeout=2)
+            if response.status_code == 200 and response.json().get("healthy", False):
+                print(f"WhatsApp bridge is healthy after {attempt+1} attempts")
+                return True
+        except requests.RequestException as e:
+            print(f"Bridge health check attempt {attempt+1}/{max_attempts} failed: {e}")
+        
+        time.sleep(delay)
+    
+    print("Failed to connect to WhatsApp bridge after maximum attempts")
+    return False
+
+# Check if the bridge is running before continuing
+if not check_bridge_health():
+    print("ERROR: Could not connect to WhatsApp bridge API. Exiting...")
+    sys.exit(1)
+
+print("WhatsApp bridge is available, continuing...")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -244,6 +282,136 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         return {
             "success": False,
             "message": "Failed to download media"
+        }
+
+@mcp.tool()
+def connect_whatsapp() -> Dict[str, Any]:
+    """Initiate the WhatsApp connection process. 
+    
+    This will start the connection process in the WhatsApp bridge service. If a new login is required, 
+    the tool will return a QR code that needs to be scanned with the WhatsApp mobile app.
+    If a session already exists, the connection will be established automatically.
+    
+    Returns:
+        A dictionary containing the connection status and additional information like QR code if required
+    """
+    # Set the connect_requested flag to true
+    if not whatsapp_set_control_state("connect_requested", "true"):
+        return {
+            "status": "error",
+            "message": "Failed to set connection request flag"
+        }
+    
+    # Poll the connection status for up to 60 seconds
+    max_attempts = 30
+    attempt = 0
+    
+    while attempt < max_attempts:
+        status = whatsapp_get_control_state("connection_status")
+        
+        if status == "needs_qr":
+            # QR code is available, return it
+            qr_code = whatsapp_get_control_state("qr_code")
+            return {
+                "status": "needs_qr",
+                "message": "Please scan this QR code with your WhatsApp mobile app",
+                "qr_code": qr_code
+            }
+        elif status == "connected":
+            # Successfully connected
+            return {
+                "status": "connected",
+                "message": "Successfully connected to WhatsApp"
+            }
+        elif status == "error":
+            # Connection failed
+            error_message = whatsapp_get_control_state("connection_error") or "Unknown error occurred"
+            return {
+                "status": "error",
+                "message": f"Connection failed: {error_message}"
+            }
+        elif status == "connecting":
+            # Still connecting, wait and try again
+            attempt += 1
+            time.sleep(2)
+            continue
+        else:
+            # Unexpected status
+            attempt += 1
+            time.sleep(2)
+            continue
+    
+    # If we've reached here, the connection process timed out
+    return {
+        "status": "timeout",
+        "message": "Connection process timed out. Check get_whatsapp_status() for current status."
+    }
+
+@mcp.tool()
+def get_whatsapp_status() -> Dict[str, Any]:
+    """Check the current WhatsApp connection status.
+    
+    Returns:
+        A dictionary containing the current connection status and additional information
+    """
+    status = whatsapp_get_control_state("connection_status")
+    response = {"status": status}
+    
+    # Add additional information based on the status
+    if status == "needs_qr":
+        qr_code = whatsapp_get_control_state("qr_code")
+        response["qr_code"] = qr_code
+        response["message"] = "Please scan this QR code with your WhatsApp mobile app"
+    elif status == "error":
+        error_message = whatsapp_get_control_state("connection_error") or "Unknown error occurred"
+        response["message"] = f"Connection error: {error_message}"
+    elif status == "connected":
+        response["message"] = "Connected to WhatsApp"
+    elif status == "disconnected":
+        response["message"] = "Not connected to WhatsApp"
+    elif status == "connecting":
+        response["message"] = "Connection in progress"
+    else:
+        response["message"] = f"Unknown status: {status}"
+    
+    return response
+
+@mcp.tool()
+def disconnect_whatsapp() -> Dict[str, Any]:
+    """Disconnect from WhatsApp.
+    
+    This will close the current WhatsApp connection if one exists.
+    
+    Returns:
+        A dictionary containing the result of the disconnect request
+    """
+    # Set the connect_requested flag to false to trigger disconnection
+    if not whatsapp_set_control_state("connect_requested", "false"):
+        return {
+            "status": "error",
+            "message": "Failed to set disconnect request flag"
+        }
+    
+    # Give some time for the disconnect to take effect
+    time.sleep(2)
+    
+    # Check the status after disconnect request
+    status = whatsapp_get_control_state("connection_status")
+    
+    if status == "disconnected":
+        return {
+            "status": "success",
+            "message": "Successfully disconnected from WhatsApp"
+        }
+    elif status == "disconnecting":
+        return {
+            "status": "pending",
+            "message": "Disconnect in progress. Use get_whatsapp_status() to check current status."
+        }
+    else:
+        return {
+            "status": status,
+            "message": f"Disconnect requested. Current status: {status}"
         }
 
 if __name__ == "__main__":
