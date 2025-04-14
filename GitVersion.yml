@@ -1,0 +1,35 @@
+mode: Mainline
+major-version-bump-message: '^(breaking|major):'
+minor-version-bump-message: '^(feature|feat|minor):'
+patch-version-bump-message: '^(fix|patch|enhancement|enh|refactor|docs|chore):'
+no-bump-message: '^(none|skip):'
+
+branches:
+  main:
+    regex: ^main$
+    tag: ''
+    increment: Patch
+    is-release-branch: true
+  
+  feature:
+    regex: ^feature/
+    tag: beta-{BranchName}
+    increment: Minor
+    source-branches: ['main']
+
+  enhancement:
+    regex: ^enhancement/
+    tag: beta-{BranchName}
+    increment: Minor
+    source-branches: ['main']
+  
+  hotfix:
+    regex: ^hotfix/
+    tag: beta
+    increment: Patch
+    source-branches: ['main']
+
+ignore:
+  sha: []
+  
+merge-message-formats: {}
