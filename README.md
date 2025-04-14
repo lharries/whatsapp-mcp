@@ -14,7 +14,90 @@ Here's an example of what you can do when it's connected to Claude.
 
 ## Installation
 
-### Prerequisites
+You can set up this project using either the Docker container method (recommended) or by installing the components directly on your system.
+
+### Option 1: Docker Container (Recommended)
+
+Using Docker provides a secure, isolated environment with all dependencies pre-installed, and makes the setup process much simpler.
+
+#### Prerequisites
+- Docker installed on your system
+
+#### Steps
+
+1. **Clone this repository**
+   ```bash
+   git clone https://github.com/lharries/whatsapp-mcp.git
+   cd whatsapp-mcp
+   ```
+
+2. **Build the Docker image**
+   ```bash
+   docker build -t whatsapp-mcp:latest .
+   ```
+
+3. **Create a directory for persistent data**
+   ```bash
+   mkdir -p ~/whatsapp_mcp_data
+   ```
+
+4. **Run the container**
+   ```bash
+   docker run -it --rm \
+     --name whatsapp-mcp-container \
+     -v ~/whatsapp_mcp_data:/data \
+     --user 1001:1001 \
+     --cap-drop=ALL \
+     whatsapp-mcp:latest
+   ```
+
+   The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
+
+5. **Configure Claude Desktop or Cursor**
+
+   For **Claude Desktop**, create or edit `claude_desktop_config.json` in your configuration directory:
+   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+   - Linux: `~/.config/Claude/claude_desktop_config.json`
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "docker",
+         "args": [
+           "run", "-i", "--rm",
+           "--name", "whatsapp-mcp-container-claude",
+           "-v", "/absolute/path/to/your/whatsapp_mcp_data:/data",
+           "--user", "1001:1001",
+           "--cap-drop=ALL",
+           "whatsapp-mcp:latest"
+         ]
+       }
+     }
+   }
+   ```
+
+   For **Cursor**, save a similar configuration as `~/.cursor/mcp.json`
+
+   ⚠️ Important: Replace `/absolute/path/to/your/whatsapp_mcp_data` with the actual absolute path to your data directory (e.g., `/home/username/whatsapp_mcp_data` on Linux or `/Users/username/whatsapp_mcp_data` on macOS).
+
+6. **Restart Claude Desktop / Cursor**
+
+   After restarting, you should now see WhatsApp as an available integration.
+
+#### Security Features
+
+The Docker setup includes several security enhancements:
+- Runs as a non-root user (UID 1001)
+- Drops all Linux capabilities for enhanced security
+- Isolates the application from the host system
+- Uses a multi-stage build to minimize image size
+- Uses `tini` as init process to handle signals properly
+
+### Option 2: Direct Installation
+
+#### Prerequisites
 
 - Go
 - Python 3.6+
@@ -22,7 +105,7 @@ Here's an example of what you can do when it's connected to Claude.
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
 
-### Steps
+#### Steps
 
 1. **Clone this repository**
 
