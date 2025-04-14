@@ -6,7 +6,7 @@
     <title>QR Code Generator</title>
     <style>
         body { display: flex; flex-direction: column; align-items: center; font-family: Arial, sans-serif; }
-        canvas { margin-top: 20px; }
+        #qrCanvas { margin-top: 20px; }
         input { margin: 10px; padding: 5px; }
         button { padding: 5px 10px; }
     </style>
@@ -15,7 +15,7 @@
     <h1>QR Code Generator</h1>
     <input type="text" id="qrInput" placeholder="Enter text to encode">
     <button onclick="generateQR()">Generate QR Code</button>
-    <canvas id="qrCanvas"></canvas>
+    <div id="qrCanvas"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/qr-code-styling@1.6.0-rc.1/lib/qr-code-styling.js"></script>
     <script>
@@ -31,9 +31,9 @@
                 qrOptions: { typeNumber: 0, mode: 'Byte', errorCorrectionLevel: 'Q' }
             });
 
-            const canvas = document.getElementById('qrCanvas');
-            canvas.innerHTML = '';
-            qrCode.append(canvas);
+            const canvasContainer = document.getElementById('qrCanvas');
+            canvasContainer.innerHTML = ''; // Clear previous QR code
+            qrCode.append(canvasContainer);
         }
     </script>
 </body>
