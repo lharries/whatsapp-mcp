@@ -8,11 +8,11 @@
                 "-i",
                 "--rm",
                 "--name",
-                "whatsapp-mcp-container-claude",
+                "whatsapp-mcp",
                 "--user",
                 "1001:1001",
                 "--cap-drop=ALL",
-                "whatsapp-mcp:latest"
+                "ghcr.io/pahventure/pv-mcp-whatsapp:0.3.4"
             ]
         }
     }
