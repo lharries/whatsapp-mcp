@@ -28,7 +28,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Required for GitVersion
 
       - name: Install GitVersion
         uses: gittools/actions/gitversion/setup@v1
@@ -41,135 +41,120 @@ jobs:
         with:
           useConfigFile: true
 
-  build:
-    name: Build and Push Docker Image
+  build-and-push:
+    name: Build and Push Multi-Platform Image
     needs: version
+    runs-on: ubuntu-latest # Always use AMD64 runner for emulation
     permissions:
       contents: read
-      packages: write
-    strategy:
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-22.04-arm64  # Adjust based on actual ARM64 runner label
-      fail-fast: false
-
-    runs-on: ${{ matrix.runner }}
+      packages: write # Needed to push to GHCR
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        # No need for fetch-depth: 0 here unless your Dockerfile needs git history
 
+      # QEMU is needed for multi-platform builds other than the host arch
+      # See: https://github.com/docker/setup-qemu-action
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Buildx is the builder engine needed for multi-platform builds
+      # See: https://github.com/docker/setup-buildx-action
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
 
+      # Login to GitHub Container Registry
+      # See: https://github.com/docker/login-action
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request' # Only login when pushing
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: ${{ matrix.platform }}
-          tags: ghcr.io/${{ github.repository }}:temp-${{ github.run_id }}-${{ matrix.platform }}
-          outputs: type=image,push-by-digest=true
-
-      - name: Export digest
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          echo $digest > "${{ runner.temp }}/digests/${{ matrix.platform }}.txt"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.platform }}
-          path: ${{ runner.temp }}/digests/${{ matrix.platform }}.txt
-          if-no-files-found: error
-          retention-days: 1
-
-  manifest:
-    name: Create Multi-platform Manifest
-    runs-on: ubuntu-latest
-    needs: [version, build]
-    if: github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # Generate tags and labels based on Git version and event
+      # See: https://github.com/docker/metadata-action
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            # Push 'latest' tag only for main branch pushes
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Push semver tags (e.g., v1.2.3)
             type=raw,value=${{ needs.version.outputs.version }}
+            # Push major.minor.patch tag (e.g., 1.2.3)
             type=raw,value=${{ needs.version.outputs.majorMinorPatch }}
+            # Push major.minor tag (e.g., 1.2)
             type=raw,value=${{ needs.version.outputs.majorMinor }}
-          flavor: |
-            latest=auto
-            suffix=${{ inputs.tag_suffix != '' && format('-{0}', inputs.tag_suffix) || '' }}
+            # Add optional suffix from workflow dispatch input
+            suffix=${{ inputs.tag_suffix != '' && format('-{0}', inputs.tag_suffix) || '' }},onlatest=true
 
-      - name: Create and push manifest list
-        run: |
-          AMD64_DIGEST=$(cat ${{ runner.temp }}/digests/digests-linux-amd64/linux/amd64.txt)
-          ARM64_DIGEST=$(cat ${{ runner.temp }}/digests/digests-linux-arm64/linux/arm64.txt)
-          for TAG in ${{ steps.meta.outputs.tags }}; do
-            docker buildx imagetools create -t $TAG \
-              ghcr.io/${{ github.repository }}@$AMD64_DIGEST \
-              ghcr.io/${{ github.repository }}@$ARM64_DIGEST
-          done
+          # Add labels like git sha, repo url etc.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+
+      # Build and push the image for multiple platforms
+      # Buildx automatically creates the manifest list when pushing multiple platforms
+      # See: https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # Only push actual images for non-PR events
+          # For PRs, it will only build and check if it succeeds
+          push: ${{ github.event_name != 'pull_request' }}
+          # Build for both amd64 and arm64 using QEMU emulation on the amd64 runner
+          platforms: linux/amd64,linux/arm64
+          # Use the tags generated by the metadata action
+          tags: ${{ steps.meta.outputs.tags }}
+          # Use the labels generated by the metadata action
+          labels: ${{ steps.meta.outputs.labels }}
+          # Enable build cache for faster builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Generate build provenance (useful for security scanning like SLSA)
+          provenance: true
 
   make-public:
     name: Make Docker Image Public
     runs-on: ubuntu-latest
-    needs: [version, manifest]
-    if: github.ref == 'refs/heads/main'
+    # Depends on the consolidated build-and-push job
+    needs: [version, build-and-push]
+    # Only run on pushes to the main branch, after a successful push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: read
-      packages: write
+      packages: write # Need write permission to change package visibility
     steps:
       - name: Make image public
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const repo = context.repo.owner + '/' + context.repo.repo;
-            const package_name = repo.toLowerCase();
+            const repoFullName = process.env.GITHUB_REPOSITORY;
+            const packageName = repoFullName.toLowerCase(); // GHCR package names are derived from repo name
             try {
-              await github.rest.packages.updatePackageVisibilityForAuthenticatedUser({
+              console.log(`Attempting to set visibility for package: ${packageName}`);
+              await github.rest.packages.setPackageVisibilityForAuthenticatedUser({
                 package_type: 'container',
-                package_name: package_name,
+                package_name: packageName,
                 visibility: 'public'
               });
-              console.log('Package visibility set to public');
+              console.log(`Package '${packageName}' visibility set to public successfully.`);
             } catch (error) {
-              core.setFailed(`Failed to set visibility: ${error.message}`);
+              // Log the specific error, especially if it's a 404 Not Found
+              if (error.status === 404) {
+                console.warn(`Package '${packageName}' not found. It might take a moment for the package to become available after pushing. Error: ${error.message}`);
+                // You might consider adding a small delay and retry here if needed, but often it's just a timing issue
+              } else {
+                core.setFailed(`Failed to set visibility for package '${packageName}': ${error.message}`);
+              }
+              // Optionally, you can choose *not* to fail the workflow for visibility issues
+              // For example, comment out the core.setFailed line above if public visibility is non-critical
             }
