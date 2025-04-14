@@ -9,8 +9,8 @@ import audio
 
 # Updated path to use the container's volume path
 MESSAGES_DB_PATH = "/data/store/messages.db"
-# Ensure API points to the internal localhost address
-WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+# Ensure API points to the internal container address rather than localhost
+WHATSAPP_API_BASE_URL = "http://0.0.0.0:8080/api"
 
 @dataclass
 class Message:
@@ -767,3 +767,59 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def get_control_state(key: str) -> str:
+    """Get a value from the control_state table.
+    
+    Args:
+        key: The key to retrieve
+        
+    Returns:
+        The value associated with the key, or an empty string if not found
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT value FROM control_state WHERE key = ?", (key,))
+        result = cursor.fetchone()
+        
+        if result:
+            return result[0]
+        else:
+            return ""
+            
+    except sqlite3.Error as e:
+        print(f"Database error while getting control state: {e}")
+        return ""
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def set_control_state(key: str, value: str) -> bool:
+    """Set a value in the control_state table.
+    
+    Args:
+        key: The key to set
+        value: The value to associate with the key
+        
+    Returns:
+        True if the operation was successful, False otherwise
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "INSERT OR REPLACE INTO control_state (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        conn.commit()
+        return True
+            
+    except sqlite3.Error as e:
+        print(f"Database error while setting control state: {e}")
+        return False
+    finally:
+        if 'conn' in locals():
+            conn.close()

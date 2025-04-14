@@ -12,40 +12,22 @@ mkdir -p /data/store
 chown appuser:appgroup /data/store
 
 # --- Start Go Bridge ---
-echo "Starting Go WhatsApp Bridge..."
-# Run in background, redirect output if needed
-/app/whatsapp-bridge &
+echo "Starting Go WhatsApp Bridge..." >&2
+# Run in background, redirect output to stderr
+/app/whatsapp-bridge 2>&1 >&2 &
 BRIDGE_PID=$!
-echo "Go Bridge started with PID $BRIDGE_PID"
+echo "Go Bridge started with PID $BRIDGE_PID" >&2
 
 # Wait a moment to ensure the API is available
 sleep 2
 
 # --- Start Python MCP Server ---
-echo "Starting Python MCP Server..."
+echo "Starting Python MCP Server..." >&2
 # Activate virtual environment and run the Python script
 # This runs in the foreground and handles MCP communication via stdio
 . /app/venv/bin/activate
 cd /app/whatsapp-mcp-server
-python main.py &
-MCP_PID=$!
-echo "Python MCP Server started with PID $MCP_PID"
 
-# Wait for either process to exit
-wait -n $BRIDGE_PID $MCP_PID
-
-# If one exits, send signal to the other to ensure cleanup
-if kill -0 $BRIDGE_PID 2>/dev/null; then
-    echo "MCP Server exited, stopping Go Bridge..."
-    kill $BRIDGE_PID
-fi
-if kill -0 $MCP_PID 2>/dev/null; then
-    echo "Go Bridge exited, stopping MCP Server..."
-    kill $MCP_PID
-fi
-
-# Wait for remaining process to terminate
-wait
-echo "Both processes stopped. Exiting."
-
-exit 0
+# Run the MCP server in the foreground
+# All diagnostic output is redirected to stderr to keep stdin/stdout clean for MCP protocol
+exec python main.py

@@ -1,0 +1,19 @@
+{
+    "servers": {
+        "whatsapp": {
+            "type": "stdio",
+            "command": "docker",
+            "args": [
+                "run",
+                "-i",
+                "--rm",
+                "--name",
+                "whatsapp-mcp-container-claude",
+                "--user",
+                "1001:1001",
+                "--cap-drop=ALL",
+                "whatsapp-mcp:latest"
+            ]
+        }
+    }
+}
