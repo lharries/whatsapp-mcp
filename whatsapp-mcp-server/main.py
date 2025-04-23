@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_unread_messages as whatsapp_get_unread_messages
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,19 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def get_unread_messages(limit: int = 10) -> List[Dict[str, Any]]:
+    """Get an overview of recent chats with unread messages.
+    
+    Args:
+        limit: Maximum number of chats with unread messages to return (default 10)
+    
+    Returns:
+        A list of chat objects with unread message information
+    """
+    unread_chats = whatsapp_get_unread_messages(limit)
+    return unread_chats
 
 if __name__ == "__main__":
     # Initialize and run the server
