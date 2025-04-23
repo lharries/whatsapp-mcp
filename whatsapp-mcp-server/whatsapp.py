@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+from pathlib import Path
 import os.path
 import requests
 import json
@@ -650,7 +651,15 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def validate_media_path(media_path: str, uploads_dir: str) -> bool:
+    media_path_norm = Path(media_path).expanduser().resolve()
+    uploads_dir_norm = Path(uploads_dir).expanduser().resolve()
+    if not media_path_norm.is_relative_to(uploads_dir_norm):
+        return False
+    
+    return True
+
+def send_file(recipient: str, media_path: str, uploads_dir: str) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -660,7 +669,11 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, "Media path must be provided"
         
         if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+            return False, f"Media file not found: {str(media_path)}"
+        
+        # Check media_path is in uploads_dir.
+        if not validate_media_path(media_path, uploads_dir):
+            return False, f"Media path outside of uploads dir = {uploads_dir}, potentially dangerous."
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
@@ -684,7 +697,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_audio_message(recipient: str, media_path: str, uploads_dir: str) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -702,6 +715,10 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
+        # Check media_path is in uploads_dir.
+        if not validate_media_path(media_path, uploads_dir):
+            return False, f"Media path outside of uploads dir = {uploads_dir}, potentially dangerous."
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,

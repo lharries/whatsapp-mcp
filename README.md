@@ -153,6 +153,8 @@ You can send various media types to your WhatsApp contacts:
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
   - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
 
+To configure the media uploads directory, please set the `WHATSAPP_UPLOADS_DIR` environment variable. Default: `[REPOSITORY_ROOT]/uploads`.
+
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
