@@ -88,8 +88,8 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
 
 #### Steps to get it working:
 
-1. **Install a C compiler**  
-   We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
+1. **Install a C compiler**
+   We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.
    → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
 
 2. **Enable CGO and run the app**
@@ -103,6 +103,89 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
 Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+
+### Docker Installation
+
+You can also run the WhatsApp MCP server using Docker, which simplifies the setup process and ensures consistent behavior across different platforms.
+
+#### Prerequisites
+
+- Docker
+- Docker Compose
+
+#### Steps
+
+1. **Clone this repository**
+
+   ```bash
+   git clone https://github.com/lharries/whatsapp-mcp.git
+   cd whatsapp-mcp
+   ```
+
+2. **Build and start the Docker container**
+
+   ```bash
+   docker-compose up --build
+   ```
+
+   The first time you run it, you will be prompted to scan a QR code in the container logs. Scan the QR code with your WhatsApp mobile app to authenticate.
+
+3. **Connect to the MCP server**
+
+   For **Claude**, create a `claude_desktop_config.json` file in your Claude Desktop configuration directory at:
+
+   ```
+   ~/Library/Application Support/Claude/claude_desktop_config.json
+   ```
+
+   with the following content:
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "curl",
+         "args": [
+           "-X",
+           "POST",
+           "http://localhost:8081"
+         ]
+       }
+     }
+   }
+   ```
+
+   For **Cursor**, create an `mcp.json` file in your Cursor configuration directory at:
+
+   ```
+   ~/.cursor/mcp.json
+   ```
+
+   with the same content.
+
+4. **Restart Claude Desktop / Cursor**
+
+   Open Claude Desktop and you should now see WhatsApp as an available integration.
+
+   Or restart Cursor.
+
+#### Persistent Storage
+
+Your WhatsApp data is stored in the `whatsapp-bridge/store` directory, which is mounted as a volume in the Docker container. This ensures your data persists even if you stop or remove the container.
+
+#### Stopping the Container
+
+To stop the container:
+
+```bash
+docker-compose down
+```
+
+To stop and remove all data (including WhatsApp authentication):
+
+```bash
+docker-compose down -v
+```
 
 ## Architecture Overview
 

@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  whatsapp-mcp:
+    build: .
+    ports:
+      - "8080:8080"  # WhatsApp bridge port
+      - "8081:8081"  # MCP server port
+    volumes:
+      - ./whatsapp-bridge/store:/app/whatsapp-bridge/store  # Persistent storage for WhatsApp data
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
