@@ -185,7 +185,16 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Extract captions from media messages
+	if img := msg.GetImageMessage(); img != nil && img.GetCaption() != "" {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil && vid.GetCaption() != "" {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+		return doc.GetCaption()
+	}
+
+	// No text content found
 	return ""
 }
 
@@ -1056,11 +1065,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Extract text content
 				var content string
 				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
+					// Use our extractTextContent function which also gets captions from media messages
+					content = extractTextContent(msg.Message.Message)
 				}
 
 				// Extract media info
