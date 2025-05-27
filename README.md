@@ -179,3 +179,28 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+## Resources 
+
+<details>
+<summary><b>Open MCP Marketplace API Support</b></summary>
+
+![MCP Marketplace User Review Rating Badge](http://www.deepnlp.org/api/marketplace/svg?lharries/whatsapp-mcp)|[Reviews](http://www.deepnlp.org/store/ai-agent/mcp-server/pub-lharries/whatsapp-mcp)|[GitHub](https://github.com/AI-Agent-Hub/mcp-marketplace)|[Doc](http://www.deepnlp.org/doc/mcp_marketplace)|[MCP Marketplace](http://www.deepnlp.org/store/ai-agent/mcp-server)
+
+Allow AI/Agent/LLM to find this MCP Server via common python/typescript API, search and explore relevant servers and tools
+
+***Example: Search Server and Tools***
+```python
+import anthropic
+import mcp_marketplace as mcpm
+
+result_q = mcpm.search(query="whatsapp mcp", mode="list", page_id=0, count_per_page=100, config_name="deepnlp") # search server by category choose various endpoint
+result_id = mcpm.search(id="lharries/whatsapp-mcp", mode="list", page_id=0, count_per_page=100, config_name="deepnlp")      # search server by id choose various endpoint 
+tools = mcpm.list_tools(id="lharries/whatsapp-mcp", config_name="deepnlp_tool")
+# Call Claude to Choose Tools Function Calls 
+# client = anthropic.Anthropic()
+# response = client.messages.create(model="claude-opus-4-20250514", max_tokens=1024, tools=tools, messages=[])
+```
+
+</details>
+
