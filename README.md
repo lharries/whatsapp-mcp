@@ -170,6 +170,22 @@ By default, just the metadata of the media is stored in the local database. The 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
 
+### WhatsApp Communities Limitations
+
+**Important**: WhatsApp Communities (newer group format) may not work reliably with this MCP server. This is due to limitations in the underlying whatsmeow library with newer Community formats.
+
+**Symptoms:**
+- Cannot send messages to groups with JID format: `120363...@g.us`
+- Error messages when trying to access Community groups
+- Issues with newer group formats
+
+**Solutions:**
+- Use traditional WhatsApp groups (format: `XXXXXXXXXX-XXXXXXXXXX@g.us`) ✅
+- Send messages to individual contacts instead ✅
+- Check group compatibility using the `check_group_compatibility` tool ✅
+
+For detailed information and workarounds, see: **[WhatsApp Communities Troubleshooting Guide](./WHATSAPP_COMMUNITIES_TROUBLESHOOTING.md)**
+
 ### Authentication Issues
 
 - **QR Code Not Displaying**: If the QR code doesn't appear, try restarting the authentication script. If issues persist, check if your terminal supports displaying QR codes.

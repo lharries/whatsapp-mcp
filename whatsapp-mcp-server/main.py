@@ -14,6 +14,7 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+import re
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -93,6 +94,15 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
+    
+    # Enhance each chat with group type information
+    for chat in chats:
+        if "jid" in chat:
+            compatibility_info = check_group_compatibility(chat["jid"])
+            chat["group_type"] = compatibility_info["type"]
+            chat["compatible"] = compatibility_info["compatible"]
+            chat["group_description"] = compatibility_info["description"]
+    
     return chats
 
 @mcp.tool()
@@ -244,6 +254,68 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         return {
             "success": False,
             "message": "Failed to download media"
+        }
+
+@mcp.tool()
+def check_group_compatibility(jid: str) -> Dict[str, Any]:
+    """Check WhatsApp group/chat compatibility and identify the type.
+    
+    Args:
+        jid: The JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us") to check
+    
+    Returns:
+        Information about the group type and compatibility status
+    """
+    
+    # Parse the JID to determine type
+    if "@s.whatsapp.net" in jid:
+        return {
+            "type": "personal",
+            "compatible": True,
+            "description": "Individual WhatsApp contact",
+            "jid": jid,
+            "recommendations": ["This is a personal chat and should work reliably"]
+        }
+    elif "@g.us" in jid:
+        user_part = jid.split("@")[0]
+        
+        # Check for WhatsApp Community format
+        if user_part.startswith("120363"):
+            return {
+                "type": "community",
+                "compatible": False,
+                "description": "WhatsApp Community (newer group format)",
+                "jid": jid,
+                "recommendations": [
+                    "Communities with this format may not work reliably",
+                    "Try creating a traditional WhatsApp group instead",
+                    "Send messages to individual members as a workaround",
+                    "Check for whatsmeow library updates"
+                ]
+            }
+        elif "-" in user_part:
+            return {
+                "type": "traditional_group",
+                "compatible": True,
+                "description": "Traditional WhatsApp group",
+                "jid": jid,
+                "recommendations": ["This is a traditional group and should work reliably"]
+            }
+        else:
+            return {
+                "type": "unknown_group",
+                "compatible": False,
+                "description": "Unknown group format",
+                "jid": jid,
+                "recommendations": ["Unknown group format - proceed with caution"]
+            }
+    else:
+        return {
+            "type": "unknown",
+            "compatible": False,
+            "description": "Unknown JID format",
+            "jid": jid,
+            "recommendations": ["Unknown JID format - this may not be a valid WhatsApp identifier"]
         }
 
 if __name__ == "__main__":
