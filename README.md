@@ -67,7 +67,7 @@ Here's an example of what you can do when it's connected to Claude.
    For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
    ```
-   ~/Library/Application Support/Claude/claude_desktop_config.json
+   ~/Library/Application\ Support/Claude/claude_desktop_config.json
    ```
 
    For **Cursor**, save this as `mcp.json` in your Cursor configuration directory at:
