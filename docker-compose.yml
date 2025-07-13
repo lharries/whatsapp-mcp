@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  whatsapp-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: whatsapp-bridge
+    volumes:
+      # Mount SQLite database directory to persist data
+      - whatsapp_data:/app/store
+      # Mount a directory for QR code display (optional)
+      - ./qr-codes:/app/qr-codes
+    ports:
+      # Internal port for communication with MCP server
+      - "8080:8080"
+    environment:
+      - WHATSAPP_DB_PATH=/app/store
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: whatsapp-mcp-server
+    depends_on:
+      - whatsapp-bridge
+    volumes:
+      # Share the SQLite database with the bridge
+      - whatsapp_data:/app/store:ro
+    ports:
+      # Expose MCP server port to host
+      - "3000:3000"
+    environment:
+      # Configure connection to WhatsApp bridge
+      - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
+      - DATABASE_PATH=/app/store/messages.db
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+
+volumes:
+  whatsapp_data:
+    driver: local
+
+networks:
+  whatsapp-network:
+    driver: bridge

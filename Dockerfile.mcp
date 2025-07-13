@@ -1,0 +1,32 @@
+# Dockerfile for WhatsApp MCP Server (Python component)
+FROM python:3.11-slim
+
+# Install system dependencies including ffmpeg for audio conversion
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install uv for fast Python package management
+RUN pip install uv
+
+# Copy Python requirements (assuming pyproject.toml exists)
+COPY whatsapp-mcp-server/pyproject.toml ./
+COPY whatsapp-mcp-server/uv.lock ./
+
+# Install Python dependencies using uv
+RUN uv sync --frozen
+
+# Copy the MCP server source code
+COPY whatsapp-mcp-server/ ./
+
+# Create a non-root user for security
+RUN useradd -m -u 1000 mcpuser && chown -R mcpuser:mcpuser /app
+USER mcpuser
+
+# Expose MCP server port
+EXPOSE 3000
+
+# Run the MCP server
+CMD ["uv", "run", "main.py"]
