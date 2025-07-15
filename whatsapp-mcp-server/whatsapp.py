@@ -210,10 +210,10 @@ def list_messages(
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
             
-            return format_messages_list(messages_with_context, show_chat_info=True)
+            return messages_with_context
             
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+        # Return messages without context
+        return result
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
