@@ -16,7 +16,7 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP("whatsapp", log_level="ERROR")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
