@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
+from auto_responder import AutoResponder
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -17,6 +18,9 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# Initialize the auto-responder
+auto_responder = AutoResponder(check_interval=30)  # Check every 30 seconds
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -244,6 +248,152 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         return {
             "success": False,
             "message": "Failed to download media"
+        }
+
+@mcp.tool()
+def start_auto_responder() -> Dict[str, Any]:
+    """Start the automatic message response service.
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    try:
+        auto_responder.start()
+        return {
+            "success": True,
+            "message": "Auto responder service started"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to start auto responder: {str(e)}"
+        }
+
+@mcp.tool()
+def stop_auto_responder() -> Dict[str, Any]:
+    """Stop the automatic message response service.
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    try:
+        auto_responder.stop()
+        return {
+            "success": True,
+            "message": "Auto responder service stopped"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to stop auto responder: {str(e)}"
+        }
+
+@mcp.tool()
+def list_auto_responder_rules() -> List[Dict[str, Any]]:
+    """List all configured auto-responder rules.
+    
+    Returns:
+        A list of rule configurations
+    """
+    rules = []
+    for rule in auto_responder.rule_manager.rules:
+        rules.append({
+            "name": rule.name,
+            "pattern": rule.pattern,
+            "response": rule.response,
+            "pattern_type": rule.pattern_type,
+            "is_regex": rule.is_regex,
+            "enabled": rule.enabled,
+            "sender_filter": rule.sender_filter,
+            "chat_filter": rule.chat_filter
+        })
+    return rules
+
+@mcp.tool()
+def add_auto_responder_rule(
+    name: str,
+    pattern: str,
+    response: str,
+    pattern_type: str = "contains",
+    is_regex: bool = False,
+    enabled: bool = True,
+    sender_filter: Optional[str] = None,
+    chat_filter: Optional[str] = None
+) -> Dict[str, Any]:
+    """Add a new auto-responder rule.
+    
+    Args:
+        name: Name of the rule for identification
+        pattern: Pattern to match in the message
+        response: Response template to send
+        pattern_type: Type of pattern matching ("text", "exact", "contains")
+        is_regex: Whether pattern is a regular expression
+        enabled: Whether this rule is active
+        sender_filter: Optional filter to only apply to specific senders
+        chat_filter: Optional filter to only apply to specific chats
+        
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    try:
+        from auto_responder_rules import ResponseRule
+        
+        # Create the rule
+        rule = ResponseRule(
+            name=name,
+            pattern=pattern,
+            response=response,
+            pattern_type=pattern_type,
+            is_regex=is_regex,
+            enabled=enabled,
+            sender_filter=sender_filter,
+            chat_filter=chat_filter
+        )
+        
+        # Add it to the manager
+        auto_responder.rule_manager.rules.append(rule)
+        auto_responder.rule_manager.save_rules()
+        
+        return {
+            "success": True,
+            "message": f"Rule '{name}' added successfully"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to add rule: {str(e)}"
+        }
+
+@mcp.tool()
+def remove_auto_responder_rule(name: str) -> Dict[str, Any]:
+    """Remove an auto-responder rule by name.
+    
+    Args:
+        name: The name of the rule to remove
+        
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    try:
+        # Find and remove the rule
+        rules = auto_responder.rule_manager.rules
+        for i, rule in enumerate(rules):
+            if rule.name == name:
+                rules.pop(i)
+                auto_responder.rule_manager.save_rules()
+                return {
+                    "success": True,
+                    "message": f"Rule '{name}' removed successfully"
+                }
+                
+        return {
+            "success": False,
+            "message": f"Rule '{name}' not found"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to remove rule: {str(e)}"
         }
 
 if __name__ == "__main__":

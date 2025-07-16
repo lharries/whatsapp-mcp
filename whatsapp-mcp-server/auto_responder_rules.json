@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Hello Response",
+    "pattern": "hello",
+    "response": "Hello! This is an automated response.",
+    "pattern_type": "contains",
+    "is_regex": false,
+    "enabled": true,
+    "sender_filter": null,
+    "chat_filter": null
+  },
+  {
+    "name": "Help Response",
+    "pattern": "help",
+    "response": "This is an automatic response. For assistance, please contact the admin.",
+    "pattern_type": "contains",
+    "is_regex": false,
+    "enabled": true,
+    "sender_filter": null,
+    "chat_filter": null
+  }
+]
