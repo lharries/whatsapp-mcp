@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -372,26 +374,26 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+func extractMediaInfo(msg *waProto.Message, timestamp time.Time) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + timestamp.Format("20060102_150405") + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + timestamp.Format("20060102_150405") + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + timestamp.Format("20060102_150405") + "_" + generateUUID() + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -399,7 +401,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + timestamp.Format("20060102_150405")
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -427,7 +429,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.Timestamp)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -590,6 +592,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// Generate a unique filename with UUID for each download
+	if mediaType == "audio" {
+		// Always generate a new UUID for audio files to avoid conflicts
+		timestamp := time.Now()
+		filename = "audio_" + timestamp.Format("20060102_150405") + "_" + generateUUID() + ".ogg"
+	}
+	
 	// Generate a local path for the file
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
@@ -784,6 +793,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+// Generate a simple UUID for unique filenames
+func generateUUID() string {
+	bytes := make([]byte, 8)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
 
 func main() {
@@ -1069,7 +1085,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					// Get message timestamp first
+					timestamp := time.Time{}
+					if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
+						timestamp = time.Unix(int64(ts), 0)
+					} else {
+						timestamp = time.Now() // fallback to current time
+					}
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, timestamp)
 				}
 
 				// Log the message content for debugging
@@ -1306,7 +1329,7 @@ func placeholderWaveform(duration uint32) []byte {
 	waveform := make([]byte, waveformLength)
 
 	// Seed the random number generator for consistent results with the same duration
-	rand.Seed(int64(duration))
+	mathrand.Seed(int64(duration))
 
 	// Create a more natural looking waveform with some patterns and variability
 	// rather than completely random values
@@ -1325,7 +1348,7 @@ func placeholderWaveform(duration uint32) []byte {
 		val += (baseAmplitude / 2) * math.Sin(pos*math.Pi*frequencyFactor*16)
 
 		// Add some randomness to make it look more natural
-		val += (rand.Float64() - 0.5) * 15
+		val += (mathrand.Float64() - 0.5) * 15
 
 		// Add some fade-in and fade-out effects
 		fadeInOut := math.Sin(pos * math.Pi)

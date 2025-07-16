@@ -44,6 +44,8 @@ Here's an example of what you can do when it's connected to Claude.
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
+   **Important:** You must keep this bridge running continuously for the MCP server to work. The bridge connects to WhatsApp and provides the REST API that the MCP server uses. If you close this terminal or stop the bridge, Claude will lose access to WhatsApp.
+
    After approximately 20 days, you will might need to re-authenticate.
 
 3. **Connect to the MCP server**
@@ -84,6 +86,22 @@ Here's an example of what you can do when it's connected to Claude.
 
    Or restart Cursor.
 
+## Updating the WhatsApp Bridge
+
+When you make changes to the WhatsApp bridge code (the Go application), you need to ensure Claude Desktop picks up the updated version:
+
+1. **Stop the WhatsApp bridge** (if it's currently running): Press `Ctrl+C` in the terminal where the bridge is running
+
+2. **Rebuild and restart the bridge**:
+   ```bash
+   cd whatsapp-bridge
+   go run main.go
+   ```
+
+3. **Restart Claude Desktop**: Completely quit Claude Desktop and reopen it to ensure it connects to the updated bridge
+
+The MCP server will automatically reconnect to the updated bridge when Claude Desktop restarts.
+
 ### Windows Compatibility
 
 If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
@@ -123,6 +141,11 @@ This application consists of two main components:
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
+
+**Prerequisites for usage:**
+1. The WhatsApp bridge must be running in a terminal (`go run main.go` in the whatsapp-bridge directory)
+2. Claude Desktop must be open and connected to the MCP server
+3. You must have completed the initial WhatsApp authentication (QR code scan)
 
 ### MCP Tools
 
@@ -170,7 +193,8 @@ By default, just the metadata of the media is stored in the local database. The 
 ## Troubleshooting
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
-- Make sure both the Go application and the Python server are running for the integration to work properly.
+- Make sure both the Go application (WhatsApp bridge) is running continuously for the integration to work properly. The Python MCP server starts automatically when Claude connects.
+- If Claude shows "WhatsApp connection failed" errors, check that the WhatsApp bridge is running on port 8080 (you should see "Starting REST API server on :8080..." in the bridge terminal).
 
 ### Authentication Issues
 
