@@ -39,11 +39,19 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+	IsRead    bool
 }
 
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+}
+
+// Chat represents a chat with basic information
+type Chat struct {
+	JID             string
+	LastMessageTime time.Time
+	UnreadCount     uint32
 }
 
 // Initialize message store
@@ -64,7 +72,8 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			unread_count INTEGER DEFAULT 0
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -81,6 +90,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			is_read BOOLEAN DEFAULT FALSE,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -99,11 +109,13 @@ func (store *MessageStore) Close() error {
 }
 
 // Store a chat in the database
-func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time, unreadCount uint32) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, unread_count) VALUES (?, ?, ?, ?)",
+		jid, name, lastMessageTime, unreadCount,
 	)
+	// Log the unread count update
+	fmt.Printf("StoreChat: Updating chat %s with unread count: %d\n", jid, unreadCount)
 	return err
 }
 
@@ -117,9 +129,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, is_read) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, false,
 	)
 	return err
 }
@@ -127,7 +139,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename, is_read FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -139,7 +151,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &msg.IsRead)
 		if err != nil {
 			return nil, err
 		}
@@ -151,25 +163,49 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 }
 
 // Get all chats
-func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+func (store *MessageStore) GetChats() ([]Chat, error) {
+	rows, err := store.db.Query("SELECT jid, last_message_time, unread_count FROM chats ORDER BY last_message_time DESC")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	chats := make(map[string]time.Time)
+	var chats []Chat
 	for rows.Next() {
-		var jid string
-		var lastMessageTime time.Time
-		err := rows.Scan(&jid, &lastMessageTime)
+		var chat Chat
+		err := rows.Scan(&chat.JID, &chat.LastMessageTime, &chat.UnreadCount)
 		if err != nil {
 			return nil, err
 		}
-		chats[jid] = lastMessageTime
+		chats = append(chats, chat)
 	}
 
 	return chats, nil
+}
+
+// Get unread count for a chat
+func (store *MessageStore) GetUnreadCount(chatJID string) (uint32, error) {
+	var unreadCount uint32
+	err := store.db.QueryRow("SELECT unread_count FROM chats WHERE jid = ?", chatJID).Scan(&unreadCount)
+	if err != nil {
+		return 0, err
+	}
+	return unreadCount, nil
+}
+
+// Mark chat as read
+func (store *MessageStore) MarkChatAsRead(chatJID string) error {
+	_, err := store.db.Exec("UPDATE chats SET unread_count = 0 WHERE jid = ?", chatJID)
+	fmt.Printf("MarkChatAsRead: Marking chat %s as read\n", chatJID)
+	return err
+}
+
+// Mark chat as unread
+func (store *MessageStore) MarkChatAsUnread(chatJID string) error {
+	// Set unread count to 1 to indicate unread status
+	_, err := store.db.Exec("UPDATE chats SET unread_count = 1 WHERE jid = ?", chatJID)
+	fmt.Printf("MarkChatAsUnread: Marking chat %s as unread\n", chatJID)
+	return err
 }
 
 // Extract text content from a message
@@ -417,8 +453,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
+	// Determine unread count
+	var unreadCount uint32 = 0
+	if !msg.Info.IsFromMe {
+		// If message is not from me, increment unread count
+		currUnread, err := messageStore.GetUnreadCount(chatJID)
+		if err == nil {
+			unreadCount = currUnread + 1
+		} else {
+			unreadCount = 1
+		}
+	}
+
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp, unreadCount)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -675,6 +723,25 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// GetChatsResponse represents the response for the get chats API
+type GetChatsResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Chats   []Chat `json:"chats,omitempty"`
+}
+
+// MarkChatReadRequest represents the request body for marking a chat as read/unread
+type MarkChatReadRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Read    bool   `json:"read"` // true to mark as read, false to mark as unread
+}
+
+// MarkChatReadResponse represents the response for marking a chat as read/unread
+type MarkChatReadResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -774,6 +841,90 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting all chats with unread counts
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get all chats
+		chats, err := messageStore.GetChats()
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Handle errors
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetChatsResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to get chats: %v", err),
+			})
+			return
+		}
+
+		// Send successful response
+		json.NewEncoder(w).Encode(GetChatsResponse{
+			Success: true,
+			Chats:   chats,
+		})
+	})
+
+	// Handler for marking a chat as read or unread
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req MarkChatReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.ChatJID == "" {
+			http.Error(w, "Chat JID is required", http.StatusBadRequest)
+			return
+		}
+
+		var err error
+		var actionMsg string
+
+		// Mark chat as read or unread based on request
+		if req.Read {
+			err = messageStore.MarkChatAsRead(req.ChatJID)
+			actionMsg = "Chat marked as read"
+		} else {
+			err = messageStore.MarkChatAsUnread(req.ChatJID)
+			actionMsg = "Chat marked as unread"
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Handle errors
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(MarkChatReadResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to update chat status: %v", err),
+			})
+			return
+		}
+
+		// Send successful response
+		json.NewEncoder(w).Encode(MarkChatReadResponse{
+			Success: true,
+			Message: actionMsg,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -845,11 +996,20 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.MarkChatAsRead:
+			// Handle chat read status changes from other devices
+			fmt.Printf("MarkChatAsRead: %v\n", v)
+			handleMarkChatAsRead(messageStore, v, logger)
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+		case *events.Receipt:
+			// Handle receipt events (when someone reads a message we sent)
+			fmt.Printf("Received receipt: %v\n", v)
+			handleReceipt(messageStore, v, logger)
 		}
 	})
 
@@ -1016,6 +1176,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
+		if conversation.UnreadCount == nil {
+			continue
+		}
+
+		// var unreadCount uint32 = 0
+		// if conversation.UnreadCount != nil {
+		// 	unreadCount = *conversation.UnreadCount
+		// 	// if unreadCount == 0 {
+		// 	// 	continue
+		// 	// }
+		// }
+
 		chatJID := *conversation.ID
 
 		// Try to parse the JID
@@ -1045,7 +1217,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			// Extract unread count if available
+			var unreadCount uint32 = 0
+			if conversation.UnreadCount != nil {
+				unreadCount = *conversation.UnreadCount
+				logger.Infof("Chat %s has %d unread messages", chatJID, unreadCount)
+			}
+
+			messageStore.StoreChat(chatJID, name, timestamp, unreadCount)
 
 			// Store messages
 			for _, msg := range messages {
@@ -1073,7 +1252,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				// logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				// logger.Infof("Message user receipts: %v", msg.Message.UserReceipt)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -1345,4 +1525,115 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// Handle chat read status changes from other devices
+func handleMarkChatAsRead(messageStore *MessageStore, evt *events.MarkChatAsRead, logger waLog.Logger) {
+	chatJID := evt.JID.String()
+
+	// Check if we have an action and if the chat was marked as read
+	if evt.Action != nil && evt.Action.Read != nil {
+		if *evt.Action.Read {
+			// Chat was marked as read, update the database
+			err := messageStore.MarkChatAsRead(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to update read status for chat %s: %v", chatJID, err)
+			} else {
+				logger.Infof("Chat %s marked as read from another device at %s",
+					chatJID, evt.Timestamp.Format("2006-01-02 15:04:05"))
+			}
+		} else {
+			// Chat was marked as unread, update the database
+			err := messageStore.MarkChatAsUnread(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to update unread status for chat %s: %v", chatJID, err)
+			} else {
+				logger.Infof("Chat %s marked as unread from another device at %s",
+					chatJID, evt.Timestamp.Format("2006-01-02 15:04:05"))
+			}
+		}
+	}
+}
+
+// Handle receipt events (e.g., when someone reads a message we sent)
+func handleReceipt(messageStore *MessageStore, receipt *events.Receipt, logger waLog.Logger) {
+	chatJID := receipt.Chat.String()
+	// Print receipt details for debugging
+	fmt.Printf("Receipt details: chat=%s, sender=%s, isFromMe=%v, messageIDs=%v\n",
+		chatJID, receipt.Sender.User, receipt.IsFromMe, receipt.MessageIDs)
+
+	logger.Infof("Received receipt for messages not in database - can't update read status for specific messages")
+	// Although we don't have the specific messages, if this is a receipt we generated,
+	// we can still update the chat's unread count
+	if receipt.IsFromMe {
+		err := messageStore.MarkChatAsRead(chatJID)
+		if err != nil {
+			logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
+		} else {
+			fmt.Printf("Received receipt for our read action - marking chat %s as read\n", chatJID)
+		}
+	}
+
+	// If the receipt is from us (we generated it), it means we've read messages in this chat
+	if receipt.IsFromMe {
+		// Check if any of the messages are incoming (sent to us)
+		hasIncomingMessages, err := messageStore.AreMessagesIncoming(receipt.MessageIDs, chatJID)
+		if err != nil {
+			logger.Warnf("Failed to check if messages are incoming: %v", err)
+		} else if hasIncomingMessages {
+			// This is a receipt we generated for incoming messages
+			// Mark the chat as read (set unread count to 0)
+			err := messageStore.MarkChatAsRead(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
+			} else {
+				fmt.Printf("We've read incoming messages in chat %s - marking chat as read\n", chatJID)
+			}
+		} else {
+			fmt.Printf("We've read our own messages in chat %s - not changing unread count\n", chatJID)
+		}
+	} else {
+		// This is a receipt from another user indicating they've read our messages
+		fmt.Printf("User %s has read our messages in chat %s\n", receipt.Sender.User, chatJID)
+	}
+}
+
+// Mark specific message as read
+func (store *MessageStore) MarkMessageAsRead(messageID, chatJID string) error {
+	_, err := store.db.Exec("UPDATE messages SET is_read = TRUE WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID)
+	return err
+}
+
+// Check if messages are incoming (not from us)
+func (store *MessageStore) AreMessagesIncoming(messageIDs []string, chatJID string) (bool, error) {
+	// If no message IDs, return false
+	if len(messageIDs) == 0 {
+		return false, nil
+	}
+
+	// Prepare query to check if any of the messages are incoming (is_from_me = 0)
+	query := `
+		SELECT COUNT(*) 
+		FROM messages 
+		WHERE id IN (` + strings.Repeat("?,", len(messageIDs)-1) + `?) 
+		AND chat_jid = ? 
+		AND is_from_me = 0`
+
+	// Prepare arguments for the query
+	args := make([]interface{}, len(messageIDs)+1)
+	for i, id := range messageIDs {
+		args[i] = id
+	}
+	args[len(messageIDs)] = chatJID
+
+	// Execute query
+	var count int
+	err := store.db.QueryRow(query, args...).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+
+	// If count > 0, at least one message is incoming
+	return count > 0, nil
 }
