@@ -9,5 +9,9 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  server: {
+    host: true,
+    allowedHosts: ['all', 'go-to-typescript-conversion-app-tunnel-a6y7pnb1.devinapps.com']
+  }
 })
 

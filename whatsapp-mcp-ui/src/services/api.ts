@@ -1,13 +1,17 @@
 import axios from 'axios';
 import { AuthResponse, CreateUserRequest, LoginRequest, WhatsAppDeviceStatus, SendMessageRequest, ChatMap, Message } from '../types/api';
 
-const API_BASE = 'http://localhost:3000/api';
+const API_BASE = 'https://go-to-typescript-conversion-app-tunnel-bn19sos0.devinapps.com/api';
 
 const api = axios.create({
   baseURL: API_BASE,
   headers: {
     'Content-Type': 'application/json',
   },
+  auth: {
+    username: 'user',
+    password: 'e6df4d0dd0a6e1a118b5da99998e8e55'
+  }
 });
 
 api.interceptors.request.use((config) => {
