@@ -84,4 +84,18 @@ export interface AuthResponse {
   user: Omit<User, 'password_hash'>;
   session_id: string;
   expires_at: Date;
+  token: string;
+}
+
+export interface WhatsAppDeviceStatus {
+  deviceName: string;
+  isConnected: boolean;
+  hasQR: boolean;
+  qrCode?: string;
+}
+
+export interface SendMessageRequest {
+  recipient: string;
+  message: string;
+  deviceName?: string;
 }

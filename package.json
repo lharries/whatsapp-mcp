@@ -6,17 +6,38 @@
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node dist/test-messagestore.js",
-    "test:multi-user": "npm run build && node dist/test-multi-user.js"
+    "test:multi-user": "npm run build && node dist/test-multi-user.js",
+    "test:auth": "npm run build && node dist/test-auth.js",
+    "start": "npm run build && node dist/server/index.js",
+    "dev": "npm run build && node dist/server/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^12.2.0"
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^12.2.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.31.0"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@types/better-sqlite3": "^7.6.11",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.10.2",
+    "@types/qrcode-terminal": "^0.12.2",
     "typescript": "^5.7.2"
   },
-  "keywords": ["whatsapp", "mcp", "sqlite", "typescript"],
+  "keywords": [
+    "whatsapp",
+    "mcp",
+    "sqlite",
+    "typescript"
+  ],
   "author": "Devin AI",
   "license": "MIT"
 }
