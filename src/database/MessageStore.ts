@@ -1,7 +1,8 @@
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Message, ChatRow, MessageRow, ChatMap } from './types';
+import { Message, ChatRow, MessageRow, ChatMap, User } from './types';
+import { MigrationManager } from './MigrationManager';
 
 export class MessageStore {
   private db: Database.Database;
@@ -50,9 +51,12 @@ export class MessageStore {
 
     try {
       db.exec(createTablesSQL);
+      
+      const migrationManager = new MigrationManager(db);
+      await migrationManager.runMigrations();
     } catch (error) {
       db.close();
-      throw new Error(`Failed to create tables: ${error}`);
+      throw new Error(`Failed to create tables or run migrations: ${error}`);
     }
 
     return new MessageStore(db);
@@ -62,11 +66,15 @@ export class MessageStore {
     this.db.close();
   }
 
-  storeChat(jid: string, name: string, lastMessageTime: Date): void {
+  storeChat(jid: string, name: string, lastMessageTime: Date, userId: number): void {
     const stmt = this.db.prepare(
-      'INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)'
+      'INSERT OR REPLACE INTO chats (jid, name, last_message_time, user_id) VALUES (?, ?, ?, ?)'
     );
-    stmt.run(jid, name, lastMessageTime.toISOString());
+    stmt.run(jid, name, lastMessageTime.toISOString(), userId);
+  }
+
+  storeChatLegacy(jid: string, name: string, lastMessageTime: Date): void {
+    this.storeChat(jid, name, lastMessageTime, 1);
   }
 
   storeMessage(
@@ -82,7 +90,8 @@ export class MessageStore {
     mediaKey: Buffer | null,
     fileSHA256: Buffer | null,
     fileEncSHA256: Buffer | null,
-    fileLength: number
+    fileLength: number,
+    userId: number
   ): void {
     if (content === '' && mediaType === '') {
       return;
@@ -90,8 +99,8 @@ export class MessageStore {
 
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO messages 
-      (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, user_id) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -107,16 +116,36 @@ export class MessageStore {
       mediaKey,
       fileSHA256,
       fileEncSHA256,
-      fileLength
+      fileLength,
+      userId
     );
   }
 
-  getMessages(chatJID: string, limit: number): Message[] {
+  storeMessageLegacy(
+    id: string,
+    chatJID: string,
+    sender: string,
+    content: string,
+    timestamp: Date,
+    isFromMe: boolean,
+    mediaType: string,
+    filename: string,
+    url: string,
+    mediaKey: Buffer | null,
+    fileSHA256: Buffer | null,
+    fileEncSHA256: Buffer | null,
+    fileLength: number
+  ): void {
+    this.storeMessage(id, chatJID, sender, content, timestamp, isFromMe, 
+      mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, 1);
+  }
+
+  getMessages(chatJID: string, limit: number, userId: number): Message[] {
     const stmt = this.db.prepare(
-      'SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?'
+      'SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? AND user_id = ? ORDER BY timestamp DESC LIMIT ?'
     );
     
-    const rows = stmt.all(chatJID, limit) as Array<{
+    const rows = stmt.all(chatJID, userId, limit) as Array<{
       sender: string;
       content: string;
       timestamp: string;
@@ -135,12 +164,16 @@ export class MessageStore {
     }));
   }
 
-  getChats(): ChatMap {
+  getMessagesLegacy(chatJID: string, limit: number): Message[] {
+    return this.getMessages(chatJID, limit, 1);
+  }
+
+  getChats(userId: number): ChatMap {
     const stmt = this.db.prepare(
-      'SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC'
+      'SELECT jid, last_message_time FROM chats WHERE user_id = ? ORDER BY last_message_time DESC'
     );
     
-    const rows = stmt.all() as Array<{
+    const rows = stmt.all(userId) as Array<{
       jid: string;
       last_message_time: string;
     }>;
@@ -151,5 +184,72 @@ export class MessageStore {
     }
 
     return chats;
+  }
+
+  getChatsLegacy(): ChatMap {
+    return this.getChats(1);
+  }
+
+  createUser(username: string, email: string, passwordHash: string, phoneNumber?: string): number {
+    const stmt = this.db.prepare(`
+      INSERT INTO users (username, email, password_hash, phone_number, created_at, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `);
+    const result = stmt.run(username, email, passwordHash, phoneNumber || null);
+    return result.lastInsertRowid as number;
+  }
+
+  getUserById(userId: number): User | null {
+    const stmt = this.db.prepare(`
+      SELECT id, username, email, password_hash, phone_number, whatsapp_jid, 
+             created_at, updated_at, is_active, last_login
+      FROM users WHERE id = ? AND is_active = 1
+    `);
+    const row = stmt.get(userId) as any;
+    if (!row) return null;
+    
+    return {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      password_hash: row.password_hash,
+      phone_number: row.phone_number,
+      whatsapp_jid: row.whatsapp_jid,
+      created_at: new Date(row.created_at),
+      updated_at: new Date(row.updated_at),
+      is_active: Boolean(row.is_active),
+      last_login: row.last_login ? new Date(row.last_login) : null
+    };
+  }
+
+  getUserByUsername(username: string): User | null {
+    const stmt = this.db.prepare(`
+      SELECT id, username, email, password_hash, phone_number, whatsapp_jid,
+             created_at, updated_at, is_active, last_login
+      FROM users WHERE username = ? AND is_active = 1
+    `);
+    const row = stmt.get(username) as any;
+    if (!row) return null;
+    
+    return {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      password_hash: row.password_hash,
+      phone_number: row.phone_number,
+      whatsapp_jid: row.whatsapp_jid,
+      created_at: new Date(row.created_at),
+      updated_at: new Date(row.updated_at),
+      is_active: Boolean(row.is_active),
+      last_login: row.last_login ? new Date(row.last_login) : null
+    };
+  }
+
+  updateUserLastLogin(userId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE users SET last_login = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `);
+    stmt.run(userId);
   }
 }

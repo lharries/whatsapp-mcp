@@ -5,7 +5,8 @@
   "main": "dist/database/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node dist/test-messagestore.js"
+    "test": "npm run build && node dist/test-messagestore.js",
+    "test:multi-user": "npm run build && node dist/test-multi-user.js"
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
