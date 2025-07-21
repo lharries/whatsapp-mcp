@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp-mcp-typescript",
+  "version": "1.0.0",
+  "description": "TypeScript conversion of WhatsApp MCP database layer",
+  "main": "dist/database/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node dist/test-messagestore.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "keywords": ["whatsapp", "mcp", "sqlite", "typescript"],
+  "author": "Devin AI",
+  "license": "MIT"
+}
