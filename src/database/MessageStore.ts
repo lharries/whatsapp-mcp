@@ -252,4 +252,72 @@ export class MessageStore {
     `);
     stmt.run(userId);
   }
+
+  getUserByEmail(email: string): User | null {
+    const stmt = this.db.prepare(`
+      SELECT id, username, email, password_hash, phone_number, whatsapp_jid,
+             created_at, updated_at, is_active, last_login
+      FROM users WHERE email = ? AND is_active = 1
+    `);
+    const row = stmt.get(email) as any;
+    if (!row) return null;
+    
+    return {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      password_hash: row.password_hash,
+      phone_number: row.phone_number,
+      whatsapp_jid: row.whatsapp_jid,
+      created_at: new Date(row.created_at),
+      updated_at: new Date(row.updated_at),
+      is_active: Boolean(row.is_active),
+      last_login: row.last_login ? new Date(row.last_login) : null
+    };
+  }
+
+  createUserSession(sessionId: string, userId: number, expiresAt: Date, userAgent?: string, ipAddress?: string): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO user_sessions (id, user_id, expires_at, user_agent, ip_address)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    stmt.run(sessionId, userId, expiresAt.toISOString(), userAgent || null, ipAddress || null);
+  }
+
+  getUserSession(sessionId: string): any | null {
+    const stmt = this.db.prepare(`
+      SELECT id, user_id, created_at, expires_at, is_active, user_agent, ip_address
+      FROM user_sessions WHERE id = ? AND is_active = 1
+    `);
+    const row = stmt.get(sessionId) as any;
+    if (!row) return null;
+    
+    return {
+      id: row.id,
+      user_id: row.user_id,
+      created_at: new Date(row.created_at),
+      expires_at: new Date(row.expires_at),
+      is_active: Boolean(row.is_active),
+      user_agent: row.user_agent,
+      ip_address: row.ip_address
+    };
+  }
+
+  createUserDevice(userId: number, deviceName: string): number {
+    const stmt = this.db.prepare(`
+      INSERT INTO user_devices (user_id, device_name, created_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+    `);
+    const result = stmt.run(userId, deviceName);
+    return result.lastInsertRowid as number;
+  }
+
+  updateDeviceConnection(userId: number, deviceName: string, isConnected: boolean): void {
+    const stmt = this.db.prepare(`
+      UPDATE user_devices 
+      SET is_connected = ?, last_connected = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND device_name = ?
+    `);
+    stmt.run(isConnected ? 1 : 0, userId, deviceName);
+  }
 }
