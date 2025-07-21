@@ -18,14 +18,14 @@ async function testMessageStore() {
     const testChatName = 'Test Chat';
     const testTimestamp = new Date();
 
-    store.storeChat(testChatJID, testChatName, testTimestamp);
+    store.storeChatLegacy(testChatJID, testChatName, testTimestamp);
     console.log('✓ Chat stored successfully');
 
     const testMessageId = 'test-message-1';
     const testSender = '1234567890';
     const testContent = 'Hello, this is a test message!';
     
-    store.storeMessage(
+    store.storeMessageLegacy(
       testMessageId,
       testChatJID,
       testSender,
@@ -47,7 +47,7 @@ async function testMessageStore() {
     const testMediaType = 'image';
     const testFilename = 'test-image.jpg';
     
-    store.storeMessage(
+    store.storeMessageLegacy(
       testMediaMessageId,
       testChatJID,
       testSender,
@@ -64,7 +64,7 @@ async function testMessageStore() {
     );
     console.log('✓ Media message stored successfully');
 
-    const messages = store.getMessages(testChatJID, 10);
+    const messages = store.getMessagesLegacy(testChatJID, 10);
     console.log(`✓ Retrieved ${messages.length} messages`);
     
     if (messages.length !== 2) {
@@ -80,7 +80,7 @@ async function testMessageStore() {
     }
     console.log('✓ Message content and media type verified');
 
-    const chats = store.getChats();
+    const chats = store.getChatsLegacy();
     console.log(`✓ Retrieved ${Object.keys(chats).length} chats`);
     
     if (!(testChatJID in chats)) {
@@ -89,7 +89,7 @@ async function testMessageStore() {
     console.log('✓ Chat retrieval verified');
 
     const emptyMessageId = 'empty-message';
-    store.storeMessage(
+    store.storeMessageLegacy(
       emptyMessageId,
       testChatJID,
       testSender,
@@ -105,7 +105,7 @@ async function testMessageStore() {
       0
     );
     
-    const messagesAfterEmpty = store.getMessages(testChatJID, 10);
+    const messagesAfterEmpty = store.getMessagesLegacy(testChatJID, 10);
     if (messagesAfterEmpty.length === 2) {
       console.log('✓ Empty message correctly ignored (not stored)');
     } else {
