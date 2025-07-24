@@ -26,7 +26,8 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    contacts_dict = [contact.__dict__ for contact in contacts]
+    return contacts_dict
 
 @mcp.tool()
 def list_messages(
@@ -40,7 +41,7 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> List[str]:
     """Get WhatsApp messages matching specified criteria with optional context.
     
     Args:
@@ -93,7 +94,8 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    chats_dict = [chat.__dict__ for chat in chats]
+    return chats_dict
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
@@ -104,7 +106,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    chat_dict = None
+    if chat is not None:
+        chat_dict = chat.__dict__
+    return chat_dict
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
@@ -114,7 +119,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    chat_dict = None
+    if chat is not None:
+        chat_dict = chat.__dict__
+    return chat_dict
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -126,10 +134,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    chats_dict = [chat.__dict__ for chat in chats]
+    return chats_dict
 
 @mcp.tool()
-def get_last_interaction(jid: str) -> str:
+def get_last_interaction(jid: str) -> Optional[str]:
     """Get most recent WhatsApp message involving the contact.
     
     Args:
@@ -152,7 +161,8 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    context_dict = context.__dict__
+    return context_dict
 
 @mcp.tool()
 def send_message(
