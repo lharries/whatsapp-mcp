@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    create_group as whatsapp_create_group
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,49 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def create_group(
+    group_name: str,
+    participants: List[str],
+    description: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create a new WhatsApp group with the specified participants.
+    
+    Args:
+        group_name: The name for the new group
+        participants: List of phone numbers (with country code, no + or symbols) or JIDs to add to the group
+        description: Optional description for the group
+    
+    Returns:
+        A dictionary containing success status, status message, group JID, and participant information
+    """
+    # Validate input
+    if not group_name.strip():
+        return {
+            "success": False,
+            "message": "Group name cannot be empty"
+        }
+    
+    if not participants or len(participants) == 0:
+        return {
+            "success": False,
+            "message": "At least one participant must be provided"
+        }
+    
+    # Call the whatsapp_create_group function
+    success, message, group_jid, added_participants, failed_participants = whatsapp_create_group(
+        group_name.strip(), participants, description
+    )
+    
+    return {
+        "success": success,
+        "message": message,
+        "group_jid": group_jid,
+        "group_name": group_name.strip(),
+        "added_participants": added_participants,
+        "failed_participants": failed_participants
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

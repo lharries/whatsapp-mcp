@@ -765,3 +765,56 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def create_group(group_name: str, participants: List[str], description: Optional[str] = None) -> Tuple[bool, str, Optional[str], List[str], List[str]]:
+    """Create a WhatsApp group with the specified participants.
+    
+    Args:
+        group_name: The name for the new group
+        participants: List of phone numbers or JIDs to add to the group
+        description: Optional group description
+    
+    Returns:
+        A tuple containing:
+        - success: Whether the group was created successfully
+        - message: Status message
+        - group_jid: JID of the created group (if successful)
+        - added_participants: List of successfully added participants
+        - failed_participants: List of participants that couldn't be added
+    """
+    try:
+        # Validate input
+        if not group_name:
+            return False, "Group name must be provided", None, [], []
+        
+        if not participants or len(participants) == 0:
+            return False, "At least one participant must be provided", None, [], []
+        
+        url = f"{WHATSAPP_API_BASE_URL}/create-group"
+        payload = {
+            "group_name": group_name,
+            "participants": participants,
+            "description": description or ""
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            success = result.get("success", False)
+            message = result.get("message", "Unknown response")
+            group_jid = result.get("group_jid", None) if success else None
+            added_participants = result.get("added_participants", [])
+            failed_participants = result.get("failed_participants", [])
+            
+            return success, message, group_jid, added_participants, failed_participants
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}", None, [], []
+            
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None, [], []
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}", None, [], []
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None, [], []
