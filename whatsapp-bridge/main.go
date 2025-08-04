@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"math"
 	"math/rand"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +31,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+)
+
+// Global variables for QR code state management
+var (
+	currentQRCode string
+	isAuthenticated bool
+	authMutex sync.RWMutex
+	lastQRUpdate time.Time
 )
 
 // Message represents a chat message for our client
@@ -641,7 +651,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +784,495 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for QR code HTML page
+	http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
+		authMutex.RLock()
+		qrCode := currentQRCode
+		authenticated := isAuthenticated
+		authMutex.RUnlock()
+
+		if authenticated {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Authentication</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 500px;
+            width: 100%%;
+        }
+        .success-icon {
+            font-size: 60px;
+            color: #25D366;
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        .status {
+            background: #E8F5E8;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #C3E6CB;
+        }
+        .refresh-btn {
+            background: #25D366;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+            transition: background 0.3s;
+        }
+        .refresh-btn:hover {
+            background: #20B954;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">✅</div>
+        <h1>WhatsApp Authentication</h1>
+        <div class="status">
+            <strong>Status:</strong> Successfully authenticated and connected to WhatsApp!
+        </div>
+        <p>Your WhatsApp bridge is ready to use. You can now send and receive messages through the API.</p>
+        <button class="refresh-btn" onclick="location.reload()">Refresh Status</button>
+    </div>
+</body>
+</html>`)
+			return
+		}
+
+		if qrCode == "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Authentication</title>
+    <meta http-equiv="refresh" content="3">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 500px;
+            width: 100%%;
+        }
+        .loading {
+            font-size: 60px;
+            margin-bottom: 20px;
+            animation: spin 2s linear infinite;
+        }
+        @keyframes spin {
+            0%% { transform: rotate(0deg); }
+            100%% { transform: rotate(360deg); }
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        .status {
+            background: #FFF3CD;
+            color: #856404;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #FFEAA7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="loading">⏳</div>
+        <h1>WhatsApp Authentication</h1>
+        <div class="status">
+            <strong>Status:</strong> Generating QR code...
+        </div>
+        <p>Please wait while we prepare your QR code for scanning.</p>
+        <p><small>This page will refresh automatically.</small></p>
+    </div>
+</body>
+</html>`)
+			return
+		}
+
+		// Generate QR code as SVG
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		qrTemplate := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp QR Code</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 500px;
+            width: 100%%;
+        }
+        .whatsapp-logo {
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+        .qr-container {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 15px;
+            margin: 30px 0;
+            display: inline-block;
+        }
+        .instructions {
+            background: #E3F2FD;
+            color: #1565C0;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: left;
+        }
+        .instructions h3 {
+            margin-top: 0;
+            color: #1565C0;
+        }
+        .instructions ol {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .instructions li {
+            margin: 8px 0;
+        }
+        .refresh-btn {
+            background: #25D366;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+            transition: background 0.3s;
+        }
+        .refresh-btn:hover {
+            background: #20B954;
+        }
+        .warning {
+            background: #FFF3CD;
+            color: #856404;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #FFEAA7;
+            font-size: 14px;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="whatsapp-logo">💬</div>
+        <h1>WhatsApp Web QR Code</h1>
+        <p class="subtitle">Scan this QR code with your WhatsApp mobile app</p>
+        
+        <div class="qr-container">
+            <canvas id="qrcode"></canvas>
+        </div>
+        
+        <div class="instructions">
+            <h3>📱 How to scan:</h3>
+            <ol>
+                <li>Open WhatsApp on your phone</li>
+                <li>Tap <strong>Menu</strong> or <strong>Settings</strong></li>
+                <li>Tap <strong>Linked Devices</strong></li>
+                <li>Tap <strong>Link a Device</strong></li>
+                <li>Point your phone at this screen to capture the code</li>
+            </ol>
+        </div>
+        
+        <div class="warning">
+            ⚠️ This QR code expires after a few minutes. Refresh the page if needed.
+        </div>
+        
+        <button class="refresh-btn" onclick="location.reload()">Refresh QR Code</button>
+    </div>
+    
+    <script>
+        // Generate QR code using qrcode-generator library
+        const qrText = "{{.QRCode}}";
+        const canvas = document.getElementById('qrcode');
+        
+        // Debug logging
+        console.log('QR Text:', qrText);
+        console.log('QR Text Length:', qrText.length);
+        console.log('QR Text Type:', typeof qrText);
+        
+        try {
+            // Try method 1: qrcode-generator library
+            console.log('Attempting Method 1: qrcode-generator library');
+            const qr = qrcode(0, 'L'); // L = Low error correction, good for clean displays
+            qr.addData(qrText);
+            qr.make();
+            
+            // Get the module count
+            const moduleCount = qr.getModuleCount();
+            // Use larger cell size for better mobile scanning (minimum 6px per module)
+            const cellSize = Math.max(6, Math.floor(320 / moduleCount));
+            const canvasSize = cellSize * moduleCount;
+            
+            console.log('Module Count:', moduleCount);
+            console.log('Cell Size:', cellSize);
+            console.log('Canvas Size:', canvasSize);
+            
+            // Set canvas size
+            canvas.width = canvasSize;
+            canvas.height = canvasSize;
+            
+            // Get canvas context
+            const ctx = canvas.getContext('2d');
+            
+            // Fill background white first
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, canvasSize, canvasSize);
+            
+            // Draw QR code with crisp edges
+            ctx.imageSmoothingEnabled = false;
+            for (let row = 0; row < moduleCount; row++) {
+                for (let col = 0; col < moduleCount; col++) {
+                    if (qr.isDark(row, col)) {
+                        ctx.fillStyle = '#000000';
+                        ctx.fillRect(col * cellSize, row * cellSize, cellSize, cellSize);
+                    }
+                }
+            }
+            
+            console.log('Method 1: QR Code rendered successfully');
+        } catch (error) {
+            console.error('Method 1 failed:', error);
+            
+            // Try method 2: QRCode.js library (fallback)
+            if (typeof QRCode !== 'undefined') {
+                try {
+                    console.log('Attempting Method 2: QRCode.js library');
+                    
+                    // Clear canvas
+                    const ctx = canvas.getContext('2d');
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    
+                    // Use QRCode.js to render directly to canvas
+                    QRCode.toCanvas(canvas, qrText, {
+                        width: 320,
+                        margin: 2,
+                        color: {
+                            dark: '#000000',
+                            light: '#FFFFFF'
+                        },
+                        errorCorrectionLevel: 'L'
+                    }, function(error) {
+                        if (error) {
+                            console.error('Method 2 failed:', error);
+                            canvas.parentElement.innerHTML = '<p style="color: red;">Both QR code methods failed. Please refresh the page.</p>';
+                        } else {
+                            console.log('Method 2: QR Code rendered successfully');
+                        }
+                    });
+                } catch (error2) {
+                    console.error('Method 2 failed:', error2);
+                    canvas.parentElement.innerHTML = '<p style="color: red;">All QR code generation methods failed: ' + error.message + '</p>';
+                }
+            } else {
+                console.error('QRCode.js library not loaded');
+                canvas.parentElement.innerHTML = '<p style="color: red;">QR Code generation failed: ' + error.message + '</p>';
+            }
+        }
+        
+        // Auto-refresh every 30 seconds to check for new QR codes
+        setTimeout(() => {
+            location.reload();
+        }, 30000);
+    </script>
+</body>
+</html>`
+
+		tmpl, err := template.New("qr").Parse(qrTemplate)
+		if err != nil {
+			http.Error(w, "Template error", http.StatusInternalServerError)
+			return
+		}
+
+		// Properly escape QR code for JavaScript template
+		escapedQR := strings.ReplaceAll(qrCode, `\`, `\\`)
+		escapedQR = strings.ReplaceAll(escapedQR, `"`, `\"`)
+		escapedQR = strings.ReplaceAll(escapedQR, "\n", "\\n")
+		escapedQR = strings.ReplaceAll(escapedQR, "\r", "\\r")
+		
+		data := struct {
+			QRCode string
+		}{
+			QRCode: escapedQR,
+		}
+
+		err = tmpl.Execute(w, data)
+		if err != nil {
+			http.Error(w, "Template execution error", http.StatusInternalServerError)
+		}
+	})
+
+	// Handler for status dashboard
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "status.html")
+	})
+
+	// Handler for status API (for dashboard JS)
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		authMutex.RLock()
+		authenticated := isAuthenticated
+		qrCode := currentQRCode
+		authMutex.RUnlock()
+		
+		// Get database stats
+		var msgCount, chatCount int64
+		var lastSyncTime *time.Time
+		var dbSize int64
+		
+		if messageStore != nil {
+			// Get message count
+			err := messageStore.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&msgCount)
+			if err != nil {
+				msgCount = 0
+			}
+			
+			// Get chat count
+			err = messageStore.db.QueryRow("SELECT COUNT(*) FROM chats").Scan(&chatCount)
+			if err != nil {
+				chatCount = 0
+			}
+			
+			// Get last message time
+			var lastMsg string
+			err = messageStore.db.QueryRow("SELECT MAX(timestamp) FROM messages").Scan(&lastMsg)
+			if err == nil && lastMsg != "" {
+				if t, err := time.Parse("2006-01-02 15:04:05", lastMsg); err == nil {
+					lastSyncTime = &t
+				}
+			}
+			
+			// Get database file size
+			if info, err := os.Stat("store/messages.db"); err == nil {
+				dbSize = info.Size()
+			}
+		}
+		
+		status := map[string]interface{}{
+			"sync_status": map[string]interface{}{
+				"active": authenticated && client.IsConnected(),
+				"authenticated": authenticated,
+				"connected": client.IsConnected(),
+			},
+			"bridge_status": map[string]interface{}{
+				"running": true,
+				"authenticated": authenticated,
+				"api_responsive": true,
+			},
+			"statistics": map[string]interface{}{
+				"message_count": msgCount,
+				"chat_count": chatCount,
+				"last_sync_time": lastSyncTime,
+				"database_size_mb": float64(dbSize) / (1024 * 1024),
+				"database_exists": true,
+			},
+			"authentication": map[string]interface{}{
+				"has_qr_code": qrCode != "",
+				"qr_url": "http://localhost:8080/qr",
+			},
+			"last_check": time.Now(),
+			"error": nil,
+		}
+		
+		json.NewEncoder(w).Encode(status)
+	})
+
+	// Handler for authentication status API
+	http.HandleFunc("/api/auth-status", func(w http.ResponseWriter, r *http.Request) {
+		authMutex.RLock()
+		authenticated := isAuthenticated
+		qrCode := currentQRCode
+		authMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		response := map[string]interface{}{
+			"authenticated": authenticated,
+			"has_qr_code":   qrCode != "",
+			"qr_url":        "http://localhost:8080/qr",
+		}
+
+		json.NewEncoder(w).Encode(response)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1299,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -833,6 +1332,9 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+
+	// Start REST API server early so QR code web interface is available
+	startRESTServer(client, messageStore, 8080)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -866,12 +1368,41 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Print QR code for pairing with phone and update global state
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Update QR code if it's different or if we haven't set one yet
+				authMutex.Lock()
+				if currentQRCode != evt.Code || currentQRCode == "" {
+					// Prevent too rapid updates of the same QR code (spam protection)
+					if currentQRCode == evt.Code && time.Since(lastQRUpdate) < 5*time.Second {
+						authMutex.Unlock()
+						fmt.Printf("QR code spam protection - same code too soon\n")
+					} else {
+						currentQRCode = evt.Code
+						isAuthenticated = false
+						lastQRUpdate = time.Now()
+						
+						// Debug: Print raw QR code to see what it contains
+						fmt.Printf("DEBUG - Raw QR Code: %q\n", evt.Code)
+						
+						authMutex.Unlock()
+						
+						fmt.Println("\nScan this QR code with your WhatsApp app:")
+						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+						fmt.Printf("\nQR Code is also available at: http://localhost:8080/qr\n")
+					}
+				} else {
+					authMutex.Unlock()
+					fmt.Printf("QR code unchanged, still available at: http://localhost:8080/qr\n")
+				}
 			} else if evt.Event == "success" {
+				// Update authentication state
+				authMutex.Lock()
+				currentQRCode = ""
+				isAuthenticated = true
+				authMutex.Unlock()
+				
 				connected <- true
 				break
 			}
@@ -892,6 +1423,13 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
+		
+		// Update authentication state for already logged in users
+		authMutex.Lock()
+		currentQRCode = ""
+		isAuthenticated = true
+		authMutex.Unlock()
+		
 		connected <- true
 	}
 
@@ -904,9 +1442,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -988,7 +1523,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

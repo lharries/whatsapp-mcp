@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp MCP Status</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+        }
+        .status-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 15px 0;
+        }
+        .status-active { border-left: 4px solid #4CAF50; }
+        .status-inactive { border-left: 4px solid #f44336; }
+        .status-warning { border-left: 4px solid #ff9800; }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .metric:last-child { border-bottom: none; }
+        .metric-label { font-weight: 500; }
+        .metric-value { color: #666; }
+        h1 { color: #333; margin-bottom: 10px; }
+        h2 { color: #555; margin-bottom: 15px; font-size: 18px; }
+        .refresh-btn {
+            background: #007AFF;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 20px 0;
+        }
+        .refresh-btn:hover { background: #0056CC; }
+        .timestamp { color: #888; font-size: 14px; }
+        .error { color: #f44336; background: #ffebee; padding: 10px; border-radius: 4px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WhatsApp MCP Status Dashboard</h1>
+        <p class="timestamp">Last updated: <span id="lastUpdate">Loading...</span></p>
+        
+        <button class="refresh-btn" onclick="loadStatus()">Refresh Status</button>
+        
+        <div id="statusContainer">
+            <div class="status-card">
+                <h2>Loading status...</h2>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function loadStatus() {
+            try {
+                // Update timestamp
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleString();
+                
+                // Fetch real status from API
+                const response = await fetch('/api/status');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const status = await response.json();
+                
+                // Transform the status to match our rendering format
+                const transformedStatus = {
+                    sync_status: status.sync_status?.active ? "Active" : "Inactive",
+                    bridge_status: {
+                        running: status.bridge_status?.running || false,
+                        authenticated: status.bridge_status?.authenticated || false,
+                        api_responsive: status.bridge_status?.api_responsive || false
+                    },
+                    statistics: {
+                        message_count: status.statistics?.message_count || 0,
+                        chat_count: status.statistics?.chat_count || 0,
+                        last_sync_time: status.statistics?.last_sync_time,
+                        database_size_mb: status.statistics?.database_size_mb || 0,
+                        database_exists: status.statistics?.database_exists || false
+                    },
+                    last_check: status.last_check,
+                    error: status.error
+                };
+                
+                renderStatus(transformedStatus);
+            } catch (error) {
+                document.getElementById('statusContainer').innerHTML = 
+                    '<div class="error">Failed to load status: ' + error.message + '</div>';
+            }
+        }
+        
+        function renderStatus(status) {
+            const container = document.getElementById('statusContainer');
+            const statusClass = status.sync_status === 'Active' ? 'status-active' : 
+                               status.sync_status === 'Error' ? 'status-inactive' : 'status-warning';
+            
+            container.innerHTML = `
+                <div class="status-card ${statusClass}">
+                    <h2>Sync Status: ${status.sync_status}</h2>
+                    ${status.error ? `<div class="error">${status.error}</div>` : ''}
+                </div>
+                
+                <div class="status-card">
+                    <h2>Bridge Status</h2>
+                    <div class="metric">
+                        <span class="metric-label">Process Running</span>
+                        <span class="metric-value">${status.bridge_status.running ? '✅ Yes' : '❌ No'}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Authenticated</span>
+                        <span class="metric-value">${status.bridge_status.authenticated ? '✅ Yes' : '❌ No'}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">API Responsive</span>
+                        <span class="metric-value">${status.bridge_status.api_responsive ? '✅ Yes' : '❌ No'}</span>
+                    </div>
+                </div>
+                
+                <div class="status-card">
+                    <h2>Statistics</h2>
+                    <div class="metric">
+                        <span class="metric-label">Total Messages</span>
+                        <span class="metric-value">${status.statistics.message_count.toLocaleString()}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Total Chats</span>
+                        <span class="metric-value">${status.statistics.chat_count}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Database Size</span>
+                        <span class="metric-value">${status.statistics.database_size_mb} MB</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Last Sync</span>
+                        <span class="metric-value">${status.statistics.last_sync_time ? 
+                            new Date(status.statistics.last_sync_time).toLocaleString() : 'Never'}</span>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // Load status on page load
+        loadStatus();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadStatus, 30000);
+    </script>
+</body>
+</html>

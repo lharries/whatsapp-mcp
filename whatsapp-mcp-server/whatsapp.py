@@ -6,9 +6,20 @@ import os.path
 import requests
 import json
 import audio
+import subprocess
+import time
+import threading
+import queue
+import psutil
+import signal
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge')
+BRIDGE_EXECUTABLE = "main.go"
+BRIDGE_PROCESS = None
+BRIDGE_OUTPUT_QUEUE = queue.Queue()
+QR_CODE_DATA = None
 
 @dataclass
 class Message:
@@ -46,6 +57,14 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+@dataclass
+class BridgeStatus:
+    is_running: bool
+    is_authenticated: bool
+    api_responsive: bool
+    qr_code: Optional[str] = None
+    error_message: Optional[str] = None
 
 def get_sender_name(sender_jid: str) -> str:
     try:
@@ -120,6 +139,367 @@ def format_messages_list(messages: List[Message], show_chat_info: bool = True) -
     for message in messages:
         output += format_message(message, show_chat_info)
     return output
+
+# Bridge Management Functions
+
+def is_bridge_process_running() -> bool:
+    """Check if the bridge Go process is currently running."""
+    global BRIDGE_PROCESS
+    
+    if BRIDGE_PROCESS and BRIDGE_PROCESS.poll() is None:
+        return True
+    
+    # Check if any go process is running main.go in the bridge directory
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if proc.info['name'] in ['go', 'main']:
+                cmdline = proc.info['cmdline']
+                if cmdline and any('main.go' in arg for arg in cmdline):
+                    if any(BRIDGE_DIR in arg for arg in cmdline):
+                        return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    return False
+
+def check_api_health() -> bool:
+    """Check if the bridge API is responsive."""
+    try:
+        response = requests.get(f"{WHATSAPP_API_BASE_URL.replace('/api', '')}/", timeout=5)
+        return response.status_code in [200, 404]  # 404 is OK, means server is running
+    except requests.RequestException:
+        return False
+
+def check_authentication_status() -> Tuple[bool, Optional[str]]:
+    """Check if WhatsApp is authenticated by looking for session data."""
+    whatsapp_db_path = os.path.join(BRIDGE_DIR, 'store', 'whatsapp.db')
+    
+    if not os.path.exists(whatsapp_db_path):
+        return False, "No session database found"
+    
+    try:
+        conn = sqlite3.connect(whatsapp_db_path)
+        cursor = conn.cursor()
+        
+        # Check if device table exists and has data
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='whatsmeow_device';")
+        if not cursor.fetchone():
+            return False, "No device table found"
+        
+        cursor.execute("SELECT COUNT(*) FROM whatsmeow_device;")
+        device_count = cursor.fetchone()[0]
+        
+        if device_count == 0:
+            return False, "No device registered"
+        
+        return True, None
+        
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def monitor_bridge_output(process):
+    """Monitor bridge process output for QR codes and status updates."""
+    global QR_CODE_DATA, BRIDGE_OUTPUT_QUEUE
+    
+    qr_lines = []
+    capturing_qr = False
+    
+    for line in iter(process.stdout.readline, ''):
+        line_str = line.strip()
+        BRIDGE_OUTPUT_QUEUE.put(line_str)
+        
+        # Detect QR code start
+        if "Scan this QR code with your WhatsApp app:" in line_str:
+            capturing_qr = True
+            qr_lines = []
+            continue
+        
+        # Capture QR code lines (they contain █ and ▄ characters)
+        if capturing_qr:
+            if "Successfully connected and authenticated!" in line_str:
+                capturing_qr = False
+                if qr_lines:
+                    QR_CODE_DATA = "\n".join(qr_lines)
+            elif any(char in line_str for char in ['█', '▄', '▀', '▐', '▌']):
+                qr_lines.append(line_str)
+
+def start_bridge_process() -> Tuple[bool, str]:
+    """Start the WhatsApp bridge Go process."""
+    global BRIDGE_PROCESS
+    
+    if is_bridge_process_running():
+        return True, "Bridge is already running"
+    
+    try:
+        # Change to bridge directory and start the Go application
+        bridge_path = os.path.abspath(BRIDGE_DIR)
+        
+        if not os.path.exists(bridge_path):
+            return False, f"Bridge directory not found: {bridge_path}"
+        
+        go_file = os.path.join(bridge_path, BRIDGE_EXECUTABLE)
+        if not os.path.exists(go_file):
+            return False, f"Bridge executable not found: {go_file}"
+        
+        # Find Go executable
+        go_cmd = None
+        for go_path in ['/usr/local/go/bin/go', '/opt/homebrew/bin/go', 'go']:
+            try:
+                result = subprocess.run([go_path, 'version'], capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    go_cmd = go_path
+                    break
+            except (subprocess.SubprocessError, FileNotFoundError):
+                continue
+        
+        if not go_cmd:
+            return False, "Go executable not found. Please ensure Go is installed and accessible."
+        
+        # Prepare environment with Go paths
+        env = os.environ.copy()
+        env['PATH'] = '/usr/local/go/bin:/opt/homebrew/bin:' + env.get('PATH', '')
+        env['GOPATH'] = env.get('GOPATH', os.path.expanduser('~/go'))
+        env['GOROOT'] = env.get('GOROOT', '/usr/local/go')
+        
+        # Start the process
+        BRIDGE_PROCESS = subprocess.Popen(
+            [go_cmd, 'run', 'main.go'],
+            cwd=bridge_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+        
+        # Start output monitoring in a separate thread
+        output_thread = threading.Thread(target=monitor_bridge_output, args=(BRIDGE_PROCESS,))
+        output_thread.daemon = True
+        output_thread.start()
+        
+        # Wait a moment for the process to start
+        time.sleep(2)
+        
+        if BRIDGE_PROCESS.poll() is not None:
+            return False, f"Bridge process failed to start. Exit code: {BRIDGE_PROCESS.returncode}"
+        
+        return True, "Bridge process started successfully"
+        
+    except Exception as e:
+        return False, f"Failed to start bridge process: {str(e)}"
+
+def stop_bridge_process() -> bool:
+    """Stop the WhatsApp bridge process."""
+    global BRIDGE_PROCESS
+    
+    if BRIDGE_PROCESS:
+        try:
+            BRIDGE_PROCESS.terminate()
+            BRIDGE_PROCESS.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            BRIDGE_PROCESS.kill()
+        except Exception:
+            pass
+        finally:
+            BRIDGE_PROCESS = None
+    
+    return True
+
+def wait_for_authentication(timeout: int = 120) -> Tuple[bool, Optional[str]]:
+    """Wait for WhatsApp authentication to complete."""
+    global QR_CODE_DATA, BRIDGE_OUTPUT_QUEUE
+    
+    start_time = time.time()
+    qr_returned = False
+    collected_output = []
+    
+    while time.time() - start_time < timeout:
+        # Check authentication status first
+        is_auth, _ = check_authentication_status()
+        if is_auth:
+            return True, None
+        
+        # Check for new output from bridge
+        try:
+            while True:
+                line = BRIDGE_OUTPUT_QUEUE.get_nowait()
+                collected_output.append(line)
+                print(f"Bridge output: {line}")  # Debug output
+        except queue.Empty:
+            pass
+        
+        # Check if we have a QR code to display (only return it once)
+        if QR_CODE_DATA and not qr_returned:
+            qr_returned = True
+            return False, QR_CODE_DATA
+        
+        # Look for QR code patterns in collected output
+        output_text = '\n'.join(collected_output)
+        if "Scan this QR code with your WhatsApp app:" in output_text and not qr_returned:
+            # Extract QR code lines manually
+            qr_lines = []
+            in_qr = False
+            for line in collected_output:
+                if "Scan this QR code with your WhatsApp app:" in line:
+                    in_qr = True
+                    continue
+                if in_qr:
+                    if any(char in line for char in ['█', '▄', '▀', '▐', '▌']):
+                        qr_lines.append(line)
+                    elif "Successfully connected" in line or "Connected to WhatsApp" in line:
+                        break
+            
+            if qr_lines:
+                qr_code = '\n'.join(qr_lines)
+                qr_returned = True
+                return False, qr_code
+        
+        # Check if bridge process is still running
+        if not is_bridge_process_running():
+            return False, "Bridge process stopped unexpectedly"
+        
+        time.sleep(0.5)  # Check more frequently
+    
+    # Return collected output for debugging if timeout
+    debug_info = f"Authentication timeout. Collected output:\n" + '\n'.join(collected_output[-20:])  # Last 20 lines
+    return False, debug_info
+
+def get_bridge_status() -> BridgeStatus:
+    """Get comprehensive bridge status."""
+    is_running = is_bridge_process_running()
+    api_responsive = check_api_health() if is_running else False
+    is_authenticated, auth_error = check_authentication_status()
+    
+    status = BridgeStatus(
+        is_running=is_running,
+        is_authenticated=is_authenticated,
+        api_responsive=api_responsive,
+        error_message=auth_error
+    )
+    
+    return status
+
+def get_qr_code_from_running_bridge() -> Optional[str]:
+    """Try to get QR code from a running bridge by restarting it and capturing output."""
+    global BRIDGE_PROCESS
+    
+    # Stop current bridge
+    stop_bridge_process()
+    time.sleep(1)
+    
+    try:
+        # Start bridge and capture initial output
+        bridge_path = os.path.abspath(BRIDGE_DIR)
+        
+        # Find Go executable
+        go_cmd = None
+        for go_path in ['/usr/local/go/bin/go', '/opt/homebrew/bin/go', 'go']:
+            try:
+                result = subprocess.run([go_path, 'version'], capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    go_cmd = go_path
+                    break
+            except (subprocess.SubprocessError, FileNotFoundError):
+                continue
+        
+        if not go_cmd:
+            return None
+        
+        # Prepare environment
+        env = os.environ.copy()
+        env['PATH'] = '/usr/local/go/bin:/opt/homebrew/bin:' + env.get('PATH', '')
+        env['GOPATH'] = env.get('GOPATH', os.path.expanduser('~/go'))
+        env['GOROOT'] = env.get('GOROOT', '/usr/local/go')
+        
+        # Start process and capture output for a few seconds
+        process = subprocess.Popen(
+            [go_cmd, 'run', 'main.go'],
+            cwd=bridge_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env
+        )
+        
+        output_lines = []
+        start_time = time.time()
+        
+        # Capture output for up to 8 seconds
+        while time.time() - start_time < 8:
+            try:
+                line = process.stdout.readline()
+                if line:
+                    output_lines.append(line.strip())
+                    # Check if we found authentication success
+                    if "Successfully connected and authenticated" in line:
+                        break
+                else:
+                    time.sleep(0.1)
+            except:
+                break
+        
+        # Set the global process reference
+        BRIDGE_PROCESS = process
+        
+        # Extract QR code from output
+        qr_lines = []
+        in_qr = False
+        
+        for line in output_lines:
+            if "Scan this QR code with your WhatsApp app:" in line:
+                in_qr = True
+                continue
+            if in_qr:
+                if any(char in line for char in ['█', '▄', '▀', '▐', '▌']):
+                    qr_lines.append(line)
+                elif "Successfully connected" in line or "Connected to WhatsApp" in line:
+                    break
+                elif line.strip() == "":  # End of QR code
+                    break
+        
+        if qr_lines:
+            return '\n'.join(qr_lines)
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error getting QR code: {e}")
+        return None
+
+def ensure_bridge_ready() -> Tuple[bool, str, Optional[str]]:
+    """Ensure bridge is running and authenticated. Returns (success, message, qr_url)."""
+    
+    status = get_bridge_status()
+    
+    # If everything is ready, return success
+    if status.is_running and status.api_responsive and status.is_authenticated:
+        return True, "Bridge is ready", None
+    
+    # If bridge is not running, start it
+    if not status.is_running:
+        success, message = start_bridge_process()
+        if not success:
+            return False, f"Failed to start bridge: {message}", None
+        
+        # Wait for API to become responsive
+        for _ in range(30):  # Wait up to 30 seconds
+            if check_api_health():
+                break
+            time.sleep(1)
+        else:
+            return False, "Bridge started but API is not responsive", None
+    
+    # Check authentication status again after ensuring bridge is running
+    status = get_bridge_status()
+    if status.is_authenticated:
+        return True, "Bridge is ready and authenticated", None
+    
+    # Not authenticated - bridge should be serving QR code via web interface
+    qr_url = "http://localhost:8080/qr"
+    return False, "Bridge is running but not authenticated. Please scan the QR code via the web interface.", qr_url
 
 def list_messages(
     after: Optional[str] = None,

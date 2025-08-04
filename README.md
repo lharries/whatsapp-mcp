@@ -33,8 +33,11 @@ Here's an example of what you can do when it's connected to Claude.
    cd whatsapp-mcp
    ```
 
-2. **Run the WhatsApp bridge**
+2. **Authentication Setup**
 
+   The WhatsApp MCP server now features **automatic bridge management**. You have two options:
+
+   **Option A: Manual Bridge Startup (Traditional)**
    Navigate to the whatsapp-bridge directory and run the Go application:
 
    ```bash
@@ -42,9 +45,19 @@ Here's an example of what you can do when it's connected to Claude.
    go run main.go
    ```
 
-   The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
+   **Option B: Automatic Startup (Recommended)**
+   Skip manual bridge startup! The MCP server will automatically start the bridge when you use any WhatsApp tool in Claude.
 
-   After approximately 20 days, you will might need to re-authenticate.
+   #### Authentication Process
+   - **First Time**: You'll need to scan a QR code to authenticate
+   - **QR Code Access**: Visit `http://localhost:8080/qr` in your browser to see the QR code
+   - **Mobile App**: Open WhatsApp → Settings → Linked Devices → Link a Device → Scan QR code
+   - **Re-authentication**: After ~20 days, you may need to re-authenticate using the same process
+
+   #### Bridge Status Monitoring
+   - **Status Dashboard**: `http://localhost:8080/status` - Visual dashboard with real-time status
+   - **QR Code Page**: `http://localhost:8080/qr` - Authentication QR code when needed
+   - **API Status**: `http://localhost:8080/api/status` - JSON status data
 
 3. **Connect to the MCP server**
 
@@ -128,6 +141,7 @@ Once connected, you can interact with your WhatsApp contacts through Claude, lev
 
 Claude can access the following tools to interact with WhatsApp:
 
+#### Message and Chat Management
 - **search_contacts**: Search for contacts by name or phone number
 - **list_messages**: Retrieve messages with optional filters and context
 - **list_chats**: List available chats with metadata
@@ -136,10 +150,25 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
+
+#### Message Sending
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+
+#### Media Management
 - **download_media**: Download media from a WhatsApp message and get the local file path
+
+#### Status Monitoring
+- **get_sync_status**: Get comprehensive sync status including bridge health, database statistics, and last sync time
+- **check_bridge_status**: Check the current status of the WhatsApp bridge and authentication
+
+### MCP Resources
+
+Claude can also access these resources for status information:
+
+- **whatsapp://sync-status**: JSON resource providing real-time bridge and sync status
+- **whatsapp://status-ui**: Rich HTML status display with visual indicators and statistics
 
 ### Media Handling Features
 
@@ -159,6 +188,35 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+### Status Monitoring Features
+
+The WhatsApp MCP server includes comprehensive status monitoring capabilities:
+
+#### Web Dashboard
+Access a visual status dashboard at `http://localhost:8080/status` when the bridge is running:
+- Real-time bridge and authentication status
+- Database statistics (message count, chat count, database size)
+- Last sync timestamp
+- Auto-refresh every 30 seconds
+- Visual status indicators with color-coded badges
+
+#### MCP Status Tools
+- **Bridge Health**: Check if the WhatsApp bridge process is running and responsive
+- **Authentication Status**: Monitor WhatsApp authentication state and QR code availability
+- **Sync Statistics**: View message counts, chat counts, and database metrics
+- **Error Reporting**: Get detailed error messages and troubleshooting guidance
+
+#### Automatic Bridge Management
+- **Auto-startup**: All MCP tools automatically start the bridge if it's not running
+- **Health Monitoring**: Continuous monitoring of bridge process and API responsiveness
+- **Authentication Recovery**: Automatic QR code generation for re-authentication
+
+#### Status Access Methods
+1. **MCP Tools**: Call `get_sync_status` or `check_bridge_status` in Claude
+2. **MCP Resources**: View `whatsapp://sync-status` or `whatsapp://status-ui` resources
+3. **Web Interface**: Visit `http://localhost:8080/status` in your browser
+4. **API Endpoint**: Access `http://localhost:8080/api/status` for JSON data
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server
@@ -169,15 +227,183 @@ By default, just the metadata of the media is stored in the local database. The 
 
 ## Troubleshooting
 
+### General Issues
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
-- Make sure both the Go application and the Python server are running for the integration to work properly.
+- With automatic bridge management, you only need the Python MCP server running - the Go bridge will start automatically.
+
+### Bridge and Connection Issues
+
+#### Bridge Startup Problems
+- **Auto-startup Fails**: Check the status dashboard at `http://localhost:8080/status` for detailed error information
+- **Go Not Found**: Ensure Go is installed and available in PATH (`which go` should return a path)
+- **Port Already in Use**: If port 8080 is busy, kill any existing processes: `pkill -f 'go run main.go'`
+- **Permission Issues**: Ensure the MCP server has permission to start the Go bridge process
+
+#### Status Monitoring
+- **Check Bridge Status**: Use the `check_bridge_status` MCP tool in Claude for real-time diagnostics
+- **Web Dashboard**: Visit `http://localhost:8080/status` for visual status monitoring
+- **API Diagnostics**: Access `http://localhost:8080/api/status` for JSON status data
 
 ### Authentication Issues
 
-- **QR Code Not Displaying**: If the QR code doesn't appear, try restarting the authentication script. If issues persist, check if your terminal supports displaying QR codes.
-- **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
-- **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
-- **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
-- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **QR Code Not Displaying**: 
+  - Visit `http://localhost:8080/qr` in your browser instead of checking the terminal
+  - If the page shows "no QR code available", restart the bridge or use a WhatsApp tool to trigger authentication
+- **QR Code Expired**: Refresh the QR code page or restart the bridge to generate a new QR code
+- **WhatsApp Already Logged In**: If your session is already active, the bridge will automatically reconnect without showing a QR code
+- **Device Limit Reached**: WhatsApp limits linked devices. Remove an existing device: WhatsApp → Settings → Linked Devices
+- **Authentication Timeout**: Try using the `check_bridge_status` tool which will attempt to restart the authentication process
+
+### Data Sync Issues
+
+- **No Messages Loading**: After initial authentication, it can take several minutes for message history to load
+- **Missing Recent Messages**: The bridge syncs incrementally; recent messages should appear within a few seconds
+- **WhatsApp Out of Sync**: Delete both database files and restart:
+  ```bash
+  rm whatsapp-bridge/store/messages.db whatsapp-bridge/store/whatsapp.db
+  # Bridge will restart automatically when you use a WhatsApp tool
+  ```
+
+### Status Dashboard Issues
+
+- **Dashboard Not Loading**: Ensure the bridge is running by calling a WhatsApp MCP tool first
+- **Status Shows "Not Ready"**: Check individual status indicators for specific issues
+- **Auto-refresh Not Working**: Browser may have JavaScript disabled; manually refresh the page
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+## Running in Docker
+
+The WhatsApp MCP server supports containerized deployment using Docker and Docker Compose. The container includes both the Go bridge and Python MCP server in a single, optimized image that preserves all automatic bridge management features.
+
+### Quick Start
+
+1. **Build and start the container:**
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Access the QR code for authentication:**
+   - Web interface: `http://localhost:8080/qr`
+   - Status dashboard: `http://localhost:8080/status`
+
+3. **Configure Claude Desktop** to use the containerized MCP server (see configuration below)
+
+### Architecture
+
+The Docker deployment uses a **combined container approach** that includes:
+- **Go Bridge**: Compiled binary handling WhatsApp API communication
+- **Go Runtime**: Available for automatic bridge process management
+- **Python MCP Server**: Full MCP functionality with automatic bridge management
+- **Shared Storage**: SQLite databases persisted via Docker volumes
+
+This architecture ensures that all automatic bridge management features (startup, monitoring, QR code capture) work exactly as in local installations.
+
+### MCP Transport Modes
+
+The MCP server supports two transport modes, configurable via the `MCP_TRANSPORT` environment variable:
+
+#### **STDIO Transport** (Default for local installations)
+- **Use case:** Local development, direct MCP client connections
+- **Characteristics:** 
+  - Communication via standard input/output streams
+  - Lower latency for local connections
+  - Requires direct process management
+- **Claude Configuration:**
+  ```json
+  {
+    "mcpServers": {
+      "whatsapp": {
+        "command": "uv",
+        "args": ["run", "main.py"],
+        "cwd": "/path/to/whatsapp-mcp-server"
+      }
+    }
+  }
+  ```
+
+#### **SSE Transport** (Default for Docker)
+- **Use case:** Containerized deployments, web-based integrations
+- **Characteristics:**
+  - Communication via HTTP Server-Sent Events
+  - Better suited for container environments
+  - Enables web-based MCP client connections
+  - Listens on port 3000 by default
+- **Claude Configuration:**
+  ```json
+  {
+    "mcpServers": {
+      "whatsapp": {
+        "command": "docker",
+        "args": [
+          "exec",
+          "-i",
+          "whatsapp-mcp-server",
+          "uv",
+          "run",
+          "main.py"
+        ]
+      }
+    }
+  }
+  ```
+
+### Environment Variables
+
+Configure the Docker deployment using these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_TRANSPORT` | `sse` (Docker), `stdio` (local) | MCP transport protocol |
+| `WHATSAPP_BRIDGE_URL` | `http://localhost:8080` | Bridge API endpoint (localhost in combined container) |
+| `DATABASE_PATH` | `/app/whatsapp-bridge/store/messages.db` | SQLite database path |
+| `WHATSAPP_DB_PATH` | `/app/whatsapp-bridge/store` | Bridge database directory |
+
+### Docker Compose Configuration
+
+The provided `docker-compose.yml` includes:
+
+- **Combined Container**: Single container with both Go bridge and Python MCP server
+- **Automatic Bridge Management**: Full subprocess control and monitoring within container
+- **Persistent Storage**: SQLite databases stored in Docker volume
+- **Health Checks**: Container health monitoring via bridge API
+- **Port Mapping**: Web interface (8080) and MCP server (3000)
+
+### Customizing Transport Mode
+
+To override the default SSE transport in Docker:
+
+```bash
+# Use STDIO transport in Docker (not recommended)
+MCP_TRANSPORT=stdio docker-compose up
+
+# Or set in docker-compose.yml
+environment:
+  - MCP_TRANSPORT=stdio
+```
+
+To use SSE transport locally:
+
+```bash
+# Set environment variable
+export MCP_TRANSPORT=sse
+uv run main.py
+```
+
+### Transport Mode Implications
+
+| Aspect | STDIO | SSE |
+|--------|-------|-----|
+| **Latency** | Lower | Slightly higher |
+| **Docker Support** | Limited | Excellent |
+| **Web Integration** | Not suitable | Native support |
+| **Process Management** | Direct | Via HTTP |
+| **Debugging** | Terminal logs | HTTP logs + browser tools |
+| **Scalability** | Single instance | Multiple clients possible |
+
+### Recommended Configurations
+
+- **Local Development**: Use STDIO transport with direct Python execution
+- **Production Docker**: Use SSE transport with Docker Compose
+- **CI/CD Pipelines**: Use Docker with SSE transport for testing
+- **Development Docker**: Use SSE transport for consistency with production
