@@ -1,4 +1,5 @@
 # WhatsApp MCP Server
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/lharries/whatsapp-mcp)](https://archestra.ai/mcp-catalog/lharries__whatsapp-mcp)
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
