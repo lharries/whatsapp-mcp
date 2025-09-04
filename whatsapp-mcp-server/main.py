@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+from dataclasses import asdict
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -18,6 +19,26 @@ from whatsapp import (
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
+def convert_to_dict(obj):
+    """Convert dataclass objects to dictionaries for JSON serialization."""
+    if hasattr(obj, '__dict__') and hasattr(obj, '__dataclass_fields__'):
+        # This is a dataclass
+        result = asdict(obj)
+        # Convert datetime objects to ISO strings
+        for key, value in result.items():
+            if hasattr(value, 'isoformat'):
+                result[key] = value.isoformat()
+        return result
+    elif isinstance(obj, list):
+        return [convert_to_dict(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_to_dict(value) for key, value in obj.items()}
+    elif hasattr(obj, 'isoformat'):
+        # This is a datetime
+        return obj.isoformat()
+    else:
+        return obj
+
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
@@ -26,7 +47,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return convert_to_dict(contacts)
 
 @mcp.tool()
 def list_messages(
