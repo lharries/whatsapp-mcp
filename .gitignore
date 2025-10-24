@@ -1,3 +1,51 @@
+# Database files
 *.db
+*.db-shm
+*.db-wal
+
+# Config files
 claude_desktop_config.json
+mcp.json
+.env
+.env.local
+
+# Logs
 whatsapp.log
+*.log
+logs/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data directories
+backend/data/
+frontend/dist/
+common/dist/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+*.tmp
+tmp/
+temp/

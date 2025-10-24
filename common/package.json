@@ -1,0 +1,21 @@
+{
+  "name": "@whatsapp-mcp/common",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Shared types, utilities, and constants for WhatsApp MCP",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/**/*.ts"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2",
+    "vitest": "^1.6.0"
+  }
+}

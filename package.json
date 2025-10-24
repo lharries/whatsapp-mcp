@@ -1,0 +1,38 @@
+{
+  "name": "whatsapp-mcp-monorepo",
+  "version": "2.0.0",
+  "private": true,
+  "description": "WhatsApp MCP Server - Full-Stack TypeScript Implementation",
+  "author": "Luke Harries",
+  "license": "MIT",
+  "workspaces": [
+    "backend",
+    "frontend",
+    "common"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "rm -rf backend/dist frontend/dist common/dist backend/node_modules frontend/node_modules common/node_modules node_modules",
+    "backend:dev": "npm run dev -w backend",
+    "frontend:dev": "npm run dev -w frontend",
+    "backend:build": "npm run build -w backend",
+    "frontend:build": "npm run build -w frontend",
+    "common:build": "npm run build -w common"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "eslint": "^9.5.0",
+    "prettier": "^3.3.2",
+    "typescript": "^5.5.2",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
