@@ -1,3 +1,9 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# MVP downloads folder
+downloads/
+
+# Config with sensitive credentials (keep config.json template in repo)
+# Users should copy and fill in their own credentials
