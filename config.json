@@ -1,0 +1,11 @@
+{
+  "whatsapp": {
+    "group_name": "My Group Name"
+  },
+  "aws": {
+    "bucket_name": "my-whatsapp-backup-bucket",
+    "region": "us-east-1",
+    "access_key_id": "",
+    "secret_access_key": ""
+  }
+}
