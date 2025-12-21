@@ -31,6 +31,40 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// SECURITY: Log sanitization functions to prevent PII exposure
+
+// sanitizePhoneNumber redacts phone numbers in logs, keeping only last 4 digits
+func sanitizePhoneNumber(phone string) string {
+	// Extract just digits
+	digits := ""
+	for _, c := range phone {
+		if c >= '0' && c <= '9' {
+			digits += string(c)
+		}
+	}
+	if len(digits) > 4 {
+		return "***" + digits[len(digits)-4:]
+	}
+	return "****"
+}
+
+// sanitizeLogContent truncates message content for logging
+func sanitizeLogContent(content string, maxLen int) string {
+	if len(content) > maxLen {
+		return content[:maxLen] + "..."
+	}
+	return content
+}
+
+// sanitizeJID redacts the phone portion of a JID for logging
+func sanitizeJID(jid string) string {
+	parts := strings.Split(jid, "@")
+	if len(parts) == 2 {
+		return sanitizePhoneNumber(parts[0]) + "@" + parts[1]
+	}
+	return sanitizePhoneNumber(jid)
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -233,8 +267,30 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// SECURITY: Validate media path to prevent path traversal attacks
+		cleanPath := filepath.Clean(mediaPath)
+		absPath, err := filepath.Abs(cleanPath)
+		if err != nil {
+			return false, "Invalid media path"
+		}
+
+		// Get allowed media directory (current working directory + /media or configured path)
+		allowedDir := os.Getenv("WHATSAPP_MEDIA_DIR")
+		if allowedDir == "" {
+			allowedDir = "./media"
+		}
+		allowedAbsDir, err := filepath.Abs(allowedDir)
+		if err != nil {
+			return false, "Server configuration error: invalid media directory"
+		}
+
+		// Ensure the path is within the allowed directory
+		if !strings.HasPrefix(absPath, allowedAbsDir+string(os.PathSeparator)) && absPath != allowedAbsDir {
+			return false, "Access denied: media path outside allowed directory"
+		}
+
 		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		mediaData, err := os.ReadFile(absPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
@@ -462,10 +518,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		// Log based on message type
+		// SECURITY: Sanitize sender (phone number) and content to prevent PII exposure in logs
+		safeSender := sanitizeJID(sender)
+		safeContent := sanitizeLogContent(content, 50) // Truncate content to 50 chars
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, safeSender, mediaType, filename, safeContent)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, safeSender, safeContent)
 		}
 	}
 }
@@ -561,8 +620,18 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
+	// SECURITY: Sanitize chatJID to prevent path traversal
+	// Only allow alphanumeric characters, @, and _ (replace : with _)
+	sanitizedChatJID := strings.ReplaceAll(chatJID, ":", "_")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "..", "")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "/", "")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "\\", "")
+	if sanitizedChatJID == "" {
+		return false, "", "", "", fmt.Errorf("invalid chat JID")
+	}
+
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := fmt.Sprintf("store/%s", sanitizedChatJID)
 	localPath := ""
 
 	// Get media info from the database
@@ -590,8 +659,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// SECURITY: Sanitize filename to prevent path traversal
+	// Extract only the base name (no directory components)
+	safeFilename := filepath.Base(filename)
+	if safeFilename == "." || safeFilename == ".." || safeFilename == "" {
+		return false, "", "", "", fmt.Errorf("invalid filename")
+	}
+
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = fmt.Sprintf("%s/%s", chatDir, safeFilename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -599,10 +675,19 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
+	// SECURITY: Verify the path is within the store directory
+	storeDir, err := filepath.Abs("store")
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to get store directory path: %v", err)
+	}
+	if !strings.HasPrefix(absPath, storeDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("access denied: path outside store directory")
+	}
+
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, safeFilename, absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -610,7 +695,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	// SECURITY: Sanitize chatJID in log output
+	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, sanitizeJID(chatJID))
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -641,7 +727,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -652,7 +738,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, safeFilename, absPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -675,10 +761,42 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// SECURITY: Authentication middleware for API endpoints
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get API key from environment
+		expectedAPIKey := os.Getenv("WHATSAPP_API_KEY")
+
+		// If no API key is configured, reject all requests for security
+		if expectedAPIKey == "" {
+			http.Error(w, "Server not configured: WHATSAPP_API_KEY environment variable required", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Check API key from header
+		providedAPIKey := r.Header.Get("X-API-Key")
+		if providedAPIKey == "" {
+			providedAPIKey = r.Header.Get("Authorization")
+			// Support "Bearer <token>" format
+			if strings.HasPrefix(providedAPIKey, "Bearer ") {
+				providedAPIKey = strings.TrimPrefix(providedAPIKey, "Bearer ")
+			}
+		}
+
+		// Validate API key
+		if providedAPIKey == "" || providedAPIKey != expectedAPIKey {
+			http.Error(w, "Unauthorized: invalid or missing API key", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for sending messages (with authentication)
+	http.HandleFunc("/api/send", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -721,10 +839,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for downloading media (with authentication)
+	http.HandleFunc("/api/download", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -772,7 +890,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -800,14 +918,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1091,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1106,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
