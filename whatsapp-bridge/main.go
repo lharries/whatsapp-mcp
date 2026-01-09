@@ -244,15 +244,22 @@ func sendReaction(client *whatsmeow.Client, messageStore *MessageStore, messageI
 		}
 	}
 
+	// Create the message key for the reaction
+	msgKey := &waProto.MessageKey{
+		RemoteJID: proto.String(chatJID),
+		FromMe:    proto.Bool(parsedSenderJID.User == client.Store.ID.User),
+		ID:        proto.String(messageID),
+	}
+
+	// Only set Participant for group chats
+	if strings.HasSuffix(chatJID, "@g.us") {
+		msgKey.Participant = proto.String(senderJID)
+	}
+
 	// Create the reaction message
 	reactionMsg := &waProto.Message{
 		ReactionMessage: &waProto.ReactionMessage{
-			Key: &waProto.MessageKey{
-				RemoteJID:   proto.String(chatJID),
-				FromMe:      proto.Bool(parsedSenderJID.User == client.Store.ID.User),
-				ID:          proto.String(messageID),
-				Participant: proto.String(senderJID),
-			},
+			Key:               msgKey,
 			Text:              proto.String(emoji),
 			SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
 		},
