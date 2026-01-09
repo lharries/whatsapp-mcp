@@ -202,6 +202,81 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// ReactMessageRequest represents the request body for the react to message API
+type ReactMessageRequest struct {
+	MessageID string `json:"message_id"`
+	ChatJID   string `json:"chat_jid"`
+	Emoji     string `json:"emoji"`
+}
+
+// Function to send a reaction to a WhatsApp message
+func sendReaction(client *whatsmeow.Client, messageStore *MessageStore, messageID string, chatJID string, emoji string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	// Parse the chat JID
+	targetJID, err := types.ParseJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing chat JID: %v", err)
+	}
+
+	// Get the message from the store to find sender info
+	var senderJID string
+	var timestamp int64
+	err = messageStore.db.QueryRow(`
+		SELECT sender, strftime('%s', timestamp)
+		FROM messages
+		WHERE id = ? AND chat_jid = ?
+	`, messageID, chatJID).Scan(&senderJID, &timestamp)
+
+	if err != nil {
+		return false, fmt.Sprintf("Error finding message: %v", err)
+	}
+
+	// Parse the sender JID
+	parsedSenderJID, err := types.ParseJID(senderJID)
+	if err != nil {
+		// If parsing fails, try constructing from phone number
+		parsedSenderJID = types.JID{
+			User:   senderJID,
+			Server: "s.whatsapp.net",
+		}
+	}
+
+	// Create the message key for the reaction
+	msgKey := &waProto.MessageKey{
+		RemoteJID: proto.String(chatJID),
+		FromMe:    proto.Bool(parsedSenderJID.User == client.Store.ID.User),
+		ID:        proto.String(messageID),
+	}
+
+	// Only set Participant for group chats
+	if strings.HasSuffix(chatJID, "@g.us") {
+		msgKey.Participant = proto.String(senderJID)
+	}
+
+	// Create the reaction message
+	reactionMsg := &waProto.Message{
+		ReactionMessage: &waProto.ReactionMessage{
+			Key:               msgKey,
+			Text:              proto.String(emoji),
+			SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+		},
+	}
+
+	// Send the reaction
+	_, err = client.SendMessage(context.Background(), targetJID, reactionMsg)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending reaction: %v", err)
+	}
+
+	if emoji == "" {
+		return true, "Reaction removed successfully"
+	}
+	return true, fmt.Sprintf("Reaction '%s' sent successfully", emoji)
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -641,7 +716,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -708,6 +783,53 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
+	// Handler for reacting to messages
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req ReactMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.MessageID == "" {
+			http.Error(w, "Message ID is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "Chat JID is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Println("Received request to react to message", req.MessageID, "with emoji", req.Emoji)
+
+		// Send the reaction
+		success, message := sendReaction(client, messageStore, req.MessageID, req.ChatJID, req.Emoji)
+		fmt.Println("Reaction sent", success, message)
+
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -800,14 +922,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1095,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1110,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
