@@ -724,6 +724,49 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def react_to_message(message_id: str, chat_jid: str, emoji: str) -> Tuple[bool, str]:
+    """React to a WhatsApp message with an emoji.
+
+    Args:
+        message_id: The ID of the message to react to
+        chat_jid: The JID of the chat containing the message
+        emoji: The emoji to react with (empty string to remove reaction)
+
+    Returns:
+        A tuple of (success: bool, message: str)
+    """
+    try:
+        # Validate input
+        if not message_id:
+            return False, "Message ID must be provided"
+
+        if not chat_jid:
+            return False, "Chat JID must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/react"
+        payload = {
+            "message_id": message_id,
+            "chat_jid": chat_jid,
+            "emoji": emoji
+        }
+
+        response = requests.post(url, json=payload)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
     

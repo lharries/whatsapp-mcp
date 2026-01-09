@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    react_to_message as whatsapp_react_to_message
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,25 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def react_to_message(message_id: str, chat_jid: str, emoji: str) -> Dict[str, Any]:
+    """React to a WhatsApp message with an emoji.
+
+    Args:
+        message_id: The ID of the message to react to
+        chat_jid: The JID of the chat containing the message
+        emoji: The emoji to react with (e.g., "❤️", "👍", "😂"). Use empty string to remove reaction.
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_react_to_message(message_id, chat_jid, emoji)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
 
 if __name__ == "__main__":
     # Initialize and run the server
