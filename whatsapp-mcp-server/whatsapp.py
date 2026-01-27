@@ -5,10 +5,22 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import logging
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("whatsapp-mcp")
+
+default_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+MESSAGES_DB_PATH = os.environ.get("WHATSAPP_DB_PATH", default_db_path)
+
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
+API_KEY = os.environ.get("WHATSAPP_API_KEY", "whatsapp-mcp-secret-key")
 
 @dataclass
 class Message:
@@ -85,7 +97,7 @@ def get_sender_name(sender_jid: str) -> str:
             return sender_jid
         
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        logger.error(f"Database error while getting sender name: {e}")
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -108,7 +120,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
+        logger.error(f"Error formatting message: {e}")
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
@@ -205,7 +217,8 @@ def list_messages(
             # Add context for each message
             messages_with_context = []
             for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
+                # REUSE the existing connection and pass the already fetched message object
+                context = get_message_context(msg.id, context_before, context_after, conn=conn, target_message=msg)
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
@@ -216,7 +229,7 @@ def list_messages(
         return format_messages_list(result, show_chat_info=True)    
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -226,35 +239,42 @@ def list_messages(
 def get_message_context(
     message_id: str,
     before: int = 5,
-    after: int = 5
+    after: int = 5,
+    conn: Optional[sqlite3.Connection] = None,
+    target_message: Optional[Message] = None
 ) -> MessageContext:
     """Get context around a specific message."""
+    should_close_conn = False
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        if conn is None:
+            conn = sqlite3.connect(MESSAGES_DB_PATH)
+            should_close_conn = True
+            
         cursor = conn.cursor()
         
-        # Get the target message first
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
-        """, (message_id,))
-        msg_data = cursor.fetchone()
-        
-        if not msg_data:
-            raise ValueError(f"Message with ID {message_id} not found")
+        # Get the target message first if not provided
+        if target_message is None:
+            cursor.execute("""
+                SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+                FROM messages
+                JOIN chats ON messages.chat_jid = chats.jid
+                WHERE messages.id = ?
+            """, (message_id,))
+            msg_data = cursor.fetchone()
             
-        target_message = Message(
-            timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
-            chat_name=msg_data[2],
-            content=msg_data[3],
-            is_from_me=msg_data[4],
-            chat_jid=msg_data[5],
-            id=msg_data[6],
-            media_type=msg_data[8]
-        )
+            if not msg_data:
+                raise ValueError(f"Message with ID {message_id} not found")
+                
+            target_message = Message(
+                timestamp=datetime.fromisoformat(msg_data[0]),
+                sender=msg_data[1],
+                chat_name=msg_data[2],
+                content=msg_data[3],
+                is_from_me=msg_data[4],
+                chat_jid=msg_data[5],
+                id=msg_data[6],
+                media_type=msg_data[8]
+            )
         
         # Get messages before
         cursor.execute("""
@@ -264,7 +284,7 @@ def get_message_context(
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
             ORDER BY messages.timestamp DESC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], before))
+        """, (target_message.chat_jid, target_message.timestamp, before))
         
         before_messages = []
         for msg in cursor.fetchall():
@@ -287,7 +307,7 @@ def get_message_context(
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
             ORDER BY messages.timestamp ASC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], after))
+        """, (target_message.chat_jid, target_message.timestamp, after))
         
         after_messages = []
         for msg in cursor.fetchall():
@@ -309,10 +329,10 @@ def get_message_context(
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         raise
     finally:
-        if 'conn' in locals():
+        if should_close_conn and 'conn' in locals() and conn:
             conn.close()
 
 
@@ -383,7 +403,7 @@ def list_chats(
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -396,22 +416,43 @@ def search_contacts(query: str) -> List[Contact]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
+        # Try FTS search first
+        fts_query = f"{query}*" if query else ""
+        contacts = []
+        try:
+            cursor.execute("""
+                SELECT jid, name
+                FROM chats_fts
+                WHERE chats_fts MATCH ?
+                ORDER BY rank
+                LIMIT 50
+            """, (fts_query,))
+            contacts = cursor.fetchall()
+            if not contacts and query:
+                 # If FTS returns nothing, it might be due to no matches OR table issue.
+                 # But if table exists, it returns list (empty or not).
+                 pass
+        except Exception:
+             # Fallback to LIKE if FTS table doesn't exist or other error
+            pass
+
+        if not contacts:
+            # Fallback to standard search if no results or FTS failed
+            search_pattern = '%' +query + '%'
+            
+            cursor.execute("""
+                SELECT DISTINCT 
+                    jid,
+                    name
+                FROM chats
+                WHERE 
+                    (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                    AND jid NOT LIKE '%@g.us'
+                ORDER BY name, jid
+                LIMIT 50
+            """, (search_pattern, search_pattern))
+
+            contacts = cursor.fetchall()
         
         result = []
         for contact_data in contacts:
@@ -425,7 +466,7 @@ def search_contacts(query: str) -> List[Contact]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -476,7 +517,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -525,7 +566,7 @@ def get_last_interaction(jid: str) -> str:
         return format_message(message)
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -573,7 +614,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -616,7 +657,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -634,7 +675,8 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, json=payload, headers=headers)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -668,7 +710,8 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, json=payload, headers=headers)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -708,7 +751,8 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, json=payload, headers=headers)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -741,27 +785,100 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, json=payload, headers=headers)
         
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                logger.info(f"Media downloaded successfully: {path}")
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                logger.error(f"Download failed: {result.get('message', 'Unknown error')}")
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            logger.error(f"Error: HTTP {response.status_code} - {response.text}")
             return None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        logger.error(f"Request error: {str(e)}")
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        logger.error(f"Error parsing response: {response.text}")
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return None
+
+
+def sync_contacts() -> dict:
+    """Sync contact names from WhatsApp to update phone-number-only names.
+
+    This function calls the WhatsApp bridge API to refresh contact names for
+    contacts that are currently stored with only phone numbers as names.
+    It uses the fallback chain: FullName → PushName → BusinessName → FirstName.
+
+    Returns:
+        A dictionary with sync results including:
+        - success: Whether the sync was successful
+        - message: A summary message
+        - total_checked: Number of contacts checked
+        - updated: Number of contacts updated
+        - failed: Number of contacts that failed to update
+        - details: List of updated contacts with old/new names
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/sync-contacts"
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, headers=headers)
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Contact sync completed: {result.get('message', '')}")
+            return result
+        else:
+            error_msg = f"Error: HTTP {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "message": error_msg,
+                "total_checked": 0,
+                "updated": 0,
+                "failed": 0,
+                "details": []
+            }
+
+    except requests.RequestException as e:
+        error_msg = f"Request error: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }
+    except json.JSONDecodeError:
+        error_msg = f"Error parsing response: {response.text}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }

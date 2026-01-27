@@ -1,26 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -47,14 +49,15 @@ type MessageStore struct {
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
+func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	dbPath := filepath.Join(storeDir, "messages.db")
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -90,6 +93,36 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Create FTS table for contacts
+	if _, ftsErr := db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS chats_fts USING fts5(jid, name);
+
+		-- Triggers to keep FTS in sync
+		CREATE TRIGGER IF NOT EXISTS chats_ai AFTER INSERT ON chats BEGIN
+			INSERT INTO chats_fts(jid, name) VALUES (new.jid, new.name);
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS chats_ad AFTER DELETE ON chats BEGIN
+			DELETE FROM chats_fts WHERE jid = old.jid;
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS chats_au AFTER UPDATE ON chats BEGIN
+			DELETE FROM chats_fts WHERE jid = old.jid;
+			INSERT INTO chats_fts(jid, name) VALUES (new.jid, new.name);
+		END;
+	`); ftsErr != nil {
+		fmt.Printf("Warning: Failed to create FTS table (fts5 might be missing): %v\n", ftsErr)
+		// Don't fail the whole startup, just warn. FTS is optional optimization.
+	} else {
+		// Backfill FTS table from existing chats if FTS creation succeeded
+		// Check if FTS acts as expected first (simple count) or just INSERT items missing
+		_, _ = db.Exec(`
+            INSERT INTO chats_fts(jid, name) 
+            SELECT jid, name FROM chats 
+            WHERE jid NOT IN (SELECT jid FROM chats_fts)
+        `)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -105,6 +138,48 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// UpdateChatName updates only the name of an existing chat
+func (store *MessageStore) UpdateChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET name = ? WHERE jid = ?",
+		name, jid,
+	)
+	return err
+}
+
+// GetChatsWithPhoneNumberNames returns all chats where the name appears to be a phone number
+func (store *MessageStore) GetChatsWithPhoneNumberNames() ([]struct {
+	JID  string
+	Name string
+}, error) {
+	rows, err := store.db.Query(`
+		SELECT jid, name FROM chats
+		WHERE jid LIKE '%@s.whatsapp.net'
+		AND name GLOB '[0-9]*'
+		AND name NOT GLOB '*[^0-9]*'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []struct {
+		JID  string
+		Name string
+	}
+	for rows.Next() {
+		var item struct {
+			JID  string
+			Name string
+		}
+		if err := rows.Scan(&item.JID, &item.Name); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
 }
 
 // Store a message in the database
@@ -554,7 +629,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID, storeDir string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -562,7 +637,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(storeDir, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -641,7 +716,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -675,10 +750,29 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Auth middleware to secure the API
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiKey := os.Getenv("WHATSAPP_API_KEY")
+		if apiKey == "" {
+			apiKey = "whatsapp-mcp-secret-key" // Default key if not set
+		}
+
+		if r.Header.Get("X-API-Key") != apiKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, storeDir string) (int, error) {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -724,7 +818,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -745,7 +839,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID, storeDir)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -774,16 +868,228 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Handler for syncing contact names
+	mux.HandleFunc("/api/sync-contacts", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	// Run server in a goroutine so it doesn't block
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get all chats with phone number names
+		chatsWithPhoneNames, err := messageStore.GetChatsWithPhoneNumberNames()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chats: %v", err),
+			})
+			return
+		}
+
+		updated := 0
+		failed := 0
+		details := []map[string]string{}
+
+		for _, chat := range chatsWithPhoneNames {
+			// Parse JID
+			jid, err := types.ParseJID(chat.JID)
+			if err != nil {
+				failed++
+				continue
+			}
+
+			// Get contact info from WhatsApp
+			contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+			if err != nil {
+				failed++
+				continue
+			}
+
+			// Get the best available name
+			newName := getContactName(contact)
+			if newName == "" || isPhoneNumber(newName) {
+				// No better name available
+				continue
+			}
+
+			// Update the name in the database
+			if err := messageStore.UpdateChatName(chat.JID, newName); err != nil {
+				failed++
+				continue
+			}
+
+			updated++
+			details = append(details, map[string]string{
+				"jid":      chat.JID,
+				"old_name": chat.Name,
+				"new_name": newName,
+			})
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":       true,
+			"message":       fmt.Sprintf("Synced contact names: %d updated, %d failed", updated, failed),
+			"total_checked": len(chatsWithPhoneNames),
+			"updated":       updated,
+			"failed":        failed,
+			"details":       details,
+		})
+	})
+
+	address := fmt.Sprintf(":%d", port)
+	listener, err := net.Listen("tcp", address)
+	selectedPort := port
+	if err != nil {
+		fmt.Printf("REST API server error: unable to bind to %s: %v\n", address, err)
+		fmt.Println("Attempting to bind to an ephemeral port...")
+		listener, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return 0, fmt.Errorf("failed to bind fallback port: %w", err)
+		}
+		if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+			selectedPort = tcpAddr.Port
+		}
+	}
+
+	fmt.Printf("Starting REST API server on :%d...\n", selectedPort)
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		// Wrap mux with auth middleware
+		handler := authMiddleware(mux)
+		if err := http.Serve(listener, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+
+	return selectedPort, nil
+}
+
+var (
+	errQRTimeout       = errors.New("QR pairing timed out")
+	errQRChannelClosed = errors.New("QR channel closed before authentication completed")
+)
+
+// waitForQRCodeAuth blocks until a pairing result is received from the QR channel.
+func waitForQRCodeAuth(qrChan <-chan whatsmeow.QRChannelItem, logger waLog.Logger) error {
+	for evt := range qrChan {
+		switch evt.Event {
+		case whatsmeow.QRChannelEventCode:
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			if evt.Timeout > 0 {
+				fmt.Printf("QR code expires in %s\n", evt.Timeout.Round(time.Second))
+			}
+		case whatsmeow.QRChannelEventError:
+			if evt.Error != nil {
+				return fmt.Errorf("error while pairing device: %w", evt.Error)
+			}
+			return fmt.Errorf("error while pairing device")
+		case whatsmeow.QRChannelTimeout.Event, "timeout":
+			return errQRTimeout
+		case "success":
+			return nil
+		case "err-unexpected-state":
+			return fmt.Errorf("unexpected state while pairing. Please restart the client.")
+		case "err-client-outdated":
+			return fmt.Errorf("client is outdated. Update to the latest whatsmeow build")
+		case "err-scanned-without-multidevice":
+			return fmt.Errorf("device is not enrolled in WhatsApp multi-device beta")
+		default:
+			logger.Warnf("Received unexpected QR channel event: %s", evt.Event)
+		}
+	}
+
+	return errQRChannelClosed
+}
+
+// connectWhatsAppClient tries to bring the WhatsApp client online and blocks until the connection stabilizes.
+// It returns an error instead of exiting so the caller can decide whether to run in an offline mode.
+func connectWhatsAppClient(client *whatsmeow.Client, logger waLog.Logger) error {
+	if client == nil {
+		return fmt.Errorf("client is not initialized")
+	}
+
+	if client.Store.ID == nil {
+		// No stored session, we need to pair the device. Keep trying until the user scans
+		for attempt := 1; ; attempt++ {
+			qrChan, err := client.GetQRChannel(context.Background())
+			if err != nil {
+				return fmt.Errorf("failed to get QR channel: %w", err)
+			}
+
+			if err := client.Connect(); err != nil {
+				return fmt.Errorf("failed to connect: %w", err)
+			}
+
+			err = waitForQRCodeAuth(qrChan, logger)
+			if err == nil {
+				break
+			}
+
+			client.Disconnect()
+			if errors.Is(err, errQRTimeout) || errors.Is(err, errQRChannelClosed) {
+				logger.Warnf("Pairing attempt %d did not complete (%v). Retrying...", attempt, err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			return err
+		}
+	} else {
+		if err := client.Connect(); err != nil {
+			return fmt.Errorf("failed to connect: %w", err)
+		}
+	}
+
+	// Wait a moment for connection to stabilize
+	time.Sleep(2 * time.Second)
+
+	if !client.IsConnected() {
+		return fmt.Errorf("failed to establish stable connection")
+	}
+
+	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	return nil
+}
+
+// getRESTPort determines which port the REST server should listen on.
+// It checks REST_PORT, then PORT environment variables, falling back to 8080.
+func getRESTPort() int {
+	defaultPort := 8080
+
+	readPortEnv := func(key string) (int, bool) {
+		val := strings.TrimSpace(os.Getenv(key))
+		if val == "" {
+			return 0, false
+		}
+
+		parsed, err := strconv.Atoi(val)
+		if err != nil || parsed <= 0 || parsed > 65535 {
+			fmt.Printf("Invalid %s value %q, ignoring.\n", key, val)
+			return 0, false
+		}
+		return parsed, true
+	}
+
+	if port, ok := readPortEnv("REST_PORT"); ok {
+		return port
+	}
+
+	if port, ok := readPortEnv("PORT"); ok {
+		return port
+	}
+
+	return defaultPort
+}
+
+func getStoreDir() string {
+	storeDir := os.Getenv("WHATSAPP_STORE_DIR")
+	if storeDir == "" {
+		storeDir = "store"
+	}
+	return storeDir
 }
 
 func main() {
@@ -794,20 +1100,22 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
+	storeDir := getStoreDir()
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	dbPath := filepath.Join(storeDir, "whatsapp.db")
+	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -827,7 +1135,7 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageStore, err := NewMessageStore(storeDir)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -853,73 +1161,72 @@ func main() {
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
-
-	// Connect to WhatsApp
-	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
+	offlineMode := false
+	if os.Getenv("WHATSAPP_OFFLINE") == "1" {
+		offlineMode = true
+		logger.Warnf("WHATSAPP_OFFLINE=1 detected, skipping WhatsApp connection attempt.")
+	} else if err := connectWhatsAppClient(client, logger); err != nil {
+		offlineMode = true
+		logger.Warnf("Failed to connect to WhatsApp (%v). Continuing in offline mode.", err)
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+	if offlineMode {
+		fmt.Println("WhatsApp connectivity is unavailable. REST endpoints will report 'Not connected' until a connection is established.")
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	restPort := getRESTPort()
+	actualPort, serverErr := startRESTServer(client, messageStore, restPort, storeDir)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	if serverErr != nil {
+		logger.Errorf("REST server failed to start: %v", serverErr)
+		fmt.Println("Continuing without REST server. Press Ctrl+C to exit.")
+	} else {
+		fmt.Printf("REST server is running on port %d. Press Ctrl+C to disconnect and exit.\n", actualPort)
+	}
 
 	// Wait for termination signal
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
 	// Disconnect client
-	client.Disconnect()
+	if client.IsConnected() {
+		client.Disconnect()
+	}
+}
+
+// isPhoneNumber checks if a string looks like a phone number (only digits)
+func isPhoneNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// getContactName extracts the best available name from contact info using fallback chain
+// Priority: FullName → PushName → BusinessName → FirstName
+func getContactName(contact types.ContactInfo) string {
+	if contact.FullName != "" {
+		return contact.FullName
+	}
+	if contact.PushName != "" {
+		return contact.PushName
+	}
+	if contact.BusinessName != "" {
+		return contact.BusinessName
+	}
+	if contact.FirstName != "" {
+		return contact.FirstName
+	}
+	return ""
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -927,13 +1234,15 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	existingNameIsPhone := isPhoneNumber(existingName)
+
+	// If we have a real name (not just a phone number), use it
+	if err == nil && existingName != "" && !existingNameIsPhone {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
 
-	// Need to determine chat name
+	// Need to determine chat name (either no existing name, or existing name is just a phone number)
 	var name string
 
 	if jid.Server == "g.us" {
@@ -973,7 +1282,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,19 +1296,29 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		// Get contact info and use fallback chain: FullName → PushName → BusinessName → FirstName
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+		if err == nil {
+			name = getContactName(contact)
+		}
+
+		// If no name from contact info, try sender
+		if name == "" && sender != "" && !isPhoneNumber(sender) {
 			name = sender
-		} else {
-			// Last fallback to JID
+		}
+
+		// Last fallback to JID (phone number)
+		if name == "" {
 			name = jid.User
 		}
 
 		logger.Infof("Using contact name: %s", name)
+	}
+
+	// If we found a better name than what was stored (phone number → real name), update the database
+	if existingNameIsPhone && !isPhoneNumber(name) && name != existingName {
+		logger.Infof("Updating contact name from %s to %s", existingName, name)
+		// We'll update the name when StoreChat is called by the caller
 	}
 
 	return name

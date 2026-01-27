@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    sync_contacts as whatsapp_sync_contacts
 )
 
 # Initialize FastMCP server
@@ -224,16 +225,16 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
-    
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
     file_path = whatsapp_download_media(message_id, chat_jid)
-    
+
     if file_path:
         return {
             "success": True,
@@ -245,6 +246,27 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def sync_contacts() -> Dict[str, Any]:
+    """Sync contact names from WhatsApp to update contacts stored with only phone numbers.
+
+    This function refreshes contact names for contacts that are currently stored
+    with only phone numbers as names. It uses the WhatsApp contact info with the
+    following priority: FullName -> PushName -> BusinessName -> FirstName.
+
+    Use this when you notice contacts are showing phone numbers instead of names.
+
+    Returns:
+        A dictionary containing:
+        - success: Whether the sync was successful
+        - message: A summary message
+        - total_checked: Number of contacts checked
+        - updated: Number of contacts updated with new names
+        - failed: Number of contacts that failed to update
+        - details: List of updated contacts with old/new names
+    """
+    return whatsapp_sync_contacts()
 
 if __name__ == "__main__":
     # Initialize and run the server
