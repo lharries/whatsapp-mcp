@@ -1,0 +1,41 @@
+services:
+  whatsapp-bridge:
+    build: ./whatsapp-bridge
+    container_name: whatsapp-bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      - whatsapp-store:/app/store
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  whatsapp-mcp-server:
+    build: ./whatsapp-mcp-server
+    container_name: whatsapp-mcp-server
+    # Remove external port exposure, only nginx will access it
+    expose:
+      - "8000"
+    volumes:
+      - whatsapp-store:/app/store
+    environment:
+      - WHATSAPP_API_BASE_URL=http://whatsapp-bridge:8080/api
+      - MESSAGES_DB_PATH=/app/store/messages.db
+    depends_on:
+      - whatsapp-bridge
+    stdin_open: true
+    restart: unless-stopped
+
+  nginx-mcp-proxy:
+    image: nginx:alpine
+    container_name: nginx-mcp-proxy
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - whatsapp-mcp-server
+    restart: unless-stopped
+
+volumes:
+  whatsapp-store:
