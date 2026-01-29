@@ -8,4 +8,6 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    "uvicorn>=0.32.0",
+    "starlette>=0.41.0",
 ]

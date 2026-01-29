@@ -247,5 +247,14 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    # Initialize and run the server with SSE transport for multi-client access
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    app = Starlette(
+        routes=[
+            Mount('/', app=mcp.sse_app()),
+        ]
+    )
+    uvicorn.run(app, host='0.0.0.0', port=8000)
