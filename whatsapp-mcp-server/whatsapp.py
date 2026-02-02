@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
@@ -51,39 +51,36 @@ def get_sender_name(sender_jid: str) -> str:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
+
+        # First check if this is our own number (from me messages)
+        cursor.execute("""
+            SELECT DISTINCT sender
+            FROM messages
+            WHERE is_from_me = 1
+            LIMIT 1
+        """)
+
+        my_number_result = cursor.fetchone()
+        if my_number_result and my_number_result[0] == sender_jid:
+            return "Me"
+
+        # For other senders, try to find a contact name
+        # Look for individual chats (not groups) with this exact JID
+        contact_jid = f"{sender_jid}@s.whatsapp.net"
         cursor.execute("""
             SELECT name
             FROM chats
-            WHERE jid = ?
+            WHERE jid = ? AND jid NOT LIKE '%@g.us'
             LIMIT 1
-        """, (sender_jid,))
-        
+        """, (contact_jid,))
+
         result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
         if result and result[0]:
             return result[0]
-        else:
-            return sender_jid
-        
+
+        # If no contact name found, return the phone number
+        return sender_jid
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -132,25 +129,25 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Message]:
+) -> str:
     """Get messages matching the specified criteria with optional context."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
-        
+
         # Add filters
         if after:
             try:
                 after = datetime.fromisoformat(after)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
-            
+
             where_clauses.append("messages.timestamp > ?")
             params.append(after)
 
@@ -159,65 +156,58 @@ def list_messages(
                 before = datetime.fromisoformat(before)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
-            
+
             where_clauses.append("messages.timestamp < ?")
             params.append(before)
 
         if sender_phone_number:
             where_clauses.append("messages.sender = ?")
             params.append(sender_phone_number)
-            
+
         if chat_jid:
             where_clauses.append("messages.chat_jid = ?")
             params.append(chat_jid)
-            
+
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
             params.append(f"%{query}%")
-            
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
         # Add pagination
         offset = page * limit
         query_parts.append("ORDER BY messages.timestamp DESC")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
         messages = cursor.fetchall()
-        
-        result = []
+
+        if not messages:
+            return "No messages to display."
+
+        # Format messages as before
+        output = ""
         for msg in messages:
-            message = Message(
-                timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
-                chat_name=msg[2],
-                content=msg[3],
-                is_from_me=msg[4],
-                chat_jid=msg[5],
-                id=msg[6],
-                media_type=msg[7]
-            )
-            result.append(message)
-            
-        if include_context and result:
-            # Add context for each message
-            messages_with_context = []
-            for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
-        
+            sender_name = get_sender_name(msg[1]) if not msg[4] else "Me"
+            timestamp = msg[0]
+            chat_name = msg[2]
+            content = msg[3]
+            media_type = msg[7]
+            msg_id = msg[6]
+            chat_jid = msg[5]
+
+            output += f"[{timestamp}] Chat: {chat_name} From: {sender_name}: "
+            if media_type:
+                output += f"[{media_type} - Message ID: {msg_id} - Chat JID: {chat_jid}] "
+            output += f"{content}\n"
+
+        return output
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
-        return []
+        return "Error retrieving messages."
     finally:
         if 'conn' in locals():
             conn.close()

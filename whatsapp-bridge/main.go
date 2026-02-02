@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -414,6 +415,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
+	// Check if this is a forwarded message and adjust chat JID if needed
+	if msg.Message != nil && msg.Message.MessageContextInfo != nil {
+		// This is a forwarded message - the chat JID should be the current chat, not the original
+		// msg.Info.Chat should already contain the correct current chat JID
+		logger.Infof("Detected forwarded message from %s to chat %s", sender, chatJID)
+	}
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
@@ -641,7 +649,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -791,6 +799,16 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Update WhatsApp version to latest
+	logger.Infof("Fetching latest WhatsApp version...")
+	latestVersion, err := whatsmeow.GetLatestVersion(context.Background(), nil)
+	if err != nil {
+		logger.Warnf("Failed to fetch latest WhatsApp version, using default: %v", err)
+	} else {
+		store.SetWAVersion(*latestVersion)
+		logger.Infof("Updated WhatsApp version to: %s", latestVersion.String())
+	}
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -800,14 +818,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -924,16 +942,7 @@ func main() {
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
-	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
-		return existingName
-	}
-
-	// Need to determine chat name
+	// Always try to get the current name first, then check database as fallback
 	var name string
 
 	if jid.Server == "g.us" {
@@ -943,9 +952,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
 			// Extract name from conversation if available
-			// This uses type assertions to handle different possible types
 			var displayName, convName *string
-			// Try to extract the fields we care about regardless of the exact type
 			v := reflect.ValueOf(conversation)
 			if v.Kind() == reflect.Ptr && !v.IsNil() {
 				v = v.Elem()
@@ -973,7 +980,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,19 +994,32 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		// Just use contact info (full name) - try this first
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+			logger.Infof("Found contact name: %s", name)
+		} else if contact.PushName != "" {
+			name = contact.PushName
+			logger.Infof("Using push name: %s", name)
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
+			logger.Warnf("Using sender as fallback: %s", name)
 		} else {
 			// Last fallback to JID
 			name = jid.User
+			logger.Warnf("Using JID as last fallback: %s", name)
 		}
+	}
 
-		logger.Infof("Using contact name: %s", name)
+	// Update the database with the current name
+	if name != "" {
+		_, err := messageStore.db.Exec("INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+			chatJID, name, time.Now())
+		if err != nil {
+			logger.Warnf("Failed to update chat name in database: %v", err)
+		}
 	}
 
 	return name

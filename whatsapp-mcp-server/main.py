@@ -40,8 +40,10 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> str:
     """Get WhatsApp messages matching specified criteria with optional context.
+    
+    Returns formatted text output for better readability.
     
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
