@@ -84,6 +84,41 @@ Here's an example of what you can do when it's connected to Claude.
 
    Or restart Cursor.
 
+### Docker Deployment (SSE Multi-Client)
+
+An alternative deployment option using Docker Compose with SSE (Server-Sent Events) transport is available. This enables **multi-client support**, allowing multiple MCP clients (like Claude Desktop, Claude Code, etc.) to connect simultaneously to the same WhatsApp bridge.
+
+**Quick Start:**
+
+```bash
+# Start all services
+docker-compose up -d --build
+
+# Scan QR code to authenticate (first run only)
+docker-compose logs -f whatsapp-bridge
+```
+
+**Claude Desktop / Claude Code Configuration:**
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "url": "http://localhost:9000/mcp/whatsapp/sse"
+    }
+  }
+}
+```
+
+The Docker setup includes:
+- **whatsapp-bridge**: Go service connecting to WhatsApp via whatsmeow
+- **whatsapp-mcp-server**: Python MCP server with SSE transport
+- **nginx-mcp-proxy**: Reverse proxy handling SSE connections (port 9000)
+
+For detailed Docker setup instructions, see [DOCKER_SETUP.md](./DOCKER_SETUP.md).
+
+---
+
 ### Windows Compatibility
 
 If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
