@@ -106,6 +106,95 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+## Agentic Mode (WhatsApp → Claude works on your computer)
+
+This fork adds an **agentic daemon** that turns WhatsApp into a full AI agent interface. Send a message from your phone, Claude executes on your Mac with full tool access (Bash, Read, Write, Edit, Git, etc.), and sends back the result — including modified files.
+
+### How it works
+
+```
+WhatsApp (you send a task)
+    ↓
+Go Bridge (detects message, sends webhook)
+    ↓ HTTP POST to localhost:9090
+Python Daemon (processes instantly)
+    ↓ invokes claude -p --verbose --output-format stream-json
+Claude CLI (streams tool use + result in real-time)
+    ↓ stream parsed by Python
+Python Daemon (sends result + files via REST API)
+    ↓ POST to localhost:8080/api/send
+WhatsApp (you receive the result + any modified files)
+```
+
+### Features
+
+- **Full computer access**: Claude can run commands, edit files, manage git repos — everything Claude Code can do
+- **Streaming + Heartbeat**: Real-time progress updates every 30s ("Trabalhando... X tools usados"), typing indicator refreshed every 20s
+- **Session continuity**: Claude CLI native `--session-id` / `--resume` keeps full context across messages (files edited, commands run, project state)
+- **SQLite persistence**: Sessions and interactions survive daemon restarts. Auto-cleanup of sessions older than 7 days
+- **File sharing**: Auto-sends files modified by Claude (<1MB, common extensions). Manual send via `/send <path>` (up to 16MB)
+- **Process control**: `/cancel` kills the running Claude process cleanly via process group SIGTERM
+- **Cost tracking**: Per-interaction API cost from `stream-json`, daily total shown in `/status`
+- **Model switching**: `/model opus|sonnet|haiku` to change models on the fly
+- **Message deduplication**: Ignores duplicate webhook deliveries (tracks last 100 message IDs)
+- **Queue system**: Messages arriving while Claude is busy are queued for the next round
+- **Auto-restart**: The start script monitors and restarts the daemon if it crashes
+- **Logging**: Rotating file logs (5MB, 3 backups) + console output
+
+### Slash Commands
+
+| Command | Action |
+|---------|--------|
+| `/help` | List all available commands |
+| `/cancel` | Kill running Claude process |
+| `/new` | Start new session (clear context) |
+| `/history` | Show last 10 interactions with timestamps |
+| `/last` | Resend the last response |
+| `/send <path>` | Send a file via WhatsApp (max 16MB) |
+| `/model <name>` | Switch model (opus, sonnet, haiku, default) |
+| `/status` | System info (uptime, disk, session, cost) |
+
+Any other message is processed by Claude with full Mac access.
+
+### Quick Start
+
+```bash
+# Prerequisites: Go, Python 3, Claude CLI (claude), requests
+pip install requests
+
+# Start both bridge + daemon
+./start-daemon.sh
+
+# Or start separately:
+cd whatsapp-bridge && ./whatsapp-bridge &
+python3 whatsapp-daemon.py &
+```
+
+Send a message in your WhatsApp "Notes" (self-chat) and Claude will reply. On startup, the daemon sends a "Daemon online" notification.
+
+### Configuration
+
+All settings via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DAEMON_PORT` | `9090` | Webhook server port |
+| `BRIDGE_API` | `http://localhost:8080` | Go bridge API URL |
+| `WHATSAPP_JID` | — | Your WhatsApp JID (phone@s.whatsapp.net) |
+| `BATCH_WINDOW` | `0` | Message batching window in seconds (0 = instant) |
+| `CLAUDE_BIN` | `/Users/savino/.local/bin/claude` | Path to Claude CLI binary |
+| `CLAUDE_TIMEOUT` | — | Timeout for Claude invocations (empty = none) |
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `whatsapp-bridge/main.go` | Go bridge with webhook notification on incoming messages |
+| `whatsapp-daemon.py` | Python daemon: webhook server + Claude CLI orchestrator (~990 lines) |
+| `start-daemon.sh` | Script to run both services with auto-restart |
+| `daemon.db` | SQLite database (sessions + interactions), auto-created |
+| `daemon.log` | Rotating log file (5MB, 3 backups) |
+
 ## Architecture Overview
 
 This application consists of two main components:

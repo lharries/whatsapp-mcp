@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+daemon.log
+daemon.log.*
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/store/
