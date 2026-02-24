@@ -20,7 +20,9 @@ jobs:
 
       - name: Install dependencies
         working-directory: whatsapp-bridge
-        run: go mod download
+        run: |
+          go mod tidy
+          go mod download
 
       - name: Install mingw-w64
         run: |

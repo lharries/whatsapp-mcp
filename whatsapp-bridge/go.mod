@@ -1,10 +1,10 @@
 module whatsapp-client
 
-go 1.24.1
+go 1.25.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.24
-	go.mau.fi/whatsmeow v0.0.0-20250318233852-06705625cf82
+	go.mau.fi/whatsmeow v0.0.0-20260219150138-7ae702b1eed4
 )
 
 require (
