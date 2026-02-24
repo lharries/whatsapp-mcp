@@ -1,0 +1,42 @@
+name: Build Go MCP EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache: true 
+
+      - name: Install dependencies
+        working-directory: whatsapp-bridge
+        run: go mod download
+
+      - name: Install mingw-w64
+        run: |
+          choco install mingw -y
+          echo "C:\ProgramData\mingw64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - name: Build Optimized Binary
+        working-directory: whatsapp-bridge
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go build -trimpath -tags sqlite_fts5 -ldflags="-s -w" -o whatsapp-mcp.exe .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp-mcp-windows-amd64
+          path: whatsapp-bridge/whatsapp-mcp.exe
+          retention-days: 30
