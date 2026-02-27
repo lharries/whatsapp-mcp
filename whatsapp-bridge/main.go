@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -774,6 +775,63 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for refreshing contact names in chats table
+	http.HandleFunc("/api/refresh-contacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get all contacts from whatsmeow store
+		contacts, err := client.Store.Contacts.GetAllContacts()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get contacts: %v", err),
+			})
+			return
+		}
+
+		updated := 0
+		for jid, contact := range contacts {
+			// Only process individual contacts
+			if jid.Server != "s.whatsapp.net" {
+				continue
+			}
+			// Pick the best name: full_name > first_name > push_name
+			name := contact.FullName
+			if name == "" {
+				name = contact.FirstName
+			}
+			if name == "" {
+				name = contact.PushName
+			}
+			if name == "" || isPhoneNumber(name) {
+				continue
+			}
+
+			chatJID := jid.String()
+			// Update the chats table if the name is currently a phone number or different
+			var existingName string
+			err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+			if err == nil && (isPhoneNumber(existingName) || existingName != name) {
+				_, err = messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, chatJID)
+				if err == nil {
+					updated++
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("Updated %d chat names from contacts", updated),
+			"updated": updated,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -922,13 +980,20 @@ func main() {
 	client.Disconnect()
 }
 
+// isPhoneNumber checks if a string looks like a phone number (digits only, with optional +/- separators)
+var phoneNumberPattern = regexp.MustCompile(`^[\d\-+\s]+$`)
+
+func isPhoneNumber(s string) bool {
+	return phoneNumberPattern.MatchString(s)
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real name (not a phone number)
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && !isPhoneNumber(existingName) {
+		// Chat exists with a real name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -987,16 +1052,27 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Try contact info: full_name > first_name > push_name
 		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
+		if err == nil {
+			if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.FirstName != "" {
+				name = contact.FirstName
+			} else if contact.PushName != "" {
+				name = contact.PushName
+			}
+		}
+		// Fallbacks if contact lookup didn't yield a real name
+		if name == "" || isPhoneNumber(name) {
+			if sender != "" && !isPhoneNumber(sender) {
+				name = sender
+			} else if existingName != "" {
+				// Keep whatever we had (even if it's a number)
+				name = existingName
+			} else {
+				name = jid.User
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
