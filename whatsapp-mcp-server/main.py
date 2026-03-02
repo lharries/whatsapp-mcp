@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_chats_with_context as whatsapp_get_chats_with_context
 )
 
 # Initialize FastMCP server
@@ -153,6 +154,40 @@ def get_message_context(
     """
     context = whatsapp_get_message_context(message_id, before, after)
     return context
+
+@mcp.tool()
+def get_chats_with_context(
+    limit: int = 30,
+    context_messages: int = 5,
+    since: Optional[str] = None,
+    only_incoming: bool = False,
+    include_groups: bool = True,
+    group_require_my_activity: bool = True,
+    group_activity_days: int = 7
+) -> List[Dict[str, Any]]:
+    """Get chats with their recent context messages in a single efficient call.
+
+    Returns chats sorted by last activity, each with up to N recent messages.
+    Locked chats are always excluded.
+
+    Args:
+        limit: Maximum number of chats to return (default 30)
+        context_messages: Number of recent messages to include per chat (default 5)
+        since: Optional ISO-8601 date cutoff — only chats active since this date
+        only_incoming: If True, only return chats where the last message is NOT from me (default False)
+        include_groups: Whether to include group chats (default True)
+        group_require_my_activity: For group chats, only include if I was active recently (default True)
+        group_activity_days: Lookback window in days for group activity check (default 7)
+    """
+    return whatsapp_get_chats_with_context(
+        limit=limit,
+        context_messages=context_messages,
+        since=since,
+        only_incoming=only_incoming,
+        include_groups=include_groups,
+        group_require_my_activity=group_require_my_activity,
+        group_activity_days=group_activity_days
+    )
 
 @mcp.tool()
 def send_message(

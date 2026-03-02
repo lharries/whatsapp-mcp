@@ -23,6 +23,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -90,6 +91,9 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Add locked column if it doesn't exist
+	db.Exec("ALTER TABLE chats ADD COLUMN locked BOOLEAN DEFAULT 0")
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -103,6 +107,22 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+func (store *MessageStore) UpdateChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET name = ? WHERE jid = ?",
+		name, jid,
+	)
+	return err
+}
+
+func (store *MessageStore) SetChatLocked(jid string, locked bool) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET locked = ? WHERE jid = ?",
+		locked, jid,
 	)
 	return err
 }
@@ -641,7 +661,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,7 +795,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +820,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -821,6 +841,7 @@ func main() {
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
+	client.EmitAppStateEventsOnFullSync = true
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
@@ -845,8 +866,46 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.AppState:
+			if len(v.Index) >= 2 && v.Index[0] == "lock" {
+				chatJID := v.Index[1]
+				action := v.GetLockChatAction()
+				if action != nil {
+					locked := action.GetLocked()
+					// Resolve @lid JID to @s.whatsapp.net JID
+					resolvedJID := chatJID
+					parsedJID, err := types.ParseJID(chatJID)
+					if err == nil && parsedJID.Server == "lid" {
+						pn, err := client.Store.LIDs.GetPNForLID(context.Background(), parsedJID)
+						if err == nil && !pn.IsEmpty() {
+							resolvedJID = pn.String()
+						}
+					}
+					logger.Infof("Chat %s (resolved: %s) lock status changed to: %v", chatJID, resolvedJID, locked)
+					if err := messageStore.SetChatLocked(resolvedJID, locked); err != nil {
+						logger.Warnf("Failed to update lock status for %s: %v", resolvedJID, err)
+					}
+				}
+			}
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Migrate any @lid JIDs from previous syncs to @s.whatsapp.net
+			go migrateLidJIDs(client, messageStore, logger)
+			// Request history sync to backfill chats with few stored messages
+			go requestHistorySync(client, messageStore)
+			go syncContactNames(client, messageStore, logger)
+			// Fetch app state to get current lock status for all chats
+			go func() {
+				time.Sleep(3 * time.Second)
+				logger.Infof("Fetching app state for lock status...")
+				err := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false)
+				if err != nil {
+					logger.Warnf("Failed to fetch app state for lock status: %v", err)
+				} else {
+					logger.Infof("App state fetch complete")
+				}
+			}()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -973,7 +1032,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1047,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1003,6 +1062,42 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	}
 
 	return name
+}
+
+func syncContactNames(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		logger.Warnf("Failed to get contacts: %v", err)
+		return
+	}
+
+	updated := 0
+	for jid, contact := range contacts {
+		// Skip locked ID contacts
+		if jid.Server == "lid" {
+			continue
+		}
+
+		name := contact.FullName
+		if name == "" {
+			name = contact.PushName
+		}
+		if name == "" {
+			name = contact.BusinessName
+		}
+		if name == "" {
+			continue
+		}
+
+		chatJID := jid.String()
+		err := messageStore.UpdateChatName(chatJID, name)
+		if err != nil {
+			logger.Warnf("Failed to update name for %s: %v", chatJID, err)
+		} else {
+			updated++
+		}
+	}
+	logger.Infof("Contact sync: updated %d names from %d contacts", updated, len(contacts))
 }
 
 // Handle history sync events
@@ -1023,6 +1118,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		if err != nil {
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
+		}
+
+		// Resolve @lid JID to @s.whatsapp.net JID
+		if jid.Server == "lid" {
+			pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if err == nil && !pn.IsEmpty() {
+				logger.Infof("Resolved @lid JID %s -> %s", chatJID, pn.String())
+				chatJID = pn.String()
+				jid = pn
+			} else {
+				logger.Warnf("Could not resolve @lid JID %s, skipping conversation", chatJID)
+				continue
+			}
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
@@ -1089,6 +1197,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						// Resolve @lid sender to phone number
+						senderJID, err := types.ParseJID(sender)
+						if err == nil && senderJID.Server == "lid" {
+							pn, err := client.Store.LIDs.GetPNForLID(context.Background(), senderJID)
+							if err == nil && !pn.IsEmpty() {
+								sender = pn.User
+							}
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
@@ -1147,40 +1263,167 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+// migrateLidJIDs resolves any existing @lid JIDs in the database to @s.whatsapp.net JIDs.
+// This is a one-time cleanup for data stored before @lid resolution was added to history sync.
+func migrateLidJIDs(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	// Find all @lid chat JIDs
+	rows, err := messageStore.db.Query(`SELECT DISTINCT jid FROM chats WHERE jid LIKE '%@lid'`)
+	if err != nil {
+		logger.Warnf("Failed to query @lid chats for migration: %v", err)
 		return
 	}
+	defer rows.Close()
+
+	var lidJIDs []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err == nil {
+			lidJIDs = append(lidJIDs, jid)
+		}
+	}
+
+	if len(lidJIDs) == 0 {
+		return
+	}
+
+	logger.Infof("Migrating %d @lid JIDs to @s.whatsapp.net...", len(lidJIDs))
+	migrated := 0
+
+	for _, lidJID := range lidJIDs {
+		parsedJID, err := types.ParseJID(lidJID)
+		if err != nil {
+			continue
+		}
+
+		pn, err := client.Store.LIDs.GetPNForLID(context.Background(), parsedJID)
+		if err != nil || pn.IsEmpty() {
+			logger.Warnf("Could not resolve @lid JID %s, skipping", lidJID)
+			continue
+		}
+
+		pnJID := pn.String()
+		logger.Infof("Migrating @lid JID %s -> %s", lidJID, pnJID)
+
+		// Ensure the target chat exists
+		messageStore.db.Exec(`INSERT OR IGNORE INTO chats (jid, name, last_message_time) SELECT ?, name, last_message_time FROM chats WHERE jid = ?`, pnJID, lidJID)
+
+		// Migrate messages that don't already exist under the target JID
+		messageStore.db.Exec(`
+			INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+			SELECT id, ?, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length
+			FROM messages WHERE chat_jid = ?
+		`, pnJID, lidJID)
+
+		// Update last_message_time on target chat if @lid had a newer timestamp
+		messageStore.db.Exec(`
+			UPDATE chats SET last_message_time = (
+				SELECT MAX(last_message_time) FROM chats WHERE jid IN (?, ?)
+			) WHERE jid = ?
+		`, lidJID, pnJID, pnJID)
+
+		// Delete old @lid data
+		messageStore.db.Exec(`DELETE FROM messages WHERE chat_jid = ?`, lidJID)
+		messageStore.db.Exec(`DELETE FROM chats WHERE jid = ?`, lidJID)
+
+		migrated++
+	}
+
+	logger.Infof("@lid migration complete: %d/%d JIDs migrated", migrated, len(lidJIDs))
+}
+
+// Request on-demand history sync for chats that have few stored messages.
+// For each chat, finds the oldest known message and requests older history.
+func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		fmt.Println("Client not ready for history sync.")
+		return
+	}
+
+	// Wait for connection to stabilize
+	time.Sleep(5 * time.Second)
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		fmt.Println("Client disconnected before history sync could start.")
 		return
 	}
 
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	// Query chats and their oldest message
+	rows, err := messageStore.db.Query(`
+		SELECT m.chat_jid, m.id, m.is_from_me, m.timestamp, COUNT(*) as msg_count
+		FROM messages m
+		JOIN chats c ON m.chat_jid = c.jid
+		GROUP BY m.chat_jid
+		HAVING msg_count < 20
+		ORDER BY c.last_message_time DESC
+		LIMIT 50
+	`)
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		fmt.Printf("Failed to query chats for history sync: %v\n", err)
+		return
 	}
+	defer rows.Close()
+
+	type chatInfo struct {
+		jid       string
+		msgID     string
+		fromMe    bool
+		timestamp time.Time
+	}
+
+	// For each chat, find the oldest message
+	var chats []chatInfo
+	for rows.Next() {
+		var ci chatInfo
+		var msgCount int
+		if err := rows.Scan(&ci.jid, &ci.msgID, &ci.fromMe, &ci.timestamp, &msgCount); err != nil {
+			continue
+		}
+		chats = append(chats, ci)
+	}
+
+	// Now get the actual oldest message per chat
+	for _, ci := range chats {
+		var oldest chatInfo
+		oldest.jid = ci.jid
+		err := messageStore.db.QueryRow(`
+			SELECT id, is_from_me, timestamp FROM messages
+			WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1
+		`, ci.jid).Scan(&oldest.msgID, &oldest.fromMe, &oldest.timestamp)
+		if err != nil {
+			continue
+		}
+
+		chatJID, err := types.ParseJID(oldest.jid)
+		if err != nil {
+			continue
+		}
+
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: oldest.fromMe,
+			},
+			ID:        oldest.msgID,
+			Timestamp: oldest.timestamp,
+		}
+
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+		if historyMsg == nil {
+			continue
+		}
+
+		_, err = client.SendPeerMessage(context.Background(), historyMsg)
+		if err != nil {
+			fmt.Printf("Failed to request history for %s: %v\n", oldest.jid, err)
+		} else {
+			fmt.Printf("Requested history sync for %s (before %s)\n", oldest.jid, oldest.timestamp.Format("2006-01-02 15:04:05"))
+		}
+
+		// Rate limit to avoid flooding
+		time.Sleep(2 * time.Second)
+	}
+
+	fmt.Printf("History sync requests complete for %d chats.\n", len(chats))
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

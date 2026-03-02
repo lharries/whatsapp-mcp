@@ -141,9 +141,10 @@ def list_messages(
         # Build base query
         query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
-        where_clauses = []
+        # Only filter locked chats for broad queries, not when a specific chat is requested
+        where_clauses = [] if chat_jid else ["chats.locked = 0"]
         params = []
-        
+
         # Add filters
         if after:
             try:
@@ -346,16 +347,15 @@ def list_chats(
                 AND chats.last_message_time = messages.timestamp
             """)
             
-        where_clauses = []
+        where_clauses = ["chats.locked = 0"]
         params = []
-        
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
+        query_parts.append("WHERE " + " AND ".join(where_clauses))
+
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
@@ -404,9 +404,10 @@ def search_contacts(query: str) -> List[Contact]:
                 jid,
                 name
             FROM chats
-            WHERE 
+            WHERE
                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
+                AND locked = 0
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
@@ -454,7 +455,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE (m.sender = ? OR c.jid = ?) AND c.locked = 0
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
@@ -621,6 +622,153 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     finally:
         if 'conn' in locals():
             conn.close()
+
+def get_chats_with_context(
+    limit: int = 30,
+    context_messages: int = 5,
+    since: Optional[str] = None,
+    only_incoming: bool = False,
+    include_groups: bool = True,
+    group_require_my_activity: bool = True,
+    group_activity_days: int = 7
+) -> List[dict]:
+    """Get chats with their recent context messages in a single efficient query.
+
+    Args:
+        limit: Maximum number of chats to return (default 30)
+        context_messages: Number of recent messages per chat (default 5)
+        since: Optional ISO-8601 date cutoff for chat last_message_time
+        only_incoming: If True, only chats where last message is NOT from me
+        include_groups: Whether to include group chats (default True)
+        group_require_my_activity: For groups, require recent activity from me (default True)
+        group_activity_days: Lookback window in days for group activity check (default 7)
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        # Build WHERE conditions for filtered_chats CTE
+        chat_conditions = ["c.locked = 0"]
+        params = []
+
+        if since:
+            chat_conditions.append("c.last_message_time >= ?")
+            params.append(since)
+
+        if only_incoming:
+            chat_conditions.append("last_msg.is_from_me = 0")
+
+        if not include_groups:
+            chat_conditions.append("c.jid NOT LIKE '%@g.us'")
+
+        chat_where = " AND ".join(chat_conditions)
+
+        # Build optional group activity subquery
+        group_activity_join = ""
+        group_activity_condition = ""
+        if include_groups and group_require_my_activity:
+            group_activity_join = f"""
+                LEFT JOIN (
+                    SELECT DISTINCT chat_jid
+                    FROM messages
+                    WHERE is_from_me = 1
+                      AND timestamp >= datetime('now', '-{int(group_activity_days)} days')
+                ) my_activity ON c.jid = my_activity.chat_jid
+            """
+            group_activity_condition = """
+                AND (c.jid NOT LIKE '%@g.us' OR my_activity.chat_jid IS NOT NULL)
+            """
+
+        query = f"""
+            WITH filtered_chats AS (
+                SELECT
+                    c.jid,
+                    c.name,
+                    c.last_message_time,
+                    last_msg.content AS last_message,
+                    last_msg.sender AS last_sender,
+                    last_msg.is_from_me AS last_is_from_me
+                FROM chats c
+                LEFT JOIN messages last_msg ON c.jid = last_msg.chat_jid
+                    AND c.last_message_time = last_msg.timestamp
+                {group_activity_join}
+                WHERE {chat_where}
+                {group_activity_condition}
+                ORDER BY c.last_message_time DESC
+                LIMIT ?
+            ),
+            ranked_messages AS (
+                SELECT
+                    m.chat_jid,
+                    m.timestamp,
+                    m.sender,
+                    m.content,
+                    m.is_from_me,
+                    m.id,
+                    m.media_type,
+                    ROW_NUMBER() OVER (PARTITION BY m.chat_jid ORDER BY m.timestamp DESC) AS rn
+                FROM messages m
+                INNER JOIN filtered_chats fc ON m.chat_jid = fc.jid
+            )
+            SELECT
+                fc.jid,
+                fc.name,
+                fc.last_message_time,
+                fc.last_message,
+                fc.last_sender,
+                fc.last_is_from_me,
+                rm.timestamp AS msg_timestamp,
+                rm.sender AS msg_sender,
+                rm.content AS msg_content,
+                rm.is_from_me AS msg_is_from_me,
+                rm.id AS msg_id,
+                rm.media_type AS msg_media_type
+            FROM filtered_chats fc
+            LEFT JOIN ranked_messages rm ON fc.jid = rm.chat_jid AND rm.rn <= ?
+            ORDER BY fc.last_message_time DESC, fc.jid, rm.timestamp ASC
+        """
+        params.extend([limit, context_messages])
+
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+
+        # Group results by chat
+        chats_dict = {}
+        for row in rows:
+            jid = row[0]
+            if jid not in chats_dict:
+                chats_dict[jid] = {
+                    "jid": jid,
+                    "name": row[1],
+                    "last_message_time": row[2],
+                    "last_message": row[3],
+                    "last_sender": row[4],
+                    "last_is_from_me": row[5],
+                    "is_group": jid.endswith("@g.us"),
+                    "messages": []
+                }
+            # Add context message if present
+            if row[6] is not None:
+                sender_name = get_sender_name(row[7]) if not row[9] else "Me"
+                chats_dict[jid]["messages"].append({
+                    "timestamp": row[6],
+                    "sender": row[7],
+                    "sender_name": sender_name,
+                    "content": row[8],
+                    "is_from_me": row[9],
+                    "id": row[10],
+                    "media_type": row[11]
+                })
+
+        return list(chats_dict.values())
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
