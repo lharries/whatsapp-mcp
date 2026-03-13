@@ -774,6 +774,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Health check endpoint for Railway
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status := "ok"
+		if !client.IsConnected() {
+			status = "disconnected"
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -905,8 +915,15 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server - use PORT env var (for Railway) or default to 8080
+	port := 8080
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := fmt.Sscanf(envPort, "%d", &port); p != 1 || err != nil {
+			logger.Warnf("Invalid PORT env var %q, using default 8080", envPort)
+			port = 8080
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
