@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    transcribe_audio_message as whatsapp_transcribe_audio_message,
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,27 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    language: Optional[str] = None
+) -> Dict[str, Any]:
+    """Transcribe a WhatsApp audio/voice message using a local Whisper model.
+
+    The transcription is cached so subsequent calls for the same message return instantly.
+    Requires the 'transcription' extra: uv sync --extra transcription
+
+    Args:
+        message_id: The ID of the audio message to transcribe
+        chat_jid: The JID of the chat containing the message
+        language: Optional language code (e.g. "en", "es", "de") to skip auto-detection
+
+    Returns:
+        A dictionary containing success status, transcribed text, detected language, and whether the result was cached
+    """
+    return whatsapp_transcribe_audio_message(message_id, chat_jid, language)
 
 if __name__ == "__main__":
     # Initialize and run the server

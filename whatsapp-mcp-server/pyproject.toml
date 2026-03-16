@@ -9,3 +9,6 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
 ]
+
+[project.optional-dependencies]
+transcription = ["faster-whisper>=1.0.0"]

@@ -6,6 +6,7 @@ import os.path
 import requests
 import json
 import audio
+import transcription
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
@@ -765,3 +766,92 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def transcribe_audio_message(
+    message_id: str, chat_jid: str, language: Optional[str] = None
+) -> dict:
+    """Transcribe an audio message using local Whisper model.
+
+    Args:
+        message_id: The ID of the audio message
+        chat_jid: The JID of the chat containing the message
+        language: Optional language code (e.g. "en", "es", "de") to skip auto-detection
+
+    Returns:
+        dict with keys: success, text, language, cached
+    """
+    # Check cache first
+    cached = transcription.get_cached_transcription(MESSAGES_DB_PATH, message_id, chat_jid)
+    if cached:
+        return {
+            "success": True,
+            "text": cached["text"],
+            "language": cached["language"],
+            "cached": True,
+        }
+
+    # Verify the message is an audio type
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT media_type FROM messages WHERE id = ? AND chat_jid = ?",
+            (message_id, chat_jid),
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except sqlite3.Error as e:
+        return {"success": False, "text": f"Database error: {e}", "language": None, "cached": False}
+
+    if not row:
+        return {"success": False, "text": "Message not found", "language": None, "cached": False}
+
+    media_type = row[0] or ""
+    if "audio" not in media_type.lower() and "ptt" not in media_type.lower():
+        return {
+            "success": False,
+            "text": f"Message is not an audio message (type: {media_type})",
+            "language": None,
+            "cached": False,
+        }
+
+    # Download the audio file
+    file_path = download_media(message_id, chat_jid)
+    if not file_path:
+        return {
+            "success": False,
+            "text": "Failed to download audio file",
+            "language": None,
+            "cached": False,
+        }
+
+    # Transcribe
+    try:
+        result = transcription.transcribe_audio_file(file_path, language=language)
+    except ImportError as e:
+        return {"success": False, "text": str(e), "language": None, "cached": False}
+    except Exception as e:
+        return {
+            "success": False,
+            "text": f"Transcription failed: {e}",
+            "language": None,
+            "cached": False,
+        }
+
+    # Cache the result
+    transcription.cache_transcription(
+        MESSAGES_DB_PATH,
+        message_id,
+        chat_jid,
+        result["text"],
+        result["language"],
+        transcription.WHISPER_MODEL_NAME,
+    )
+
+    return {
+        "success": True,
+        "text": result["text"],
+        "language": result["language"],
+        "cached": False,
+    }

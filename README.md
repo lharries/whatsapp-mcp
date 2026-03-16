@@ -140,6 +140,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **transcribe_audio**: Transcribe a WhatsApp audio/voice message using a local Whisper model (requires `transcription` extra)
 
 ### Media Handling Features
 
@@ -154,6 +155,37 @@ You can send various media types to your WhatsApp contacts:
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
   - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
+
+#### Audio Transcription
+
+You can transcribe WhatsApp audio and voice messages locally using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Transcriptions are cached in SQLite so repeated calls return instantly.
+
+1. **Install the transcription extra:**
+
+   ```bash
+   cd whatsapp-mcp-server
+   uv sync --extra transcription
+   ```
+
+2. **Use the `transcribe_audio` tool** with a `message_id` and `chat_jid` (shown when listing messages with audio).
+
+3. **Configure the model** (optional): Set the `WHISPER_MODEL` environment variable to choose a model size (`tiny`, `base`, `small`, `medium`, `large-v3`). Default is `base` (~140MB, good balance of speed and accuracy for voice messages).
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "{{PATH_TO_UV}}",
+         "args": ["--directory", "{{PATH}}/whatsapp-mcp-server", "run", "main.py"],
+         "env": {
+           "WHISPER_MODEL": "small"
+         }
+       }
+     }
+   }
+   ```
+
+Language is auto-detected but you can pass an optional `language` parameter (e.g. `"en"`, `"es"`, `"de"`) for faster/more accurate results.
 
 #### Media Downloading
 
