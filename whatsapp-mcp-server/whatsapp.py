@@ -8,7 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://localhost:8181/api"
 
 @dataclass
 class Message:
@@ -723,6 +723,40 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def list_messages_raw(limit: int = 20) -> list[dict]:
+    """Return recent messages as a list of dicts for MCP resources."""
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT messages.id, messages.chat_jid, messages.sender, chats.name,
+                   messages.content, messages.timestamp, messages.is_from_me, messages.media_type
+            FROM messages
+            JOIN chats ON messages.chat_jid = chats.jid
+            ORDER BY messages.timestamp DESC
+            LIMIT ?
+        """, (limit,))
+
+        messages = []
+        for row in cursor.fetchall():
+            messages.append({
+                "id": row[0],
+                "chat_jid": row[1],
+                "sender": row[2],
+                "chat_name": row[3],
+                "content": row[4],
+                "timestamp": row[5],
+                "is_from_me": bool(row[6]),
+                "media_type": row[7],
+            })
+        return messages
+    except sqlite3.Error:
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.

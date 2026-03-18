@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +31,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"rsc.io/qr"
 )
 
 // Message represents a chat message for our client
@@ -39,6 +42,55 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+}
+
+// Auth state for REST API access
+var (
+	authMu     sync.RWMutex
+	authStatus string = "unpaired" // "unpaired", "pairing", "paired"
+	currentQR  string              // Raw QR code string (for generating images)
+)
+
+// SSEBroadcaster manages Server-Sent Events clients for real-time message streaming.
+// MCP servers can connect to /api/events to receive push notifications when new
+// messages arrive, enabling event-driven architectures without polling.
+type SSEBroadcaster struct {
+	clients map[chan string]bool
+	mu      sync.RWMutex
+}
+
+// Subscribe registers a new SSE client and returns its event channel.
+func (b *SSEBroadcaster) Subscribe() chan string {
+	ch := make(chan string, 16)
+	b.mu.Lock()
+	b.clients[ch] = true
+	b.mu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes an SSE client and closes its channel.
+func (b *SSEBroadcaster) Unsubscribe(ch chan string) {
+	b.mu.Lock()
+	delete(b.clients, ch)
+	close(ch)
+	b.mu.Unlock()
+}
+
+// Broadcast sends data to all connected SSE clients. Slow clients are skipped.
+func (b *SSEBroadcaster) Broadcast(data string) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for ch := range b.clients {
+		select {
+		case ch <- data:
+		default:
+		}
+	}
+}
+
+// Global SSE broadcaster for real-time message events
+var broadcaster = &SSEBroadcaster{
+	clients: make(map[chan string]bool),
 }
 
 // Database handler for storing message history
@@ -467,6 +519,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Broadcast SSE event for real-time listeners (MCP servers, webhooks, etc.)
+		eventData, _ := json.Marshal(map[string]interface{}{
+			"type":       "message",
+			"id":         msg.Info.ID,
+			"chat_jid":   chatJID,
+			"sender":     sender,
+			"content":    content,
+			"timestamp":  msg.Info.Timestamp.Unix(),
+			"is_from_me": msg.Info.IsFromMe,
+			"media_type": mediaType,
+		})
+		broadcaster.Broadcast(string(eventData))
 	}
 }
 
@@ -641,7 +706,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +839,89 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// SSE endpoint for real-time message events.
+	// Clients connect and receive Server-Sent Events whenever a new message arrives.
+	// This enables MCP servers to push notifications instead of polling.
+	http.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		ch := broadcaster.Subscribe()
+		defer broadcaster.Unsubscribe(ch)
+
+		// Send initial keepalive so the client knows the connection is established
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
+		for {
+			select {
+			case data := <-ch:
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+
+	// Handler for QR code as PNG base64
+	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		authMu.RLock()
+		status := authStatus
+		qrStr := currentQR
+		authMu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if status == "paired" {
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "paired",
+				"type":   "qr",
+			})
+			return
+		}
+
+		if qrStr == "" {
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": status,
+				"type":   "qr",
+			})
+			return
+		}
+
+		// Generate QR as PNG using rsc.io/qr
+		code, err := qr.Encode(qrStr, qr.L)
+		if err != nil {
+			http.Error(w, "Failed to encode QR", http.StatusInternalServerError)
+			return
+		}
+		png := code.PNG()
+		b64 := base64.StdEncoding.EncodeToString(png)
+
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "pairing",
+			"type":   "qr",
+			"data":   "data:image/png;base64," + b64,
+		})
+	})
+
+	// Handler for auth status
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		authMu.RLock()
+		status := authStatus
+		authMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +948,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -850,8 +998,15 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			authMu.Lock()
+			authStatus = "unpaired"
+			currentQR = ""
+			authMu.Unlock()
 		}
 	})
+
+	// Start REST API server early so /api/qr is available before pairing
+	startRESTServer(client, messageStore, 8181)
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
@@ -869,9 +1024,17 @@ func main() {
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				authMu.Lock()
+				authStatus = "pairing"
+				currentQR = evt.Code
+				authMu.Unlock()
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
+				authMu.Lock()
+				authStatus = "paired"
+				currentQR = ""
+				authMu.Unlock()
 				connected <- true
 				break
 			}
@@ -887,6 +1050,9 @@ func main() {
 		}
 	} else {
 		// Already logged in, just connect
+		authMu.Lock()
+		authStatus = "paired"
+		authMu.Unlock()
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
@@ -904,9 +1070,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1136,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1151,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
