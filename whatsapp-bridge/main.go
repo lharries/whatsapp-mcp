@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,7 +50,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -58,6 +59,21 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+
+	// Enable WAL mode for better concurrent read performance
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set WAL mode: %v", err)
+	}
+
+	// Set busy timeout to avoid "database is locked" errors
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set busy timeout: %v", err)
+	}
+
+	// Limit to single connection to avoid SQLite concurrency issues
+	db.SetMaxOpenConns(1)
 
 	// Create tables if they don't exist
 	_, err = db.Exec(`
@@ -233,6 +249,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// Validate mediaPath resolves to within the allowed "store/" directory
+		absMediaPath, err := filepath.EvalSymlinks(mediaPath)
+		if err != nil {
+			return false, fmt.Sprintf("Error resolving media path: %v", err)
+		}
+		allowedDir, err := filepath.EvalSymlinks("store")
+		if err != nil {
+			return false, fmt.Sprintf("Error resolving store directory: %v", err)
+		}
+		if !strings.HasPrefix(absMediaPath, allowedDir+string(filepath.Separator)) {
+			return false, "Invalid media path: must be within the store/ directory"
+		}
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -456,9 +485,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	} else {
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
+		direction := "<-"
 		if msg.Info.IsFromMe {
-			direction = "→"
+			direction = "->"
 		}
 
 		// Log based on message type
@@ -561,8 +590,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	// Sanitize chatJID to prevent path traversal: strip directory separators and parent refs
+	safeChatJID := strings.ReplaceAll(chatJID, ":", "_")
+	safeChatJID = strings.ReplaceAll(safeChatJID, "/", "_")
+	safeChatJID = strings.ReplaceAll(safeChatJID, "\\", "_")
+	safeChatJID = strings.ReplaceAll(safeChatJID, "..", "_")
+	chatDir := fmt.Sprintf("store/%s", safeChatJID)
 	localPath := ""
 
 	// Get media info from the database
@@ -586,17 +619,39 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Sanitize filename to prevent path traversal: use only the base name and strip dangerous characters
+	safeFilename := filepath.Base(filename)
+	safeFilename = strings.ReplaceAll(safeFilename, "..", "_")
+	if safeFilename == "." || safeFilename == "/" || safeFilename == "" {
+		safeFilename = "download_" + messageID
+	}
 
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
+	// Generate a local path for the file
+	localPath = fmt.Sprintf("%s/%s", chatDir, safeFilename)
+
+	// Resolve symlinks and verify path stays within the store directory
+	absPath, err := filepath.EvalSymlinks(localPath)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+		// If file doesn't exist yet, resolve the parent directory and join the filename
+		parentDir := filepath.Dir(localPath)
+		absParent, evalErr := filepath.EvalSymlinks(parentDir)
+		if evalErr != nil {
+			return false, "", "", "", fmt.Errorf("failed to resolve path: %v", evalErr)
+		}
+		absPath = filepath.Join(absParent, filepath.Base(localPath))
+	}
+
+	// Verify the resolved path is within the store directory
+	storeAbs, err := filepath.EvalSymlinks("store")
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to resolve store directory: %v", err)
+	}
+	if !strings.HasPrefix(absPath, storeAbs+string(filepath.Separator)) {
+		return false, "", "", "", fmt.Errorf("path traversal detected: resolved path %s escapes store directory", absPath)
 	}
 
 	// Check if file already exists
@@ -647,7 +702,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
@@ -675,15 +730,52 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Rate limiter: track last send time for /api/send
+var lastSendTime time.Time
+var lastSendMu sync.Mutex
+
+// validateHost checks that the Host header matches an expected local address
+func validateHost(r *http.Request, port int) bool {
+	allowedHosts := []string{
+		fmt.Sprintf("127.0.0.1:%d", port),
+		fmt.Sprintf("localhost:%d", port),
+	}
+	for _, h := range allowedHosts {
+		if r.Host == h {
+			return true
+		}
+	}
+	return false
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		// Validate Host header
+		if !validateHost(r, port) {
+			http.Error(w, "Forbidden: invalid Host header", http.StatusForbidden)
+			return
+		}
+
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		// Rate limiting: reject if less than 2 seconds since last send
+		lastSendMu.Lock()
+		if time.Since(lastSendTime) < 2*time.Second {
+			lastSendMu.Unlock()
+			http.Error(w, "Too many requests, please wait before sending again", http.StatusTooManyRequests)
+			return
+		}
+		lastSendTime = time.Now()
+		lastSendMu.Unlock()
+
+		// Limit request body to 10MB
+		r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 
 		// Parse the request body
 		var req SendMessageRequest
@@ -725,11 +817,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+		// Validate Host header
+		if !validateHost(r, port) {
+			http.Error(w, "Forbidden: invalid Host header", http.StatusForbidden)
+			return
+		}
+
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		// Limit request body to 10MB
+		r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 
 		// Parse the request body
 		var req DownloadMediaRequest
@@ -774,8 +875,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server on loopback only
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -795,7 +896,7 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
@@ -903,7 +1004,7 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	fmt.Println("\nConnected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
