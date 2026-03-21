@@ -46,6 +46,110 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+// timestampRFC3339UTC is the canonical SQLite text format for all stored instants (UTC, RFC 3339).
+const timestampRFC3339UTC = time.RFC3339
+
+func formatTimestampUTC(t time.Time) string {
+	return t.UTC().Format(timestampRFC3339UTC)
+}
+
+// parseLegacyTimestamp converts historical SQLite timestamp strings to UTC for migration.
+func parseLegacyTimestamp(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	try := []func(string) (time.Time, error){
+		func(x string) (time.Time, error) { return time.Parse(time.RFC3339Nano, x) },
+		func(x string) (time.Time, error) { return time.Parse(time.RFC3339, x) },
+		func(x string) (time.Time, error) {
+			return time.ParseInLocation("2006-01-02 15:04:05.999999999", x, time.UTC)
+		},
+		func(x string) (time.Time, error) { return time.ParseInLocation("2006-01-02 15:04:05", x, time.UTC) },
+		func(x string) (time.Time, error) {
+			return time.ParseInLocation("2006-01-02T15:04:05.999999999", x, time.UTC)
+		},
+		func(x string) (time.Time, error) { return time.ParseInLocation("2006-01-02T15:04:05", x, time.UTC) },
+	}
+	for _, p := range try {
+		if tm, err := p(s); err == nil {
+			return tm.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// migrateTimestampsToRFC3339UTC normalizes chat and message timestamps to UTC RFC3339 for consistent ordering and joins.
+func migrateTimestampsToRFC3339UTC(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= 1 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	chRows, err := tx.Query(`SELECT jid, last_message_time FROM chats WHERE last_message_time IS NOT NULL AND TRIM(last_message_time) != ''`)
+	if err != nil {
+		return err
+	}
+	for chRows.Next() {
+		var jid, raw string
+		if err := chRows.Scan(&jid, &raw); err != nil {
+			chRows.Close()
+			return err
+		}
+		tm, ok := parseLegacyTimestamp(raw)
+		if !ok {
+			fmt.Printf("migrate: skip chats.last_message_time for %q: unparsable %q\n", jid, raw)
+			continue
+		}
+		norm := formatTimestampUTC(tm)
+		if _, err := tx.Exec(`UPDATE chats SET last_message_time = ? WHERE jid = ?`, norm, jid); err != nil {
+			chRows.Close()
+			return err
+		}
+	}
+	chRows.Close()
+
+	msgRows, err := tx.Query(`SELECT id, chat_jid, timestamp FROM messages WHERE timestamp IS NOT NULL AND TRIM(timestamp) != ''`)
+	if err != nil {
+		return err
+	}
+	for msgRows.Next() {
+		var id, chatJID, raw string
+		if err := msgRows.Scan(&id, &chatJID, &raw); err != nil {
+			msgRows.Close()
+			return err
+		}
+		tm, ok := parseLegacyTimestamp(raw)
+		if !ok {
+			fmt.Printf("migrate: skip messages.timestamp for %s/%q: unparsable %q\n", chatJID, id, raw)
+			continue
+		}
+		norm := formatTimestampUTC(tm)
+		if _, err := tx.Exec(`UPDATE messages SET timestamp = ? WHERE id = ? AND chat_jid = ?`, norm, id, chatJID); err != nil {
+			msgRows.Close()
+			return err
+		}
+	}
+	msgRows.Close()
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -90,6 +194,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := migrateTimestampsToRFC3339UTC(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate timestamps: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -102,7 +211,7 @@ func (store *MessageStore) Close() error {
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		jid, name, formatTimestampUTC(lastMessageTime),
 	)
 	return err
 }
@@ -119,7 +228,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		`INSERT OR REPLACE INTO messages 
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		id, chatJID, sender, content, formatTimestampUTC(timestamp), isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }
