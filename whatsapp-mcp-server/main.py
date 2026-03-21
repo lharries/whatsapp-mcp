@@ -1,4 +1,7 @@
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from typing import List, Dict, Any, Optional
+
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -12,11 +15,27 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    format_timestamp_rfc3339_utc,
 )
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+
+def mcp_json_blob(obj: Any) -> Any:
+    """Recursively convert dataclasses and datetimes for JSON-safe MCP responses (RFC 3339 UTC)."""
+    if obj is None:
+        return None
+    if isinstance(obj, datetime):
+        return format_timestamp_rfc3339_utc(obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return mcp_json_blob(asdict(obj))
+    if isinstance(obj, dict):
+        return {k: mcp_json_blob(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [mcp_json_blob(v) for v in obj]
+    return obj
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -44,8 +63,8 @@ def list_messages(
     """Get WhatsApp messages matching specified criteria with optional context.
     
     Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
+        after: Optional RFC 3339 instant with timezone (e.g. 2026-01-02T10:27:43Z) to return messages after this time
+        before: Optional RFC 3339 instant with timezone to return messages before this time
         sender_phone_number: Optional phone number to filter messages by sender
         chat_jid: Optional chat JID to filter messages by chat
         query: Optional search term to filter messages by content
@@ -93,7 +112,7 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return [mcp_json_blob(c) for c in chats]
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
@@ -104,7 +123,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return mcp_json_blob(chat) if chat is not None else None
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
@@ -114,7 +133,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return mcp_json_blob(chat) if chat is not None else None
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -126,7 +145,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return [mcp_json_blob(c) for c in chats]
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -152,7 +171,7 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return mcp_json_blob(context)
 
 @mcp.tool()
 def send_message(
