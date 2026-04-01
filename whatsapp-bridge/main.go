@@ -240,7 +240,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 
 		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		fileExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -276,7 +276,39 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+
+		// Fallback for unknown types
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -345,8 +377,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			docFileName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(docFileName),
+				FileName:      proto.String(docFileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
