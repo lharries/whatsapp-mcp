@@ -650,22 +650,23 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, caption: str = "") -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
+            "message": caption
         }
         
         response = requests.post(url, json=payload)
