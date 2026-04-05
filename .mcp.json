@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "whatsapp-mcp": {
+      "command": "go",
+      "args": [
+        "run",
+        "main.go"
+      ]
+    }
+  }
+}

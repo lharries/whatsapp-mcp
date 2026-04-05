@@ -1,0 +1,24 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "0.1.0",
+  "description": "WhatsApp messaging from Codex via MCP",
+  "author": {
+    "name": "lharries",
+    "url": "https://github.com/lharries/whatsapp-mcp"
+  },
+  "homepage": "https://github.com/lharries/whatsapp-mcp",
+  "repository": "https://github.com/lharries/whatsapp-mcp",
+  "keywords": [
+    "mcp",
+    "codex"
+  ],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "WhatsApp MCP",
+    "shortDescription": "WhatsApp messaging from Codex via MCP",
+    "longDescription": "WhatsApp MCP server. Send and receive WhatsApp messages via MCP protocol.",
+    "category": "Communication",
+    "websiteURL": "https://github.com/lharries/whatsapp-mcp"
+  }
+}
