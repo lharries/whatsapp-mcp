@@ -1,3 +1,39 @@
+# Session data and message store — must NEVER be committed.
+# These contain authentication state for your linked WhatsApp account
+# plus the entire decrypted message history.
 *.db
-claude_desktop_config.json
+**/store/
+**/store/**
+
+# Built binary
+whatsapp-bridge/whatsapp-bridge
+
+# Logs
 whatsapp.log
+*.log
+
+# Local Claude / editor configuration
+claude_desktop_config.json
+.claude/
+.idea/
+.vscode/
+
+# Python venv / build artefacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.uv/
+dist/
+build/
+*.egg-info/
+
+# Go build artefacts
+*.test
+*.out
+go.work
+go.work.sum
+
+# OS noise
+.DS_Store
+Thumbs.db
