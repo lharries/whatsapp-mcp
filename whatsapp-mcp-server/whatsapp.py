@@ -47,43 +47,70 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+def _jid_candidates(sender: str) -> List[str]:
+    """Return the set of lookup keys to try in senders.jid / chats.jid.
+
+    messages.sender is stored as a bare number (msg.Info.Sender.User) but
+    senders.jid holds the full JID (msg.Info.Sender.String()), so a bare
+    number like "50499999999" must also be tried as "50499999999@s.whatsapp.net".
+    Group participants may already arrive as a full JID from history sync,
+    so we accept both shapes.
+    """
+    if not sender:
+        return []
+    if '@' in sender:
+        # Full JID; also try the bare number form so callers that happen to
+        # have stored it that way (older rows) still resolve.
+        return [sender, sender.split('@', 1)[0]]
+    return [f"{sender}@s.whatsapp.net", sender]
+
+
 def get_sender_name(sender_jid: str) -> str:
+    """Resolve a sender identifier to the best available human-readable name.
+
+    Priority:
+      1. senders.full_name / business_name / push_name (populated by the Go
+         bridge from whatsmeow's contact store + incoming message PushName)
+      2. chats.name (only populated for chats the user opened; applies to 1:1)
+      3. Phone number portion of the JID (last-resort fallback)
+    """
+    candidates = _jid_candidates(sender_jid)
+    if not candidates:
+        return sender_jid
+
+    placeholders = ",".join("?" for _ in candidates)
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
+
+        # 1) senders table — the enriched source of truth
+        cursor.execute(
+            f"""
+            SELECT full_name, business_name, push_name
+            FROM senders
+            WHERE jid IN ({placeholders})
             LIMIT 1
-        """, (sender_jid,))
-        
-        result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
-        if result and result[0]:
-            return result[0]
-        else:
-            return sender_jid
-        
+            """,
+            candidates,
+        )
+        row = cursor.fetchone()
+        if row:
+            for candidate in row:
+                if candidate:
+                    return candidate
+
+        # 2) chats table (1:1 chats only have a name if the chat exists)
+        cursor.execute(
+            f"SELECT name FROM chats WHERE jid IN ({placeholders}) LIMIT 1",
+            candidates,
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+        # 3) Last resort: phone number (strip the JID suffix)
+        return sender_jid.split('@')[0] if '@' in sender_jid else sender_jid
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -138,9 +165,29 @@ def list_messages(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        # Build base query. LEFT JOIN senders on the chat JID so chats that
+        # have no stored name still show a resolved one (applies to 1:1 chats
+        # where the user never opened the thread but the contact was synced).
+        query_parts = ["""
+            SELECT
+                messages.timestamp,
+                messages.sender,
+                COALESCE(
+                    NULLIF(chats.name, ''),
+                    chat_senders.full_name,
+                    chat_senders.business_name,
+                    chat_senders.push_name,
+                    chats.jid
+                ) AS chat_name,
+                messages.content,
+                messages.is_from_me,
+                chats.jid,
+                messages.id,
+                messages.media_type
+            FROM messages
+        """]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
+        query_parts.append("LEFT JOIN senders AS chat_senders ON chat_senders.jid = chats.jid")
         where_clauses = []
         params = []
         
@@ -328,30 +375,49 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
+        # Build base query. We LEFT JOIN senders so chats without a stored
+        # name (common for group participants and chats never opened by the
+        # user) still resolve to a human-readable name via FullName /
+        # BusinessName / PushName captured from whatsmeow.
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
-                chats.name,
+                COALESCE(
+                    NULLIF(chats.name, ''),
+                    senders.full_name,
+                    senders.business_name,
+                    senders.push_name,
+                    chats.jid
+                ) AS name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
                 messages.is_from_me as last_is_from_me
             FROM chats
+            LEFT JOIN senders ON senders.jid = chats.jid
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
-        
+
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+            # Search across chat name, JID, and the enriched senders fields so
+            # a user can find "Juan" even if chats.name is NULL.
+            where_clauses.append("""(
+                LOWER(chats.name) LIKE LOWER(?)
+                OR LOWER(senders.full_name) LIKE LOWER(?)
+                OR LOWER(senders.push_name) LIKE LOWER(?)
+                OR LOWER(senders.business_name) LIKE LOWER(?)
+                OR chats.jid LIKE ?
+            )""")
+            wildcard = f"%{query}%"
+            params.extend([wildcard, wildcard, wildcard, wildcard, wildcard])
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -391,28 +457,70 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Looks across the chats table (user-opened chats) AND the senders table
+    (every JID the bridge has seen — message senders plus the synced
+    whatsmeow contact store). This finds contacts even if the user never
+    opened a 1:1 chat with them.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        search_pattern = '%' + query + '%'
+
+        # UNION over chats and senders so we cover:
+        #   - chats the user opened (chats.name may have a user-visible label)
+        #   - contacts synced from whatsmeow (senders.full_name, etc.)
+        # Individual WhatsApp JIDs end in @s.whatsapp.net; groups end in @g.us.
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            SELECT jid, name FROM (
+                SELECT
+                    chats.jid AS jid,
+                    COALESCE(
+                        NULLIF(chats.name, ''),
+                        senders.full_name,
+                        senders.business_name,
+                        senders.push_name
+                    ) AS name
+                FROM chats
+                LEFT JOIN senders ON senders.jid = chats.jid
+                WHERE (
+                    LOWER(chats.name) LIKE LOWER(?)
+                    OR LOWER(senders.full_name) LIKE LOWER(?)
+                    OR LOWER(senders.push_name) LIKE LOWER(?)
+                    OR LOWER(senders.business_name) LIKE LOWER(?)
+                    OR LOWER(chats.jid) LIKE LOWER(?)
+                ) AND chats.jid NOT LIKE '%@g.us'
+
+                UNION
+
+                SELECT
+                    senders.jid AS jid,
+                    COALESCE(
+                        senders.full_name,
+                        senders.business_name,
+                        senders.push_name
+                    ) AS name
+                FROM senders
+                WHERE (
+                    LOWER(senders.full_name) LIKE LOWER(?)
+                    OR LOWER(senders.push_name) LIKE LOWER(?)
+                    OR LOWER(senders.business_name) LIKE LOWER(?)
+                    OR LOWER(senders.jid) LIKE LOWER(?)
+                ) AND senders.jid NOT LIKE '%@g.us'
+            )
+            WHERE name IS NOT NULL AND name != ''
             ORDER BY name, jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
-        
+        """, (
+            search_pattern, search_pattern, search_pattern, search_pattern, search_pattern,
+            search_pattern, search_pattern, search_pattern, search_pattern,
+        ))
+
         contacts = cursor.fetchall()
-        
+
         result = []
         for contact_data in contacts:
             contact = Contact(
@@ -421,7 +529,7 @@ def search_contacts(query: str) -> List[Contact]:
                 jid=contact_data[0]
             )
             result.append(contact)
-            
+
         return result
         
     except sqlite3.Error as e:
@@ -447,13 +555,20 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
-                c.name,
+                COALESCE(
+                    NULLIF(c.name, ''),
+                    s.full_name,
+                    s.business_name,
+                    s.push_name,
+                    c.jid
+                ) AS name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
+            LEFT JOIN senders s ON s.jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
@@ -490,10 +605,16 @@ def get_last_interaction(jid: str) -> str:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.timestamp,
                 m.sender,
-                c.name,
+                COALESCE(
+                    NULLIF(c.name, ''),
+                    s.full_name,
+                    s.business_name,
+                    s.push_name,
+                    c.jid
+                ) AS chat_name,
                 m.content,
                 m.is_from_me,
                 c.jid,
@@ -501,6 +622,7 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
+            LEFT JOIN senders s ON s.jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
             ORDER BY m.timestamp DESC
             LIMIT 1
@@ -539,22 +661,29 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         cursor = conn.cursor()
         
         query = """
-            SELECT 
+            SELECT
                 c.jid,
-                c.name,
+                COALESCE(
+                    NULLIF(c.name, ''),
+                    s.full_name,
+                    s.business_name,
+                    s.push_name,
+                    c.jid
+                ) AS name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
+            LEFT JOIN senders s ON s.jid = c.jid
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
         
         cursor.execute(query, (chat_jid,))
@@ -587,15 +716,22 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT 
+            SELECT
                 c.jid,
-                c.name,
+                COALESCE(
+                    NULLIF(c.name, ''),
+                    s.full_name,
+                    s.business_name,
+                    s.push_name,
+                    c.jid
+                ) AS name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN senders s ON s.jid = c.jid
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
             LIMIT 1

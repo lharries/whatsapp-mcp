@@ -66,7 +66,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -84,6 +84,16 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS senders (
+			jid TEXT PRIMARY KEY,
+			push_name TEXT,
+			full_name TEXT,
+			first_name TEXT,
+			business_name TEXT,
+			updated_at TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_senders_names ON senders(full_name, push_name);
 	`)
 	if err != nil {
 		db.Close()
@@ -105,6 +115,70 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// StoreSender upserts a sender row, preserving existing non-empty fields when the
+// incoming event does not provide them (e.g. PushName missing from a history sync
+// event should not overwrite a previously resolved FullName).
+func (store *MessageStore) StoreSender(jid, pushName, fullName, firstName, businessName string) error {
+	if jid == "" {
+		return nil
+	}
+	_, err := store.db.Exec(`
+		INSERT INTO senders (jid, push_name, full_name, first_name, business_name, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			push_name     = COALESCE(NULLIF(excluded.push_name, ''),     senders.push_name),
+			full_name     = COALESCE(NULLIF(excluded.full_name, ''),     senders.full_name),
+			first_name    = COALESCE(NULLIF(excluded.first_name, ''),    senders.first_name),
+			business_name = COALESCE(NULLIF(excluded.business_name, ''), senders.business_name),
+			updated_at    = excluded.updated_at
+	`, jid, pushName, fullName, firstName, businessName, time.Now())
+	return err
+}
+
+// ResolveName returns the best available human-readable name for a JID from the
+// senders table, preferring FullName > BusinessName > PushName. Returns ""
+// if no row exists or all name fields are empty.
+func (store *MessageStore) ResolveName(jid string) string {
+	var fullName, businessName, pushName sql.NullString
+	err := store.db.QueryRow(
+		"SELECT full_name, business_name, push_name FROM senders WHERE jid = ?",
+		jid,
+	).Scan(&fullName, &businessName, &pushName)
+	if err != nil {
+		return ""
+	}
+	if fullName.Valid && fullName.String != "" {
+		return fullName.String
+	}
+	if businessName.Valid && businessName.String != "" {
+		return businessName.String
+	}
+	if pushName.Valid && pushName.String != "" {
+		return pushName.String
+	}
+	return ""
+}
+
+// SyncAllContacts pulls the full whatsmeow contact store and upserts every
+// entry into the senders table. Safe to call repeatedly (UPSERT semantics).
+func SyncAllContacts(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		logger.Warnf("Failed to sync contacts: %v", err)
+		return
+	}
+	count := 0
+	for jid, info := range contacts {
+		if err := store.StoreSender(jid.String(), info.PushName, info.FullName, info.FirstName, info.BusinessName); err == nil {
+			count++
+		}
+	}
+	logger.Infof("Synced %d contacts into senders table", count)
 }
 
 // Store a message in the database
@@ -413,6 +487,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+	senderJID := msg.Info.Sender.String()
+
+	// Enrich the senders table with whatever identity data this event carries.
+	// PushName comes free with every message event; FullName/BusinessName come
+	// from whatsmeow's local contact store (populated from the user's WhatsApp
+	// address book and history sync).
+	var fullName, firstName, businessName string
+	if client.Store != nil && client.Store.Contacts != nil {
+		if contact, err := client.Store.Contacts.GetContact(context.Background(), msg.Info.Sender); err == nil {
+			fullName = contact.FullName
+			firstName = contact.FirstName
+			businessName = contact.BusinessName
+		}
+	}
+	if err := messageStore.StoreSender(senderJID, msg.Info.PushName, fullName, firstName, businessName); err != nil {
+		logger.Warnf("Failed to store sender: %v", err)
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -461,11 +552,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
+		// Resolve sender to a human-readable name; fall back to the raw number.
+		displayName := messageStore.ResolveName(senderJID)
+		if displayName == "" {
+			displayName = sender
+		}
+
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, displayName, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, displayName, content)
 		}
 	}
 }
@@ -641,7 +738,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +897,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,6 +944,9 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Pull the full WhatsApp contact store into our local senders table.
+			// Runs in a goroutine so we don't block the event dispatcher.
+			go SyncAllContacts(client, messageStore, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -973,7 +1073,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,16 +1087,26 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
+		// First try the local senders table (populated from every message and
+		// from SyncAllContacts). It prefers FullName > BusinessName > PushName.
+		if resolved := messageStore.ResolveName(chatJID); resolved != "" {
+			name = resolved
 		} else {
-			// Last fallback to JID
-			name = jid.User
+			// Then try whatsmeow's live contact store
+			contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+			if err == nil && contact.FullName != "" {
+				name = contact.FullName
+			} else if err == nil && contact.BusinessName != "" {
+				name = contact.BusinessName
+			} else if err == nil && contact.PushName != "" {
+				name = contact.PushName
+			} else if sender != "" {
+				// Fallback to sender
+				name = sender
+			} else {
+				// Last fallback to JID
+				name = jid.User
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
@@ -1145,6 +1255,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+
+	// History sync typically backfills the whatsmeow contact store with new
+	// entries (group participants, etc.), so re-sync senders now.
+	SyncAllContacts(client, messageStore, logger)
 }
 
 // Request history sync from the server

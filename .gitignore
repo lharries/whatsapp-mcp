@@ -1,3 +1,7 @@
+.DS_Store
+__pycache__/
+*.py[oc]
+.venv
 *.db
-claude_desktop_config.json
-whatsapp.log
+whatsapp-bridge/whatsapp-client
+whatsapp-bridge/store/
