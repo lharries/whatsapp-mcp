@@ -774,8 +774,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server. Bind to loopback only — the REST API has no auth and
+	// will send WhatsApp messages from the linked account on behalf of any caller.
+	// Binding to all interfaces (":port") would expose send/read to anyone on the
+	// same LAN (home WiFi, café, hotel), so we restrict to 127.0.0.1. The MCP
+	// server connects via http://localhost:{port} (whatsapp-mcp-server/whatsapp.py),
+	// which works unchanged. To opt into LAN exposure, set BIND_ADDR=0.0.0.0.
+	bindAddr := os.Getenv("BIND_ADDR")
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddr, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
