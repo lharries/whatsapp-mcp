@@ -98,9 +98,11 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			chat_pn TEXT,
+			chat_lid TEXT
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -115,6 +117,8 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			sender_pn TEXT,
+			sender_lid TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -122,6 +126,32 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Migrate: add LID/PN columns to existing DBs that were created before the LID migration fix.
+	// SQLite does not support "ADD COLUMN IF NOT EXISTS", so we check pragma_table_info first.
+	addColumnIfMissing := func(table, column, columnDef string) error {
+		var count int
+		row := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name='%s'", table, column))
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnDef))
+			return err
+		}
+		return nil
+	}
+	for _, m := range []struct{ table, column, def string }{
+		{"messages", "sender_pn", "TEXT"},
+		{"messages", "sender_lid", "TEXT"},
+		{"chats", "chat_pn", "TEXT"},
+		{"chats", "chat_lid", "TEXT"},
+	} {
+		if err := addColumnIfMissing(m.table, m.column, m.def); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate column %s.%s: %v", m.table, m.column, err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -134,26 +164,61 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	return store.StoreChatWithIdentifiers(jid, name, lastMessageTime, "", "")
+}
+
+// Store a chat with explicit PN/LID identifiers. Existing chat_pn / chat_lid are preserved
+// when the new values are empty so that later events cannot blank an already-resolved mapping.
+func (store *MessageStore) StoreChatWithIdentifiers(jid, name string, lastMessageTime time.Time, chatPN, chatLID string) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		`INSERT INTO chats (jid, name, last_message_time, chat_pn, chat_lid)
+		 VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(jid) DO UPDATE SET
+		   name = excluded.name,
+		   last_message_time = excluded.last_message_time,
+		   chat_pn = COALESCE(excluded.chat_pn, chats.chat_pn),
+		   chat_lid = COALESCE(excluded.chat_lid, chats.chat_lid)`,
+		jid, name, lastMessageTime, chatPN, chatLID,
 	)
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database (legacy signature — defaults to empty PN/LID).
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	return store.StoreMessageWithIdentifiers(id, chatJID, sender, "", "", content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+}
+
+// Store a message with explicit sender_pn / sender_lid. Empty identifiers are stored as NULL so
+// we can later distinguish "no mapping known" from "mapping known to be missing".
+func (store *MessageStore) StoreMessageWithIdentifiers(id, chatJID, sender, senderPN, senderLID, content string,
+	timestamp time.Time, isFromMe bool, mediaType, filename, url string,
+	mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT INTO messages
+		 (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, sender_pn, sender_lid)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id, chat_jid) DO UPDATE SET
+		   sender = excluded.sender,
+		   content = excluded.content,
+		   timestamp = excluded.timestamp,
+		   is_from_me = excluded.is_from_me,
+		   media_type = excluded.media_type,
+		   filename = excluded.filename,
+		   url = excluded.url,
+		   media_key = excluded.media_key,
+		   file_sha256 = excluded.file_sha256,
+		   file_enc_sha256 = excluded.file_enc_sha256,
+		   file_length = excluded.file_length,
+		   sender_pn = COALESCE(excluded.sender_pn, messages.sender_pn),
+		   sender_lid = COALESCE(excluded.sender_lid, messages.sender_lid)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, senderPN, senderLID,
 	)
 	return err
 }
@@ -464,17 +529,58 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// splitPNAndLID inspects a primary JID and its alternate form (as delivered by whatsmeow
+// in events.Message.Info.Sender / SenderAlt or derived from Chat + RecipientAlt) and returns the phone-number
+// form and the LID form as plain user strings. Either may be empty when the mapping is
+// unknown at delivery time. The legacy (preferred) user string is also returned so callers
+// can keep the existing `sender` / `chat_jid` columns backwards compatible.
+func splitPNAndLID(primary, alt types.JID) (pn string, lid string, preferredUser string) {
+	switch primary.Server {
+	case types.DefaultUserServer:
+		pn = primary.User
+		if alt.Server == types.HiddenUserServer {
+			lid = alt.User
+		}
+	case types.HiddenUserServer:
+		lid = primary.User
+		if alt.Server == types.DefaultUserServer {
+			pn = alt.User
+		}
+	}
+	// Prefer the phone-number form for legacy columns so existing lookups by phone keep working.
+	preferredUser = pn
+	if preferredUser == "" {
+		preferredUser = primary.User
+	}
+	return
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
+	// Save message to database.
+	// WhatsApp is migrating 1:1 chats and group-participant identifiers from phone-number JIDs
+	// (@s.whatsapp.net) to LID JIDs (@lid). whatsmeow exposes both forms in Sender/SenderAlt and
+	// Recipient/RecipientAlt. For 1:1 chats the Chat JID equals the counterparty, so the alt
+	// chat JID comes from SenderAlt (incoming) or RecipientAlt (outgoing). Groups (@g.us) have
+	// no PN/LID duality, so chat_pn / chat_lid stay empty for them.
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	senderPN, senderLID, senderLegacy := splitPNAndLID(msg.Info.Sender, msg.Info.SenderAlt)
+	var chatAlt types.JID
+	if !msg.Info.IsGroup {
+		if msg.Info.IsFromMe {
+			chatAlt = msg.Info.RecipientAlt
+		} else {
+			chatAlt = msg.Info.SenderAlt
+		}
+	}
+	chatPN, chatLID, _ := splitPNAndLID(msg.Info.Chat, chatAlt)
+	sender := senderLegacy
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	err := messageStore.StoreChatWithIdentifiers(chatJID, name, msg.Info.Timestamp, chatPN, chatLID)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -491,10 +597,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Store message in database
-	err = messageStore.StoreMessage(
+	err = messageStore.StoreMessageWithIdentifiers(
 		msg.Info.ID,
 		chatJID,
 		sender,
+		senderPN,
+		senderLID,
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -890,6 +998,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	}))
+
+
+	// Handler for requesting history sync (with authentication)
+	http.HandleFunc("/api/sync", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		requestHistorySync(client)
+		json.NewEncoder(w).Encode(map[string]string{"status": "sync requested"})
 	}))
 
 	// Start the server
