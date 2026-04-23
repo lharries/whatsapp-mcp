@@ -1,0 +1,44 @@
+services:
+  whatsapp-bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: whatsapp-bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist store directory (contains SQLite databases and media files)
+      - whatsapp-store:/app/store
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    networks:
+      - whatsapp-network
+
+  whatsapp-mcp-server:
+    build:
+      context: ./whatsapp-mcp-server
+      dockerfile: Dockerfile
+    container_name: whatsapp-mcp-server
+    depends_on:
+      - whatsapp-bridge
+    environment:
+      # Point to the bridge service instead of localhost
+      - WHATSAPP_API_BASE_URL=http://whatsapp-bridge:8080/api
+      - MESSAGES_DB_PATH=/app/store/messages.db
+    volumes:
+      # Mount the same store volume to access the database
+      - whatsapp-store:/app/store
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+    # This service will be used via stdio by Claude/Cursor, not as a long-running HTTP server
+    # So we don't expose ports and it will be started on demand
+
+volumes:
+  whatsapp-store:
+    driver: local
+
+networks:
+  whatsapp-network:
+    driver: bridge
