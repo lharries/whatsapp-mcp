@@ -2,13 +2,19 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
+MESSAGES_DB_PATH = os.environ.get("MESSAGES_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db'))
+
+# Debug: print the database path being used
+import sys
+print(f"DEBUG: MESSAGES_DB_PATH = {MESSAGES_DB_PATH}", file=sys.stderr)
+print(f"DEBUG: Database exists: {os.path.exists(MESSAGES_DB_PATH)}", file=sys.stderr)
 
 @dataclass
 class Message:
