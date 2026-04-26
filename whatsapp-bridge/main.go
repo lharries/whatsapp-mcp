@@ -399,6 +399,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// single-device accounts, so without this the outbound row never
 	// reaches the local store. Media outbounds are skipped: the
 	// extractMediaInfo metadata isn't reconstructed at this layer.
+	// TODO(media-send): once a media-send path lands, reconstruct the
+	// extractMediaInfo fields (media_type, filename, url, media_key,
+	// file_sha256, file_enc_sha256, file_length) from the upload
+	// resp + msg.{Image,Audio,Video,Document}Message and persist via
+	// StoreMessage so own-media-sends render in readers too.
 	if messageStore != nil && mediaPath == "" && client.Store != nil && client.Store.ID != nil {
 		chatJID := recipientJID.String()
 		sender := client.Store.ID.User
