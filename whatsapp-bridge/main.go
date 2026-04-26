@@ -118,6 +118,21 @@ func (store *MessageStore) TouchChatLastMessageTime(jid string, lastMessageTime 
 	return err
 }
 
+// EnsureChat creates a chat row if none exists, leaving any existing
+// row (and its resolved name) untouched. Required before StoreMessage
+// in the outbound path: messages.chat_jid has a FOREIGN KEY into
+// chats.jid, so a brand-new recipient with no prior handleMessage or
+// history-sync entry would otherwise fail the INSERT silently. The
+// row's name will be backfilled by handleMessage / history sync the
+// first time inbound traffic resolves it.
+func (store *MessageStore) EnsureChat(jid string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, '', ?)",
+		jid, lastMessageTime,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -387,6 +402,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	if messageStore != nil && mediaPath == "" && client.Store != nil && client.Store.ID != nil {
 		chatJID := recipientJID.String()
 		sender := client.Store.ID.User
+		if ensureErr := messageStore.EnsureChat(chatJID, resp.Timestamp); ensureErr != nil {
+			fmt.Printf("Failed to ensure chat row: %v\n", ensureErr)
+		}
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, sender, message, resp.Timestamp, true,
 			"", "", "", nil, nil, nil, 0,
