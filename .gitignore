@@ -1,3 +1,46 @@
+# Databases and logs
 *.db
-claude_desktop_config.json
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
 whatsapp.log
+logs/
+
+# Runtime state
+.bridge-pid
+.mcp-pid
+.tunnel-pid
+store/
+
+# Secrets and credentials
+.whatsapp-mcp-api-key
+*.pem
+*.key
+claude_desktop_config.json
+
+# Backups
+*.pre-fix-*
+*.old
+*.bak
+*.backup-*
+
+# Local tooling artifacts
+destiny-suite-v0.2.zip
+agente-guionista.plugin
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local operational scripts (contain hardcoded keys or environment-specific paths)
+whatsapp-mcp-service.sh
+whatsapp-mcp-service.sh.old
+start-bridge.sh
+stop-whatsapp-mcp.sh
+start-whatsapp-mcp.sh.bak
+whatsapp-mcp-server/start-sse.sh
+SETUP-COWORK.md

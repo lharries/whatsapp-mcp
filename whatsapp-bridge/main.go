@@ -31,6 +31,40 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// SECURITY: Log sanitization functions to prevent PII exposure
+
+// sanitizePhoneNumber redacts phone numbers in logs, keeping only last 4 digits
+func sanitizePhoneNumber(phone string) string {
+	// Extract just digits
+	digits := ""
+	for _, c := range phone {
+		if c >= '0' && c <= '9' {
+			digits += string(c)
+		}
+	}
+	if len(digits) > 4 {
+		return "***" + digits[len(digits)-4:]
+	}
+	return "****"
+}
+
+// sanitizeLogContent truncates message content for logging
+func sanitizeLogContent(content string, maxLen int) string {
+	if len(content) > maxLen {
+		return content[:maxLen] + "..."
+	}
+	return content
+}
+
+// sanitizeJID redacts the phone portion of a JID for logging
+func sanitizeJID(jid string) string {
+	parts := strings.Split(jid, "@")
+	if len(parts) == 2 {
+		return sanitizePhoneNumber(parts[0]) + "@" + parts[1]
+	}
+	return sanitizePhoneNumber(jid)
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -64,9 +98,11 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			chat_pn TEXT,
+			chat_lid TEXT
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -81,6 +117,8 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			sender_pn TEXT,
+			sender_lid TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -88,6 +126,32 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Migrate: add LID/PN columns to existing DBs that were created before the LID migration fix.
+	// SQLite does not support "ADD COLUMN IF NOT EXISTS", so we check pragma_table_info first.
+	addColumnIfMissing := func(table, column, columnDef string) error {
+		var count int
+		row := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name='%s'", table, column))
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnDef))
+			return err
+		}
+		return nil
+	}
+	for _, m := range []struct{ table, column, def string }{
+		{"messages", "sender_pn", "TEXT"},
+		{"messages", "sender_lid", "TEXT"},
+		{"chats", "chat_pn", "TEXT"},
+		{"chats", "chat_lid", "TEXT"},
+	} {
+		if err := addColumnIfMissing(m.table, m.column, m.def); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate column %s.%s: %v", m.table, m.column, err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -100,26 +164,61 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	return store.StoreChatWithIdentifiers(jid, name, lastMessageTime, "", "")
+}
+
+// Store a chat with explicit PN/LID identifiers. Existing chat_pn / chat_lid are preserved
+// when the new values are empty so that later events cannot blank an already-resolved mapping.
+func (store *MessageStore) StoreChatWithIdentifiers(jid, name string, lastMessageTime time.Time, chatPN, chatLID string) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		`INSERT INTO chats (jid, name, last_message_time, chat_pn, chat_lid)
+		 VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(jid) DO UPDATE SET
+		   name = excluded.name,
+		   last_message_time = excluded.last_message_time,
+		   chat_pn = COALESCE(excluded.chat_pn, chats.chat_pn),
+		   chat_lid = COALESCE(excluded.chat_lid, chats.chat_lid)`,
+		jid, name, lastMessageTime, chatPN, chatLID,
 	)
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database (legacy signature — defaults to empty PN/LID).
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	return store.StoreMessageWithIdentifiers(id, chatJID, sender, "", "", content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+}
+
+// Store a message with explicit sender_pn / sender_lid. Empty identifiers are stored as NULL so
+// we can later distinguish "no mapping known" from "mapping known to be missing".
+func (store *MessageStore) StoreMessageWithIdentifiers(id, chatJID, sender, senderPN, senderLID, content string,
+	timestamp time.Time, isFromMe bool, mediaType, filename, url string,
+	mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT INTO messages
+		 (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, sender_pn, sender_lid)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id, chat_jid) DO UPDATE SET
+		   sender = excluded.sender,
+		   content = excluded.content,
+		   timestamp = excluded.timestamp,
+		   is_from_me = excluded.is_from_me,
+		   media_type = excluded.media_type,
+		   filename = excluded.filename,
+		   url = excluded.url,
+		   media_key = excluded.media_key,
+		   file_sha256 = excluded.file_sha256,
+		   file_enc_sha256 = excluded.file_enc_sha256,
+		   file_length = excluded.file_length,
+		   sender_pn = COALESCE(excluded.sender_pn, messages.sender_pn),
+		   sender_lid = COALESCE(excluded.sender_lid, messages.sender_lid)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, senderPN, senderLID,
 	)
 	return err
 }
@@ -233,8 +332,30 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// SECURITY: Validate media path to prevent path traversal attacks
+		cleanPath := filepath.Clean(mediaPath)
+		absPath, err := filepath.Abs(cleanPath)
+		if err != nil {
+			return false, "Invalid media path"
+		}
+
+		// Get allowed media directory (current working directory + /media or configured path)
+		allowedDir := os.Getenv("WHATSAPP_MEDIA_DIR")
+		if allowedDir == "" {
+			allowedDir = "./media"
+		}
+		allowedAbsDir, err := filepath.Abs(allowedDir)
+		if err != nil {
+			return false, "Server configuration error: invalid media directory"
+		}
+
+		// Ensure the path is within the allowed directory
+		if !strings.HasPrefix(absPath, allowedAbsDir+string(os.PathSeparator)) && absPath != allowedAbsDir {
+			return false, "Access denied: media path outside allowed directory"
+		}
+
 		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		mediaData, err := os.ReadFile(absPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
@@ -408,17 +529,58 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// splitPNAndLID inspects a primary JID and its alternate form (as delivered by whatsmeow
+// in events.Message.Info.Sender / SenderAlt or derived from Chat + RecipientAlt) and returns the phone-number
+// form and the LID form as plain user strings. Either may be empty when the mapping is
+// unknown at delivery time. The legacy (preferred) user string is also returned so callers
+// can keep the existing `sender` / `chat_jid` columns backwards compatible.
+func splitPNAndLID(primary, alt types.JID) (pn string, lid string, preferredUser string) {
+	switch primary.Server {
+	case types.DefaultUserServer:
+		pn = primary.User
+		if alt.Server == types.HiddenUserServer {
+			lid = alt.User
+		}
+	case types.HiddenUserServer:
+		lid = primary.User
+		if alt.Server == types.DefaultUserServer {
+			pn = alt.User
+		}
+	}
+	// Prefer the phone-number form for legacy columns so existing lookups by phone keep working.
+	preferredUser = pn
+	if preferredUser == "" {
+		preferredUser = primary.User
+	}
+	return
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
+	// Save message to database.
+	// WhatsApp is migrating 1:1 chats and group-participant identifiers from phone-number JIDs
+	// (@s.whatsapp.net) to LID JIDs (@lid). whatsmeow exposes both forms in Sender/SenderAlt and
+	// Recipient/RecipientAlt. For 1:1 chats the Chat JID equals the counterparty, so the alt
+	// chat JID comes from SenderAlt (incoming) or RecipientAlt (outgoing). Groups (@g.us) have
+	// no PN/LID duality, so chat_pn / chat_lid stay empty for them.
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	senderPN, senderLID, senderLegacy := splitPNAndLID(msg.Info.Sender, msg.Info.SenderAlt)
+	var chatAlt types.JID
+	if !msg.Info.IsGroup {
+		if msg.Info.IsFromMe {
+			chatAlt = msg.Info.RecipientAlt
+		} else {
+			chatAlt = msg.Info.SenderAlt
+		}
+	}
+	chatPN, chatLID, _ := splitPNAndLID(msg.Info.Chat, chatAlt)
+	sender := senderLegacy
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	err := messageStore.StoreChatWithIdentifiers(chatJID, name, msg.Info.Timestamp, chatPN, chatLID)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -435,10 +597,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Store message in database
-	err = messageStore.StoreMessage(
+	err = messageStore.StoreMessageWithIdentifiers(
 		msg.Info.ID,
 		chatJID,
 		sender,
+		senderPN,
+		senderLID,
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -462,10 +626,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		// Log based on message type
+		// SECURITY: Sanitize sender (phone number) and content to prevent PII exposure in logs
+		safeSender := sanitizeJID(sender)
+		safeContent := sanitizeLogContent(content, 50) // Truncate content to 50 chars
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, safeSender, mediaType, filename, safeContent)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, safeSender, safeContent)
 		}
 	}
 }
@@ -561,8 +728,18 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
+	// SECURITY: Sanitize chatJID to prevent path traversal
+	// Only allow alphanumeric characters, @, and _ (replace : with _)
+	sanitizedChatJID := strings.ReplaceAll(chatJID, ":", "_")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "..", "")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "/", "")
+	sanitizedChatJID = strings.ReplaceAll(sanitizedChatJID, "\\", "")
+	if sanitizedChatJID == "" {
+		return false, "", "", "", fmt.Errorf("invalid chat JID")
+	}
+
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := fmt.Sprintf("store/%s", sanitizedChatJID)
 	localPath := ""
 
 	// Get media info from the database
@@ -590,8 +767,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// SECURITY: Sanitize filename to prevent path traversal
+	// Extract only the base name (no directory components)
+	safeFilename := filepath.Base(filename)
+	if safeFilename == "." || safeFilename == ".." || safeFilename == "" {
+		return false, "", "", "", fmt.Errorf("invalid filename")
+	}
+
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = fmt.Sprintf("%s/%s", chatDir, safeFilename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -599,10 +783,19 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
+	// SECURITY: Verify the path is within the store directory
+	storeDir, err := filepath.Abs("store")
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to get store directory path: %v", err)
+	}
+	if !strings.HasPrefix(absPath, storeDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("access denied: path outside store directory")
+	}
+
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, safeFilename, absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -610,7 +803,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	// SECURITY: Sanitize chatJID in log output
+	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, sanitizeJID(chatJID))
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -641,7 +835,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -652,7 +846,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, safeFilename, absPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -675,10 +869,42 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// SECURITY: Authentication middleware for API endpoints
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get API key from environment
+		expectedAPIKey := os.Getenv("WHATSAPP_API_KEY")
+
+		// If no API key is configured, reject all requests for security
+		if expectedAPIKey == "" {
+			http.Error(w, "Server not configured: WHATSAPP_API_KEY environment variable required", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Check API key from header
+		providedAPIKey := r.Header.Get("X-API-Key")
+		if providedAPIKey == "" {
+			providedAPIKey = r.Header.Get("Authorization")
+			// Support "Bearer <token>" format
+			if strings.HasPrefix(providedAPIKey, "Bearer ") {
+				providedAPIKey = strings.TrimPrefix(providedAPIKey, "Bearer ")
+			}
+		}
+
+		// Validate API key
+		if providedAPIKey == "" || providedAPIKey != expectedAPIKey {
+			http.Error(w, "Unauthorized: invalid or missing API key", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for sending messages (with authentication)
+	http.HandleFunc("/api/send", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -721,10 +947,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for downloading media (with authentication)
+	http.HandleFunc("/api/download", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -772,7 +998,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
+
+
+	// Handler for requesting history sync (with authentication)
+	http.HandleFunc("/api/sync", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		requestHistorySync(client)
+		json.NewEncoder(w).Encode(map[string]string{"status": "sync requested"})
+	}))
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -800,14 +1038,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1211,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1226,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
