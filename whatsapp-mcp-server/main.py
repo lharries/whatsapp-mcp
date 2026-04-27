@@ -4,6 +4,7 @@ from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
+    get_history_coverage as whatsapp_get_history_coverage,
     get_chat as whatsapp_get_chat,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
@@ -46,7 +47,8 @@ def list_messages(
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
+        sender_phone_number: Optional contact phone number/JID to fetch the direct conversation
+                           with that contact when possible, otherwise falls back to sender-only filtering
         chat_jid: Optional chat JID to filter messages by chat
         query: Optional search term to filter messages by content
         limit: Maximum number of messages to return (default 20)
@@ -94,6 +96,17 @@ def list_chats(
         sort_by=sort_by
     )
     return chats
+
+@mcp.tool()
+def get_history_coverage(query: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """Inspect what message history is actually stored locally for each chat.
+
+    Args:
+        query: Optional chat name/JID filter
+        limit: Maximum number of chats to return (default 50)
+    """
+    coverage = whatsapp_get_history_coverage(query=query, limit=limit)
+    return coverage
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
