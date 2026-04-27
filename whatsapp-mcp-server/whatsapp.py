@@ -7,7 +7,9 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store')
+MESSAGES_DB_PATH = os.path.join(STORE_DIR, 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(STORE_DIR, 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -35,6 +37,15 @@ class Chat:
         """Determine if chat is a group based on JID pattern."""
         return self.jid.endswith("@g.us")
 
+
+@dataclass
+class HistoryCoverage:
+    jid: str
+    name: Optional[str]
+    message_count: int
+    oldest_message_time: Optional[datetime]
+    newest_message_time: Optional[datetime]
+
 @dataclass
 class Contact:
     phone_number: str
@@ -46,6 +57,56 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+
+def _jid_user(jid: str) -> str:
+    return jid.split('@')[0]
+
+
+def _normalize_phone_or_jid(identifier: str) -> str:
+    return _jid_user(identifier.strip())
+
+
+def _is_placeholder_contact_name(name: Optional[str], jid: str) -> bool:
+    if not name or not name.strip():
+        return True
+    return name.strip() == _jid_user(jid)
+
+
+def _get_best_contact_name(
+    jid: str,
+    full_name: Optional[str] = None,
+    push_name: Optional[str] = None,
+    business_name: Optional[str] = None,
+    first_name: Optional[str] = None,
+    fallback_name: Optional[str] = None
+) -> str:
+    for candidate in (full_name, push_name, business_name, first_name, fallback_name):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return _jid_user(jid)
+
+
+def _merge_contact_result(
+    contacts_by_jid: dict[str, Contact],
+    jid: str,
+    candidate_name: Optional[str]
+) -> None:
+    current = contacts_by_jid.get(jid)
+    current_name = current.name if current else None
+
+    if _is_placeholder_contact_name(candidate_name, jid):
+        best_name = current_name or _jid_user(jid)
+    elif _is_placeholder_contact_name(current_name, jid):
+        best_name = candidate_name.strip()
+    else:
+        best_name = candidate_name.strip()
+
+    contacts_by_jid[jid] = Contact(
+        phone_number=_jid_user(jid),
+        name=best_name,
+        jid=jid
+    )
 
 def get_sender_name(sender_jid: str) -> str:
     try:
@@ -73,7 +134,7 @@ def get_sender_name(sender_jid: str) -> str:
             cursor.execute("""
                 SELECT name
                 FROM chats
-                WHERE jid LIKE ?
+                WHERE jid LIKE ? AND jid NOT LIKE '%@g.us'
                 LIMIT 1
             """, (f"%{phone_part}%",))
             
@@ -390,15 +451,73 @@ def list_chats(
             conn.close()
 
 
-def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+def get_history_coverage(query: Optional[str] = None, limit: int = 50) -> List[HistoryCoverage]:
+    """Return stored history coverage per chat for diagnostics."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        query_parts = ["""
+            SELECT
+                chats.jid,
+                chats.name,
+                COUNT(messages.id) AS message_count,
+                MIN(messages.timestamp) AS oldest_message_time,
+                MAX(messages.timestamp) AS newest_message_time
+            FROM chats
+            LEFT JOIN messages ON chats.jid = messages.chat_jid
+        """]
+        where_clauses = []
+        params = []
+
+        if query:
+            search_pattern = f"%{query}%"
+            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR LOWER(chats.jid) LIKE LOWER(?))")
+            params.extend([search_pattern, search_pattern])
+
+        if where_clauses:
+            query_parts.append("WHERE " + " AND ".join(where_clauses))
+
+        query_parts.append("""
+            GROUP BY chats.jid, chats.name
+            ORDER BY newest_message_time DESC, chats.jid
+            LIMIT ?
+        """)
+        params.append(limit)
+
+        cursor.execute(" ".join(query_parts), tuple(params))
+
+        result = []
+        for row in cursor.fetchall():
+            result.append(HistoryCoverage(
+                jid=row[0],
+                name=row[1],
+                message_count=row[2] or 0,
+                oldest_message_time=datetime.fromisoformat(row[3]) if row[3] else None,
+                newest_message_time=datetime.fromisoformat(row[4]) if row[4] else None
+            ))
+
+        return result
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def search_contacts(query: str) -> List[Contact]:
+    """Search contacts by name or phone number."""
+    conn = None
+    whatsapp_conn = None
+    try:
+        search_pattern = f"%{query}%"
+        contacts_by_jid: dict[str, Contact] = {}
+
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
         cursor.execute("""
             SELECT DISTINCT 
                 jid,
@@ -408,28 +527,58 @@ def search_contacts(query: str) -> List[Contact]:
                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
-            LIMIT 50
+            LIMIT 100
         """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
+
+        for jid, name in cursor.fetchall():
+            _merge_contact_result(contacts_by_jid, jid, name)
+
+        if os.path.exists(WHATSAPP_DB_PATH):
+            whatsapp_conn = sqlite3.connect(WHATSAPP_DB_PATH)
+            whatsapp_cursor = whatsapp_conn.cursor()
+            whatsapp_cursor.execute("""
+                SELECT DISTINCT
+                    their_jid,
+                    first_name,
+                    full_name,
+                    push_name,
+                    business_name
+                FROM whatsmeow_contacts
+                WHERE
+                    their_jid NOT LIKE '%@g.us'
+                    AND (
+                        LOWER(their_jid) LIKE LOWER(?)
+                        OR LOWER(COALESCE(full_name, '')) LIKE LOWER(?)
+                        OR LOWER(COALESCE(push_name, '')) LIKE LOWER(?)
+                        OR LOWER(COALESCE(business_name, '')) LIKE LOWER(?)
+                        OR LOWER(COALESCE(first_name, '')) LIKE LOWER(?)
+                    )
+                ORDER BY their_jid
+                LIMIT 100
+            """, (search_pattern, search_pattern, search_pattern, search_pattern, search_pattern))
+
+            for jid, first_name, full_name, push_name, business_name in whatsapp_cursor.fetchall():
+                best_name = _get_best_contact_name(
+                    jid=jid,
+                    full_name=full_name,
+                    push_name=push_name,
+                    business_name=business_name,
+                    first_name=first_name
+                )
+                _merge_contact_result(contacts_by_jid, jid, best_name)
+
+        result = list(contacts_by_jid.values())
+        result.sort(key=lambda contact: ((contact.name or contact.phone_number).lower(), contact.jid))
+        return result[:50]
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
     finally:
-        if 'conn' in locals():
+        if conn is not None:
             conn.close()
+        if whatsapp_conn is not None:
+            whatsapp_conn.close()
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
