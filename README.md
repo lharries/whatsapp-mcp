@@ -44,7 +44,7 @@ Here's an example of what you can do when it's connected to Claude.
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
-   After approximately 20 days, you will might need to re-authenticate.
+   After approximately 20 days, you might need to re-authenticate.
 
 3. **Connect to the MCP server**
 
