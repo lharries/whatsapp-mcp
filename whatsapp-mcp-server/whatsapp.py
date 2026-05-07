@@ -724,6 +724,64 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def create_group(
+    name: str,
+    participants: List[str],
+    is_community: bool = False,
+    community_parent_jid: str = "",
+) -> Tuple[bool, str, Optional[dict]]:
+    try:
+        if not name or not name.strip():
+            return False, "Group name is required", None
+        if not participants:
+            return False, "At least one participant is required", None
+
+        url = f"{WHATSAPP_API_BASE_URL}/create_group"
+        payload = {
+            "name": name,
+            "participants": participants,
+            "is_community": is_community,
+            "community_parent_jid": community_parent_jid,
+        }
+
+        response = requests.post(url, json=payload)
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {
+            "jid": result.get("jid"),
+            "name": result.get("name"),
+            "participant_count": result.get("participant_count"),
+        } if success else None
+        return success, message, details
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def leave_group(jid: str) -> Tuple[bool, str]:
+    try:
+        if not jid or not jid.strip():
+            return False, "Group JID is required"
+        url = f"{WHATSAPP_API_BASE_URL}/leave_group"
+        response = requests.post(url, json={"jid": jid})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
     

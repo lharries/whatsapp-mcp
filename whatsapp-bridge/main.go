@@ -484,6 +484,134 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// CreateGroupRequest represents the request body for the create group API.
+// Participants are bare phone numbers (country code, no '+') or full JIDs.
+// The caller's own JID is added implicitly by WhatsApp — do not include it.
+type CreateGroupRequest struct {
+	Name               string   `json:"name"`
+	Participants       []string `json:"participants"`
+	IsCommunity        bool     `json:"is_community,omitempty"`
+	CommunityParentJID string   `json:"community_parent_jid,omitempty"`
+}
+
+// CreateGroupResponse represents the response for the create group API.
+type CreateGroupResponse struct {
+	Success          bool   `json:"success"`
+	Message          string `json:"message"`
+	JID              string `json:"jid,omitempty"`
+	Name             string `json:"name,omitempty"`
+	ParticipantCount int    `json:"participant_count,omitempty"`
+}
+
+// LeaveGroupRequest represents the request body for the leave group API.
+type LeaveGroupRequest struct {
+	JID string `json:"jid"`
+}
+
+// LeaveGroupResponse represents the response for the leave group API.
+type LeaveGroupResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// createWhatsAppGroup creates a new group on WhatsApp.
+func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, req CreateGroupRequest) CreateGroupResponse {
+	if !client.IsConnected() {
+		return CreateGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return CreateGroupResponse{Success: false, Message: "Group name is required"}
+	}
+	// WhatsApp limits group subjects to 25 characters.
+	if len([]rune(req.Name)) > 25 {
+		return CreateGroupResponse{Success: false, Message: "Group name must be 25 characters or fewer"}
+	}
+	if len(req.Participants) == 0 {
+		return CreateGroupResponse{Success: false, Message: "At least one participant is required"}
+	}
+
+	participantJIDs := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var jid types.JID
+		var err error
+		if strings.Contains(p, "@") {
+			jid, err = types.ParseJID(p)
+			if err != nil {
+				return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, err)}
+			}
+		} else {
+			jid = types.JID{User: strings.TrimPrefix(p, "+"), Server: "s.whatsapp.net"}
+		}
+		participantJIDs = append(participantJIDs, jid)
+	}
+	if len(participantJIDs) == 0 {
+		return CreateGroupResponse{Success: false, Message: "No valid participants after parsing"}
+	}
+
+	createReq := whatsmeow.ReqCreateGroup{
+		Name:         req.Name,
+		Participants: participantJIDs,
+	}
+	if req.IsCommunity {
+		createReq.GroupParent.IsParent = true
+	}
+	if req.CommunityParentJID != "" {
+		parentJID, err := types.ParseJID(req.CommunityParentJID)
+		if err != nil {
+			return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid community_parent_jid: %v", err)}
+		}
+		createReq.GroupLinkedParent.LinkedParentJID = parentJID
+	}
+
+	groupInfo, err := client.CreateGroup(createReq)
+	if err != nil {
+		return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Error creating group: %v", err)}
+	}
+
+	// Persist the new chat so it shows up in list_chats immediately.
+	createdAt := groupInfo.GroupCreated
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	if err := messageStore.StoreChat(groupInfo.JID.String(), groupInfo.Name, createdAt); err != nil {
+		fmt.Printf("Warning: failed to store newly created group chat: %v\n", err)
+	}
+
+	return CreateGroupResponse{
+		Success:          true,
+		Message:          "Group created",
+		JID:              groupInfo.JID.String(),
+		Name:             groupInfo.Name,
+		ParticipantCount: len(groupInfo.Participants),
+	}
+}
+
+// leaveWhatsAppGroup leaves the specified group on WhatsApp.
+func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupResponse {
+	if !client.IsConnected() {
+		return LeaveGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	jidStr = strings.TrimSpace(jidStr)
+	if jidStr == "" {
+		return LeaveGroupResponse{Success: false, Message: "Group JID is required"}
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)}
+	}
+	if jid.Server != "g.us" {
+		return LeaveGroupResponse{Success: false, Message: "Only group JIDs (@g.us) can be left"}
+	}
+	if err := client.LeaveGroup(jid); err != nil {
+		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Error leaving group: %v", err)}
+	}
+	return LeaveGroupResponse{Success: true, Message: fmt.Sprintf("Left group %s", jid.String())}
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -772,6 +900,46 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler for creating a group
+	http.HandleFunc("/api/create_group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req CreateGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to create group %q with %d participants\n", req.Name, len(req.Participants))
+		resp := createWhatsAppGroup(client, messageStore, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for leaving a group
+	http.HandleFunc("/api/leave_group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req LeaveGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to leave group %s\n", req.JID)
+		resp := leaveWhatsAppGroup(client, req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
 	// Start the server

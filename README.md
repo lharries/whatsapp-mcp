@@ -140,6 +140,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **create_group**: Create a new WhatsApp group with the given name and participants (optionally as a community parent or as a sub-group of an existing community)
+- **leave_group**: Leave a WhatsApp group by its JID. WhatsApp's protocol has no "delete group" — leaving is the closest action.
 
 ### Media Handling Features
 
