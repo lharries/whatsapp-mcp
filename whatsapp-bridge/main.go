@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -905,8 +906,16 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Port is configurable via WHATSAPP_BRIDGE_PORT env var (default: 8080).
+	port := 8080
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed < 65536 {
+			port = parsed
+		} else {
+			logger.Warnf("Invalid WHATSAPP_BRIDGE_PORT value %q, falling back to %d", v, port)
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
