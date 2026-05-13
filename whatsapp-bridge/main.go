@@ -774,6 +774,64 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting group info (members, admins, etc.)
+	http.HandleFunc("/api/group-info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		groupJID := r.URL.Query().Get("jid")
+		if groupJID == "" {
+			http.Error(w, "jid is required", http.StatusBadRequest)
+			return
+		}
+
+		jid, err := types.ParseJID(groupJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		info, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		type MemberInfo struct {
+			JID          string `json:"jid"`
+			IsAdmin      bool   `json:"is_admin"`
+			IsSuperAdmin bool   `json:"is_super_admin"`
+		}
+
+		type GroupInfoResponse struct {
+			JID     string       `json:"jid"`
+			Name    string       `json:"name"`
+			Topic   string       `json:"topic"`
+			Members []MemberInfo `json:"members"`
+		}
+
+		members := make([]MemberInfo, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			members = append(members, MemberInfo{
+				JID:          p.JID.String(),
+				IsAdmin:      p.IsAdmin,
+				IsSuperAdmin: p.IsSuperAdmin,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(GroupInfoResponse{
+			JID:     info.JID.String(),
+			Name:    info.Name,
+			Topic:   info.Topic,
+			Members: members,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)

@@ -580,6 +580,14 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             conn.close()
 
 
+def get_group_info(group_jid: str) -> str:
+    """Get group info including members and admins via the WhatsApp bridge API."""
+    response = requests.get(f"{WHATSAPP_API_BASE_URL}/group-info", params={"jid": group_jid})
+    if not response.ok:
+        return f"Error fetching group info: {response.text}"
+    return response.json()
+
+
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:

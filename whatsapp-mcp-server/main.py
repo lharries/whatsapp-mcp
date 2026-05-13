@@ -5,6 +5,7 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
     get_chat as whatsapp_get_chat,
+    get_group_info as whatsapp_get_group_info,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
@@ -105,6 +106,15 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
     return chat
+
+@mcp.tool()
+def get_group_info(group_jid: str) -> Dict[str, Any]:
+    """Get WhatsApp group info including name, description, and full member list with admin status.
+
+    Args:
+        group_jid: The JID of the group (e.g. "123456789@g.us")
+    """
+    return whatsapp_get_group_info(group_jid)
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
