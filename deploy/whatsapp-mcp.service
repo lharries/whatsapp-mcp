@@ -1,0 +1,18 @@
+[Unit]
+Description=WhatsApp MCP Server
+After=network-online.target whatsapp-bridge.service
+Requires=whatsapp-bridge.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/whatsapp-mcp/whatsapp-mcp-server
+EnvironmentFile=/opt/whatsapp-mcp/.env
+ExecStart=/opt/whatsapp-mcp/whatsapp-mcp-server/.venv/bin/python main.py --http --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

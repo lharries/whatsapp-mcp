@@ -8,4 +8,6 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
 ]

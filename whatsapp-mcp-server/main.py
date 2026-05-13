@@ -247,5 +247,42 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import argparse
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.routing import Mount, Route
+
+    from auth import (
+        BearerAuthMiddleware,
+        authorize_get,
+        authorize_post,
+        health,
+        oauth_metadata,
+        protected_resource_metadata,
+        token_endpoint,
+    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run as HTTP/SSE server (default: stdio)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+    args = parser.parse_args()
+
+    if args.http:
+        app = Starlette(
+            routes=[
+                Route("/authorize", endpoint=authorize_get, methods=["GET"]),
+                Route("/authorize", endpoint=authorize_post, methods=["POST"]),
+                Route("/oauth/token", endpoint=token_endpoint, methods=["POST"]),
+                Route("/.well-known/oauth-authorization-server", endpoint=oauth_metadata),
+                Route("/.well-known/openid-configuration", endpoint=oauth_metadata),
+                Route("/.well-known/oauth-protected-resource", endpoint=protected_resource_metadata),
+                Route("/health", endpoint=health),
+                Mount("/", app=mcp.sse_app()),
+            ],
+            middleware=[Middleware(BearerAuthMiddleware)],
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        mcp.run(transport='stdio')

@@ -1,0 +1,17 @@
+[Unit]
+Description=WhatsApp Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/whatsapp-mcp/whatsapp-bridge
+ExecStart=/opt/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
