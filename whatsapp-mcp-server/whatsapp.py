@@ -482,9 +482,12 @@ def get_contact_groups(jid: str) -> List[dict]:
     if not sender_variants:
         return []
 
+    phone = sender_variants[0]  # always the phone number
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         placeholders = ",".join("?" * len(sender_variants))
+        # Match exact sender (phone or LID) OR old-format group sender (phone-timestamp)
         rows = conn.execute(f"""
             SELECT DISTINCT
                 c.jid,
@@ -493,10 +496,10 @@ def get_contact_groups(jid: str) -> List[dict]:
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
             WHERE c.jid LIKE '%@g.us'
-              AND m.sender IN ({placeholders})
+              AND (m.sender IN ({placeholders}) OR m.sender LIKE ?)
             GROUP BY c.jid, c.name
             ORDER BY last_active DESC
-        """, sender_variants).fetchall()
+        """, sender_variants + [f"{phone}-%"]).fetchall()
         conn.close()
         return [{"jid": r[0], "name": r[1], "last_message": r[2]} for r in rows]
     except sqlite3.Error as e:
