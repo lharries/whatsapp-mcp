@@ -461,6 +461,48 @@ def search_contacts(query: str) -> List[Contact]:
             conn.close()
 
 
+def get_contact_groups(jid: str) -> List[dict]:
+    """Find groups the contact has sent messages in, using message history."""
+    # Resolve sender identifiers: phone JID and LID variant
+    sender_variants = []
+    if jid.endswith("@s.whatsapp.net"):
+        phone = jid.split("@")[0]
+        sender_variants.append(phone)
+        try:
+            dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+            lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+            dev_conn.close()
+            if lid_row:
+                sender_variants.append(str(lid_row[0]))
+        except sqlite3.Error:
+            pass
+    else:
+        sender_variants.append(jid.split("@")[0])
+
+    if not sender_variants:
+        return []
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        placeholders = ",".join("?" * len(sender_variants))
+        rows = conn.execute(f"""
+            SELECT DISTINCT
+                c.jid,
+                c.name,
+                MAX(m.timestamp) as last_active
+            FROM chats c
+            JOIN messages m ON c.jid = m.chat_jid
+            WHERE c.jid LIKE '%@g.us'
+              AND m.sender IN ({placeholders})
+            GROUP BY c.jid, c.name
+            ORDER BY last_active DESC
+        """, sender_variants).fetchall()
+        conn.close()
+        return [{"jid": r[0], "name": r[1], "last_message": r[2]} for r in rows]
+    except sqlite3.Error as e:
+        return [{"error": str(e)}]
+
+
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
     

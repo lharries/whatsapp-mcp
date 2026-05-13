@@ -8,6 +8,7 @@ from whatsapp import (
     get_group_info as whatsapp_get_group_info,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
+    get_contact_groups as whatsapp_get_contact_groups,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
@@ -137,6 +138,15 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
     return chats
+
+@mcp.tool()
+def get_contact_groups(jid: str) -> List[Dict[str, Any]]:
+    """Get all WhatsApp groups a contact has sent messages in, based on message history.
+
+    Args:
+        jid: The contact's JID (e.g. "447837537557@s.whatsapp.net")
+    """
+    return whatsapp_get_contact_groups(jid)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
