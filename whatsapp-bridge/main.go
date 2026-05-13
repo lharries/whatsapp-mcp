@@ -1146,7 +1146,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						sender = strings.Split(*msg.Message.Key.Participant, "@")[0]
+					} else if !isFromMe && msg.Message.GetParticipant() != "" {
+						// Top-level participant field — present in old-format groups
+						sender = strings.Split(msg.Message.GetParticipant(), "@")[0]
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
