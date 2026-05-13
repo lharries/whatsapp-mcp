@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+DEVICE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8081/api"
 
 @dataclass
@@ -580,12 +581,43 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             conn.close()
 
 
-def get_group_info(group_jid: str) -> str:
+def get_group_info(group_jid: str) -> dict:
     """Get group info including members and admins via the WhatsApp bridge API."""
     response = requests.get(f"{WHATSAPP_API_BASE_URL}/group-info", params={"jid": group_jid})
     if not response.ok:
-        return f"Error fetching group info: {response.text}"
-    return response.json()
+        return {"error": f"Error fetching group info: {response.text}"}
+
+    data = response.json()
+
+    # Build LID -> phone -> name resolution map from the device store
+    lid_to_info = {}
+    try:
+        conn = sqlite3.connect(DEVICE_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT m.lid, m.pn, c.full_name, c.push_name
+            FROM whatsmeow_lid_map m
+            LEFT JOIN whatsmeow_contacts c ON c.their_jid = m.pn || '@s.whatsapp.net'
+        """)
+        for lid, pn, full_name, push_name in cursor.fetchall():
+            lid_to_info[str(lid)] = {
+                "phone": pn,
+                "name": full_name or push_name or None,
+            }
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+    # Annotate each member with resolved phone/name
+    for member in data.get("members", []):
+        raw_jid = member.get("jid", "")
+        lid = raw_jid.split("@")[0]
+        info = lid_to_info.get(lid)
+        if info:
+            member["phone"] = info["phone"]
+            member["name"] = info["name"]
+
+    return data
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
