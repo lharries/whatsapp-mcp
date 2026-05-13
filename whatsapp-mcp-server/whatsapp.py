@@ -169,8 +169,21 @@ def list_messages(
             params.append(sender_phone_number)
             
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            jid_variants = [chat_jid]
+            # If this is a phone JID, also query the LID variant (WhatsApp migrates direct chats to LIDs)
+            if chat_jid.endswith("@s.whatsapp.net"):
+                phone = chat_jid.split("@")[0]
+                try:
+                    dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                    lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+                    dev_conn.close()
+                    if lid_row:
+                        jid_variants.append(f"{lid_row[0]}@lid")
+                except sqlite3.Error:
+                    pass
+            placeholders = ",".join("?" * len(jid_variants))
+            where_clauses.append(f"messages.chat_jid IN ({placeholders})")
+            params.extend(jid_variants)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
