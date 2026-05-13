@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import html as html_module
+import json
 import os
 import secrets
 import time
@@ -13,9 +14,49 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 CLIENT_ID: str = os.environ.get("MCP_CLIENT_ID", "claude")
 CLIENT_SECRET: str = os.environ.get("MCP_CLIENT_SECRET", "")
 TOKEN_TTL: int = int(os.environ.get("MCP_TOKEN_TTL", "3600"))
+_TOKEN_FILE: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tokens.json")
 
-_token_store: dict[str, float] = {}
 _auth_codes: dict[str, dict] = {}
+
+
+def _load_tokens() -> dict[str, float]:
+    try:
+        with open(_TOKEN_FILE) as f:
+            raw = json.load(f)
+        now = time.time()
+        return {t: exp for t, exp in raw.items() if exp > now}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_tokens(store: dict[str, float]) -> None:
+    try:
+        with open(_TOKEN_FILE, "w") as f:
+            json.dump(store, f)
+    except OSError:
+        pass
+
+
+_token_store: dict[str, float] = _load_tokens()
+
+
+def _issue_token() -> str:
+    token = secrets.token_urlsafe(32)
+    _token_store[token] = time.time() + TOKEN_TTL
+    _save_tokens(_token_store)
+    return token
+
+
+def _validate_token(token: str) -> bool:
+    expiry = _token_store.get(token)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        _token_store.pop(token, None)
+        _save_tokens(_token_store)
+        return False
+    return True
+
 
 EXEMPT_PATHS = frozenset([
     "/authorize",
@@ -25,22 +66,6 @@ EXEMPT_PATHS = frozenset([
     "/.well-known/openid-configuration",
     "/health",
 ])
-
-
-def _issue_token() -> str:
-    token = secrets.token_urlsafe(32)
-    _token_store[token] = time.monotonic() + TOKEN_TTL
-    return token
-
-
-def _validate_token(token: str) -> bool:
-    expiry = _token_store.get(token)
-    if expiry is None:
-        return False
-    if time.monotonic() > expiry:
-        _token_store.pop(token, None)
-        return False
-    return True
 
 
 async def authorize_get(request: Request) -> Response:
@@ -101,7 +126,7 @@ async def authorize_post(request: Request) -> Response:
     _auth_codes[code] = {
         "code_challenge": code_challenge,
         "redirect_uri": redirect_uri,
-        "expires_at": time.monotonic() + 300,
+        "expires_at": time.time() + 300,
     }
 
     sep = "&" if "?" in redirect_uri else "?"
@@ -124,7 +149,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
         code_data = _auth_codes.pop(code, None)
         if not code_data:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        if time.monotonic() > code_data["expires_at"]:
+        if time.time() > code_data["expires_at"]:
             return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
         if redirect_uri != code_data["redirect_uri"]:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
