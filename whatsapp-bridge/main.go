@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -924,12 +925,40 @@ func main() {
 			return
 		}
 
+		// Serve QR code as a scannable HTML page on port 8082
+		var latestQR string
+		var qrMu sync.Mutex
+		qrServer := &http.Server{Addr: ":8082"}
+		http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
+			qrMu.Lock()
+			code := latestQR
+			qrMu.Unlock()
+			if code == "" {
+				http.Error(w, "QR not ready yet, refresh in a moment", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, `<!DOCTYPE html><html><head><title>WhatsApp QR</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js"></script>
+<style>body{display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#111;}
+#qr{background:#fff;padding:20px;border-radius:8px;}</style></head>
+<body><div id="qr"></div>
+<script>new QRCode(document.getElementById("qr"),{text:%q,width:300,height:300});</script>
+</body></html>`, code)
+		})
+		go func() { qrServer.ListenAndServe() }()
+		fmt.Println("QR code available at http://localhost:8082/qr (or via the server's public URL)")
+
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				qrMu.Lock()
+				latestQR = evt.Code
+				qrMu.Unlock()
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
+				qrServer.Close()
 				connected <- true
 				break
 			}
