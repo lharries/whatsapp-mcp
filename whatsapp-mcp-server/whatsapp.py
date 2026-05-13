@@ -503,8 +503,20 @@ def get_last_interaction(jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        jid_variants = [jid]
+        if jid.endswith("@s.whatsapp.net"):
+            phone = jid.split("@")[0]
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    jid_variants.append(f"{lid_row[0]}@lid")
+            except sqlite3.Error:
+                pass
+        placeholders = ",".join("?" * len(jid_variants))
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -515,10 +527,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, jid_variants + jid_variants)
         
         msg_data = cursor.fetchone()
         
