@@ -407,37 +407,52 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
+        search_pattern = '%' + query + '%'
+        seen_jids = set()
+        result = []
+
+        # Search whatsmeow_contacts (all known contacts, including those with no direct chat)
+        try:
+            dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+            rows = dev_conn.execute("""
+                SELECT their_jid, full_name, push_name
+                FROM whatsmeow_contacts
+                WHERE their_jid NOT LIKE '%@g.us'
+                  AND (LOWER(full_name) LIKE LOWER(?)
+                    OR LOWER(push_name) LIKE LOWER(?)
+                    OR LOWER(their_jid) LIKE LOWER(?))
+                ORDER BY full_name, their_jid
+                LIMIT 50
+            """, (search_pattern, search_pattern, search_pattern)).fetchall()
+            dev_conn.close()
+            for jid, full_name, push_name in rows:
+                if jid not in seen_jids:
+                    seen_jids.add(jid)
+                    result.append(Contact(
+                        phone_number=jid.split('@')[0],
+                        name=full_name or push_name,
+                        jid=jid
+                    ))
+        except sqlite3.Error:
+            pass
+
+        # Also search chats table (catches contacts whose name is only in chat history)
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            SELECT DISTINCT jid, name FROM chats
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+              AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
+        for jid, name in cursor.fetchall():
+            if jid not in seen_jids:
+                seen_jids.add(jid)
+                result.append(Contact(phone_number=jid.split('@')[0], name=name, jid=jid))
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
