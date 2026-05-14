@@ -165,8 +165,18 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+            sender_variants = [sender_phone_number]
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (sender_phone_number,)).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    sender_variants.append(str(lid_row[0]))
+            except sqlite3.Error:
+                pass
+            placeholders = ",".join("?" * len(sender_variants))
+            where_clauses.append(f"messages.sender IN ({placeholders})")
+            params.extend(sender_variants)
             
         if chat_jid:
             jid_variants = [chat_jid]
@@ -517,8 +527,32 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
+
+        # Build sender variants: phone number (from JID) + LID
+        sender_variants = []
+        jid_variants = [jid]
+        if jid.endswith("@s.whatsapp.net"):
+            phone = jid.split("@")[0]
+            sender_variants.append(phone)
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute(
+                    "SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)
+                ).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    sender_variants.append(str(lid_row[0]))
+                    jid_variants.append(f"{lid_row[0]}@lid")
+            except sqlite3.Error:
+                pass
+        else:
+            sender_variants.append(jid.split("@")[0])
+
+        sender_placeholders = ",".join("?" * len(sender_variants))
+        jid_placeholders = ",".join("?" * len(jid_variants))
+        phone_prefix = sender_variants[0] if sender_variants else ""
+
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -528,11 +562,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({sender_placeholders})
+               OR c.jid IN ({jid_placeholders})
+               OR c.jid LIKE ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
-        
+        """, sender_variants + jid_variants + [f"{phone_prefix}-%", limit, page * limit])
+
         chats = cursor.fetchall()
         
         result = []
