@@ -1,11 +1,14 @@
 [project]
 name = "whatsapp-mcp-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "WhatsApp MCP Server with multi-tenant support"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    "PyJWT>=2.8.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
 ]

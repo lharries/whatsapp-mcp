@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  django:
+    build: ./django-server
+    ports:
+      - "18080:8000"
+    volumes:
+      - shared_storage:/app/store
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - JWT_SECRET=${JWT_SECRET}
+      - SERVICE_KEY=${SERVICE_KEY}
+      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,django,bridge,mcp
+      - DJANGO_DEBUG=false
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - django-db
+
+  django-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=whatsapp
+      - POSTGRES_USER=whatsapp
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-whatsapp_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bridge:
+    build: ./whatsapp-bridge
+    ports:
+      - "18081:8080"
+    volumes:
+      - shared_storage:/app/store
+    environment:
+      - DJANGO_API_URL=http://django:8000
+      - JWT_SECRET=${JWT_SECRET}
+      - SERVICE_KEY=${SERVICE_KEY}
+      - POLL_INTERVAL=60
+      - PORT=8080
+    depends_on:
+      django:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mcp:
+    build: ./whatsapp-mcp-server
+    ports:
+      - "18082:8001"
+    volumes:
+      - shared_storage:/app/store
+    environment:
+      - DJANGO_API_URL=http://django:8000
+      - JWT_SECRET=${JWT_SECRET}
+      - SERVICE_KEY=${SERVICE_KEY}
+      - BRIDGE_API_URL=http://bridge:8080/api
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8001
+    depends_on:
+      django:
+        condition: service_healthy
+      bridge:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  shared_storage:
+  postgres_data:

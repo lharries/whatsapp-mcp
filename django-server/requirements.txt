@@ -1,0 +1,6 @@
+Django>=5.0,<6.0
+djangorestframework>=3.14,<4.0
+PyJWT>=2.8,<3.0
+requests>=2.31,<3.0
+gunicorn>=21.0,<22.0
+psycopg2-binary>=2.9,<3.0

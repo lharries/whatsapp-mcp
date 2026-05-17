@@ -1,0 +1,5 @@
+httpx>=0.28.1
+requests>=2.32.3
+PyJWT>=2.8.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
