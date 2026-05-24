@@ -6,6 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"math"
 	"math/rand"
 	"net/http"
@@ -28,6 +32,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -202,6 +208,39 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// generateImageThumbnail decodes mediaData, returns a ~72px-edge JPEG preview
+// plus the original width/height. Returns ok=false on any decode/encode error
+// so the caller can skip thumbnail fields silently.
+func generateImageThumbnail(mediaData []byte) (thumb []byte, width uint32, height uint32, ok bool) {
+	src, _, err := image.Decode(bytes.NewReader(mediaData))
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return nil, 0, 0, false
+	}
+	const maxEdge = 72
+	dstW, dstH := srcW, srcH
+	if srcW > maxEdge || srcH > maxEdge {
+		if srcW >= srcH {
+			dstW = maxEdge
+			dstH = int(math.Round(float64(srcH) * float64(maxEdge) / float64(srcW)))
+		} else {
+			dstH = maxEdge
+			dstW = int(math.Round(float64(srcW) * float64(maxEdge) / float64(srcH)))
+		}
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 50}); err != nil {
+		return nil, 0, 0, false
+	}
+	return buf.Bytes(), uint32(srcW), uint32(srcH), true
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -293,7 +332,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Create the appropriate message type based on media type
 		switch mediaType {
 		case whatsmeow.MediaImage:
-			msg.ImageMessage = &waProto.ImageMessage{
+			imgMsg := &waProto.ImageMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -303,6 +342,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
+			if thumb, w, h, ok := generateImageThumbnail(mediaData); ok {
+				imgMsg.JPEGThumbnail = thumb
+				imgMsg.Width = proto.Uint32(w)
+				imgMsg.Height = proto.Uint32(h)
+			}
+			msg.ImageMessage = imgMsg
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
 			var seconds uint32 = 30 // Default fallback
