@@ -79,7 +79,9 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    if isinstance(messages, str):
+        return [{"text": messages}]
+    return to_dict(messages)
 
 @mcp.tool()
 def list_chats(
