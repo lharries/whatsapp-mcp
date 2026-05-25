@@ -1,13 +1,13 @@
 import sqlite3
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+MESSAGES_DB_PATH = os.path.join(os.path.expanduser('~'), 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
