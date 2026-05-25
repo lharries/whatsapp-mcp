@@ -1,7 +1,9 @@
+from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
+    resolve_recipient as whatsapp_resolve_recipient,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
     get_chat as whatsapp_get_chat,
@@ -12,7 +14,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    revoke_message as whatsapp_revoke_message,
+    download_media as whatsapp_download_media,
 )
 
 # Initialize FastMCP server
@@ -21,12 +24,30 @@ mcp = FastMCP("whatsapp")
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
-    
-    Args:
-        query: Search term to match against contact names or phone numbers
+
+    Returns ranked candidates from whatsmeow's canonical address book first, then local chats.
+    Each result includes `confidence` (0-100), `in_address_book`, and `is_lid` — always check
+    these before using a result as a send target. `is_lid: true` means it's an opaque linked-ID
+    rather than a real phone JID and is the most common cause of wrong-person sends.
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return [asdict(c) for c in contacts]
+
+
+@mcp.tool()
+def resolve_recipient(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Resolve a name or phone number to ranked WhatsApp recipient candidates.
+
+    Use this BEFORE any send_message call when the user gives a name like "Soup" or "Mom"
+    rather than a JID. Inspect the top candidate's `confidence`, `in_address_book`, and
+    `is_lid` fields — confirm with the user if confidence < 80 or is_lid is true.
+
+    Args:
+        query: Name, partial name, or phone number to resolve
+        limit: Maximum number of candidates to return (default 20)
+    """
+    contacts = whatsapp_resolve_recipient(query, limit)
+    return [asdict(c) for c in contacts]
 
 @mcp.tool()
 def list_messages(
@@ -157,69 +178,81 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    confirm_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+    """Send a WhatsApp text message — TWO-PHASE: bridge always requires a confirm-token round-trip.
+
+    Phase 1 (no confirm_token): the bridge resolves the recipient and returns
+        {success: false, needs_confirmation: true, confirm_token: "<hex>", resolved: {...candidate}, other_candidates: [...]}
+      DO NOT silently retry. Show `resolved` (push_name, full_name, phone, is_lid, in_address_book,
+      confidence, last_message_at, chat_display_name) to the human; if confidence < 80 or is_lid is
+      true, also surface `other_candidates` and ask the user to pick.
+
+    Phase 2 (with confirm_token from phase 1): re-call with the SAME recipient + message AND the
+      token. Bridge dispatches and returns {success: true, message: "...", resolved: {...}}.
+
+    Tokens expire 60s after issue and are payload-bound — changing recipient/message rejects.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-    
-    Returns:
-        A dictionary containing success status and a status message
+        recipient:      Name, phone (digits-only with country code), or full JID. Names use the new
+                        resolver (whatsmeow address book + chats fallback).
+        message:        The text to send.
+        confirm_token:  Pass the token returned from phase 1 to actually send. Omit on first call.
     """
-    # Validate input
     if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+        return {"success": False, "message": "Recipient must be provided"}
+    return whatsapp_send_message(recipient, message, confirm_token)
+
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
-    Returns:
-        A dictionary containing success status and a status message
+def send_file(
+    recipient: str,
+    media_path: str,
+    confirm_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send a file (image, video, document) via WhatsApp — same two-phase confirm flow as send_message.
+
+    See send_message for the confirm-token protocol. Tokens are payload-bound, so changing
+    media_path between phase 1 and phase 2 rejects.
     """
-    
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return whatsapp_send_file(recipient, media_path, confirm_token)
+
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
-    Returns:
-        A dictionary containing success status and a status message
+def send_audio_message(
+    recipient: str,
+    media_path: str,
+    confirm_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send a WhatsApp voice/audio message — same two-phase confirm flow as send_message.
+
+    If ffmpeg isn't installed and the file isn't already .ogg, this errors before phase 1.
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return whatsapp_audio_voice_message(recipient, media_path, confirm_token)
+
+
+@mcp.tool()
+def revoke_message(
+    chat_jid: str,
+    message_id: str,
+    sender_jid: str = "",
+) -> Dict[str, Any]:
+    """Revoke ("delete for everyone") a WhatsApp message you previously sent.
+
+    Recipients see "this message was deleted". The row is also dropped from the local
+    bridge DB so list_messages reflects it immediately. WhatsApp only allows revoking
+    your own messages (or others' messages if you're a group admin), and the server
+    enforces a ~2-day age limit.
+
+    Args:
+        chat_jid:   The chat the message lives in. From list_messages.chat_jid (e.g.
+                    "1234567890@s.whatsapp.net" for a 1-on-1, "...@g.us" for a group).
+        message_id: The ID of the message to revoke. From list_messages.id.
+        sender_jid: Original sender JID. Leave empty (default) to revoke your own message;
+                    only set when revoking someone else's message in a group you admin.
+    """
+    return whatsapp_revoke_message(chat_jid, message_id, sender_jid)
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

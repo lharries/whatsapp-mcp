@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
@@ -40,6 +40,18 @@ class Contact:
     phone_number: str
     name: Optional[str]
     jid: str
+    # Extended metadata returned by /api/resolve-recipient (bridge side).
+    # All optional so legacy callers that just check name/jid still work.
+    push_name: Optional[str] = None
+    full_name: Optional[str] = None
+    business_name: Optional[str] = None
+    is_lid: bool = False
+    is_group: bool = False
+    in_address_book: bool = False
+    has_chat_history: bool = False
+    last_message_at: Optional[str] = None
+    chat_display_name: Optional[str] = None
+    confidence: int = 0
 
 @dataclass
 class MessageContext:
@@ -390,46 +402,66 @@ def list_chats(
             conn.close()
 
 
-def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+def resolve_recipient(query: str, limit: int = 20) -> List[Contact]:
+    """Rank possible WhatsApp recipients for a free-text query (name, partial name, or phone number).
+
+    Calls the bridge's /api/resolve-recipient endpoint which checks whatsmeow's canonical
+    address book FIRST, then the local chats table. Returns Contact objects sorted by
+    confidence descending. Each Contact has `is_lid`, `in_address_book`, and `confidence`
+    fields you should inspect BEFORE sending — never trust a low-confidence or @lid match
+    without explicit user verification.
+    """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
+        url = f"{WHATSAPP_API_BASE_URL}/resolve-recipient"
+        payload = {"query": query, "limit": limit}
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"resolve_recipient HTTP {response.status_code}: {response.text}")
+            return []
+        body = response.json()
+        candidates = body.get("candidates") or []
         result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
+        for c in candidates:
+            jid = c.get("jid", "")
+            phone = c.get("phone") or (jid.split("@")[0] if "@" in jid else "")
+            display_name = (
+                c.get("full_name")
+                or c.get("push_name")
+                or c.get("business_name")
+                or c.get("chat_display_name")
             )
-            result.append(contact)
-            
+            result.append(Contact(
+                phone_number=phone,
+                name=display_name,
+                jid=jid,
+                push_name=c.get("push_name"),
+                full_name=c.get("full_name"),
+                business_name=c.get("business_name"),
+                is_lid=bool(c.get("is_lid")),
+                is_group=bool(c.get("is_group")),
+                in_address_book=bool(c.get("in_address_book")),
+                has_chat_history=bool(c.get("has_chat_history")),
+                last_message_at=c.get("last_message_at"),
+                chat_display_name=c.get("chat_display_name"),
+                confidence=int(c.get("confidence") or 0),
+            ))
         return result
-        
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
+    except requests.RequestException as e:
+        print(f"resolve_recipient request error: {e}")
         return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    except Exception as e:
+        print(f"resolve_recipient unexpected error: {e}")
+        return []
+
+
+def search_contacts(query: str) -> List[Contact]:
+    """Search WhatsApp contacts by name or phone number.
+
+    Back-compat wrapper around resolve_recipient. Returns the same Contact dataclass but
+    now sourced from the canonical address book (whatsmeow contacts store), not just LIKE-matched
+    against stale chat names. Results are sorted highest-confidence first.
+    """
+    return resolve_recipient(query, limit=50)
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
@@ -622,107 +654,130 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, confirm_token: Optional[str] = None) -> Dict[str, Any]:
+    """Send a WhatsApp text message — TWO-PHASE: bridge requires a confirm_token round-trip.
+
+    Phase 1 — call with no confirm_token. Bridge returns:
+        {success: false, needs_confirmation: true, confirm_token: "...", resolved: {...}, other_candidates: [...]}
+      Surface `resolved` to the human and let them eyeball it before calling phase 2.
+
+    Phase 2 — call again with the SAME recipient + message PLUS the confirm_token from phase 1.
+      Bridge dispatches the message and returns {success: true, message: "...", resolved: {...}}.
+
+    Tokens expire 60s after issue and are payload-bound (changing recipient/message rejects).
+    """
     try:
-        # Validate input
         if not recipient:
-            return False, "Recipient must be provided"
-        
+            return {"success": False, "message": "Recipient must be provided"}
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
+        payload: Dict[str, Any] = {
             "recipient": recipient,
             "message": message,
         }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+        if confirm_token:
+            payload["confirm_token"] = confirm_token
+        response = requests.post(url, json=payload, timeout=30)
+        # 200 = sent (phase 2 success); 202 = needs_confirmation (phase 1); other = error
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"success": False, "message": f"Non-JSON response (HTTP {response.status_code}): {response.text[:200]}"}
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
+        return {"success": False, "message": f"Request error: {str(e)}"}
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+
+def revoke_message(chat_jid: str, message_id: str, sender_jid: str = "") -> Dict[str, Any]:
+    """Revoke ("delete for everyone") a previously-sent WhatsApp message.
+
+    Calls the bridge's /api/revoke endpoint which uses whatsmeow BuildRevoke + SendMessage,
+    then deletes the row from the local messages.db so list_messages reflects the revoke.
+
+    Args:
+        chat_jid:   The chat the message lives in (e.g. "1234567890@s.whatsapp.net" or "...@g.us")
+        message_id: The ID of the message to revoke (from list_messages.id or get_message_context)
+        sender_jid: Original sender; leave empty to default to your own JID (the common case).
+
+    WhatsApp only allows revoking your OWN messages (unless you're a group admin), and there's
+    a ~2-day-old TTL on the server side. The bridge will surface server errors in `message`.
+    """
     try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        if not chat_jid or not message_id:
+            return {"success": False, "message": "chat_jid and message_id are required"}
+        url = f"{WHATSAPP_API_BASE_URL}/revoke"
         payload = {
-            "recipient": recipient,
-            "media_path": media_path
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "sender_jid": sender_jid,
         }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+        response = requests.post(url, json=payload, timeout=15)
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"success": False, "message": f"Non-JSON response (HTTP {response.status_code}): {response.text[:200]}"}
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
+        return {"success": False, "message": f"Request error: {str(e)}"}
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
 
-def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, confirm_token: Optional[str] = None) -> Dict[str, Any]:
+    """Send a file via WhatsApp — same two-phase confirm flow as send_message."""
     try:
-        # Validate input
         if not recipient:
-            return False, "Recipient must be provided"
-        
+            return {"success": False, "message": "Recipient must be provided"}
         if not media_path:
-            return False, "Media path must be provided"
-        
+            return {"success": False, "message": "Media path must be provided"}
         if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+            return {"success": False, "message": f"Media file not found: {media_path}"}
+        url = f"{WHATSAPP_API_BASE_URL}/send"
+        payload: Dict[str, Any] = {
+            "recipient": recipient,
+            "media_path": media_path,
+        }
+        if confirm_token:
+            payload["confirm_token"] = confirm_token
+        response = requests.post(url, json=payload, timeout=60)
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"success": False, "message": f"Non-JSON response (HTTP {response.status_code}): {response.text[:200]}"}
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
 
+
+def send_audio_message(recipient: str, media_path: str, confirm_token: Optional[str] = None) -> Dict[str, Any]:
+    """Send an audio (voice) message via WhatsApp — same two-phase confirm flow."""
+    try:
+        if not recipient:
+            return {"success": False, "message": "Recipient must be provided"}
+        if not media_path:
+            return {"success": False, "message": "Media path must be provided"}
+        if not os.path.isfile(media_path):
+            return {"success": False, "message": f"Media file not found: {media_path}"}
         if not media_path.endswith(".ogg"):
             try:
                 media_path = audio.convert_to_opus_ogg_temp(media_path)
             except Exception as e:
-                return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
+                return {"success": False, "message": f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"}
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
+        payload: Dict[str, Any] = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
         }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+        if confirm_token:
+            payload["confirm_token"] = confirm_token
+        response = requests.post(url, json=payload, timeout=60)
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"success": False, "message": f"Non-JSON response (HTTP {response.status_code}): {response.text[:200]}"}
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
+        return {"success": False, "message": f"Request error: {str(e)}"}
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.

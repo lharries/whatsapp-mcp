@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -191,15 +195,113 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success            bool                 `json:"success"`
+	Message            string               `json:"message"`
+	NeedsConfirmation  bool                 `json:"needs_confirmation,omitempty"`
+	ConfirmToken       string               `json:"confirm_token,omitempty"`
+	Resolved           *ResolvedCandidate   `json:"resolved,omitempty"`
+	OtherCandidates    []ResolvedCandidate  `json:"other_candidates,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient    string `json:"recipient"`
+	Message      string `json:"message"`
+	MediaPath    string `json:"media_path,omitempty"`
+	ConfirmToken string `json:"confirm_token,omitempty"`
+}
+
+// RevokeMessageRequest represents the request body for revoking ("delete for everyone") a message
+type RevokeMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	SenderJID string `json:"sender_jid,omitempty"` // empty = self
+}
+
+// ResolveRecipientRequest is the request body for /api/resolve-recipient
+type ResolveRecipientRequest struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+// ResolveRecipientResponse is the response body for /api/resolve-recipient
+type ResolveRecipientResponse struct {
+	Success    bool                 `json:"success"`
+	Message    string               `json:"message"`
+	Candidates []ResolvedCandidate  `json:"candidates"`
+}
+
+// ResolvedCandidate is a single ranked match for a name/phone query
+type ResolvedCandidate struct {
+	JID             string `json:"jid"`
+	PushName        string `json:"push_name,omitempty"`
+	FullName        string `json:"full_name,omitempty"`
+	BusinessName    string `json:"business_name,omitempty"`
+	Phone           string `json:"phone,omitempty"`
+	IsLid           bool   `json:"is_lid"`
+	IsGroup         bool   `json:"is_group"`
+	InAddressBook   bool   `json:"in_address_book"`
+	HasChatHistory  bool   `json:"has_chat_history"`
+	LastMessageAt   string `json:"last_message_at,omitempty"`
+	ChatDisplayName string `json:"chat_display_name,omitempty"`
+	Confidence      int    `json:"confidence"` // 0..100; 100 = perfect addr-book + phone match
+}
+
+// pendingSend holds an unconfirmed send waiting for a confirm-token callback
+type pendingSend struct {
+	Recipient string
+	Message   string
+	MediaPath string
+	Resolved  ResolvedCandidate
+	ExpiresAt time.Time
+}
+
+var (
+	pendingSendsMu sync.Mutex
+	pendingSends   = map[string]*pendingSend{}
+)
+
+// generateConfirmToken returns a random 16-byte hex string suitable for one-shot confirmations
+func generateConfirmToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// storePendingSend records a pending send and returns its token; tokens expire in 60 seconds
+func storePendingSend(p *pendingSend) (string, error) {
+	token, err := generateConfirmToken()
+	if err != nil {
+		return "", err
+	}
+	p.ExpiresAt = time.Now().Add(60 * time.Second)
+	pendingSendsMu.Lock()
+	defer pendingSendsMu.Unlock()
+	// Opportunistic cleanup of expired tokens (cheap when map is small)
+	for k, v := range pendingSends {
+		if time.Now().After(v.ExpiresAt) {
+			delete(pendingSends, k)
+		}
+	}
+	pendingSends[token] = p
+	return token, nil
+}
+
+// popPendingSend retrieves AND removes a pending send by token. Returns nil if missing or expired.
+func popPendingSend(token string) *pendingSend {
+	pendingSendsMu.Lock()
+	defer pendingSendsMu.Unlock()
+	p, ok := pendingSends[token]
+	if !ok {
+		return nil
+	}
+	delete(pendingSends, token)
+	if time.Now().After(p.ExpiresAt) {
+		return nil
+	}
+	return p
 }
 
 // Function to send a WhatsApp message
@@ -675,51 +777,280 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// resolveRecipient ranks possible recipients for a free-text query (name, partial name, or phone).
+// Pulls from whatsmeow's canonical contacts store first, then falls back to the local `chats` table.
+// Confidence scoring favours: address-book matches > exact phone matches > active @s.whatsapp.net chats > stale @lid chats.
+func resolveRecipient(client *whatsmeow.Client, messageStore *MessageStore, query string, limit int) []ResolvedCandidate {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return nil
+	}
+	qLower := strings.ToLower(q)
+	// Strip non-digits for phone matching
+	qDigits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, q)
+
+	seen := map[string]*ResolvedCandidate{}
+
+	// --- Pass 1: whatsmeow's canonical address book ---
+	if client != nil && client.Store != nil && client.Store.Contacts != nil {
+		contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+		if err == nil {
+			for jid, info := range contacts {
+				jidStr := jid.String()
+				phone := jid.User
+				isLid := jid.Server == "lid"
+				// Skip groups in resolve-recipient (groups are usually addressed by JID directly)
+				if jid.Server == "g.us" {
+					continue
+				}
+				// Check if this contact matches the query
+				nameMatches := false
+				for _, n := range []string{info.FullName, info.PushName, info.BusinessName, info.FirstName} {
+					if n != "" && strings.Contains(strings.ToLower(n), qLower) {
+						nameMatches = true
+						break
+					}
+				}
+				phoneMatches := qDigits != "" && strings.Contains(phone, qDigits)
+				if !nameMatches && !phoneMatches {
+					continue
+				}
+				cand := &ResolvedCandidate{
+					JID:           jidStr,
+					PushName:      info.PushName,
+					FullName:      info.FullName,
+					BusinessName:  info.BusinessName,
+					Phone:         phone,
+					IsLid:         isLid,
+					InAddressBook: true,
+				}
+				// Confidence scoring
+				cand.Confidence = 60 // base for address-book hit
+				if phoneMatches {
+					cand.Confidence += 30
+				}
+				// Exact (case-insensitive) name match is strongest signal
+				for _, n := range []string{info.FullName, info.PushName, info.BusinessName, info.FirstName} {
+					if n != "" && strings.EqualFold(n, q) {
+						cand.Confidence += 10
+						break
+					}
+				}
+				if isLid {
+					cand.Confidence -= 25 // LIDs are suspicious; prefer real phone JIDs
+				}
+				if cand.Confidence > 100 {
+					cand.Confidence = 100
+				}
+				seen[jidStr] = cand
+			}
+		}
+	}
+
+	// --- Pass 2: local chats table (fallback / enriches with chat metadata) ---
+	if messageStore != nil && messageStore.db != nil {
+		searchPattern := "%" + q + "%"
+		rows, err := messageStore.db.Query(`
+			SELECT jid, name, last_message_time
+			FROM chats
+			WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+			  AND jid NOT LIKE '%@g.us'
+			ORDER BY last_message_time DESC
+			LIMIT 200
+		`, searchPattern, searchPattern)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var jidStr, name string
+				var lastTime sql.NullTime
+				if err := rows.Scan(&jidStr, &name, &lastTime); err != nil {
+					continue
+				}
+				phone := jidStr
+				if at := strings.Index(jidStr, "@"); at >= 0 {
+					phone = jidStr[:at]
+				}
+				isLid := strings.HasSuffix(jidStr, "@lid")
+				if existing, ok := seen[jidStr]; ok {
+					// Enrich existing address-book candidate with chat metadata
+					existing.HasChatHistory = true
+					existing.ChatDisplayName = name
+					if lastTime.Valid {
+						existing.LastMessageAt = lastTime.Time.Format(time.RFC3339)
+					}
+					continue
+				}
+				// New candidate — only from chats, NOT in address book = lower confidence
+				cand := &ResolvedCandidate{
+					JID:             jidStr,
+					ChatDisplayName: name,
+					Phone:           phone,
+					IsLid:           isLid,
+					InAddressBook:   false,
+					HasChatHistory:  true,
+					Confidence:      30, // base for chat-only hit
+				}
+				if lastTime.Valid {
+					cand.LastMessageAt = lastTime.Time.Format(time.RFC3339)
+				}
+				if isLid {
+					cand.Confidence -= 20 // chat-only @lid is the highest-risk class
+				}
+				seen[jidStr] = cand
+			}
+		}
+	}
+
+	// --- Pass 3: if query looks like a phone number with no hits, allow direct JID candidate ---
+	if len(seen) == 0 && qDigits != "" && len(qDigits) >= 7 {
+		jidStr := qDigits + "@s.whatsapp.net"
+		seen[jidStr] = &ResolvedCandidate{
+			JID:        jidStr,
+			Phone:      qDigits,
+			IsLid:      false,
+			Confidence: 40, // raw phone, unverified
+		}
+	}
+
+	// Collect + sort by confidence desc
+	out := make([]ResolvedCandidate, 0, len(seen))
+	for _, c := range seen {
+		out = append(out, *c)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Confidence > out[j].Confidence
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
+	// Handler for sending messages — two-phase with confirm-token gate.
+	// Phase 1 (no confirm_token): resolves the recipient, stores a pending send, returns needs_confirmation + token.
+	// Phase 2 (with confirm_token): retrieves the matching pending send, dispatches it, clears the token.
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse the request body
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
 
-		// Validate request
+		w.Header().Set("Content-Type", "application/json")
+
+		// --- Phase 2: confirmation callback ---
+		if req.ConfirmToken != "" {
+			pending := popPendingSend(req.ConfirmToken)
+			if pending == nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: "confirm_token invalid or expired (60s TTL). Call /api/send without a token to get a fresh one.",
+				})
+				return
+			}
+			// Reject mismatched payloads — token is one-shot AND payload-bound
+			if pending.Recipient != req.Recipient || pending.Message != req.Message || pending.MediaPath != req.MediaPath {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: "confirm_token does not match supplied payload (recipient/message/media_path changed since token was issued)",
+				})
+				return
+			}
+			fmt.Println("Confirmed send to", pending.Resolved.JID, "msg:", pending.Message)
+			success, message := sendWhatsAppMessage(client, pending.Recipient, pending.Message, pending.MediaPath)
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success:  success,
+				Message:  message,
+				Resolved: &pending.Resolved,
+			})
+			return
+		}
+
+		// --- Phase 1: resolve recipient + issue token ---
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
 			return
 		}
-
 		if req.Message == "" && req.MediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
+		// Resolve. If caller passed a raw JID, treat it as a self-resolved candidate so we still token-gate.
+		var resolved ResolvedCandidate
+		var others []ResolvedCandidate
+		if strings.Contains(req.Recipient, "@") {
+			resolved = ResolvedCandidate{
+				JID:           req.Recipient,
+				IsLid:         strings.HasSuffix(req.Recipient, "@lid"),
+				IsGroup:       strings.HasSuffix(req.Recipient, "@g.us"),
+				InAddressBook: false,
+				Confidence:    50, // explicit JID, no verification
+			}
+			if at := strings.Index(req.Recipient, "@"); at >= 0 {
+				resolved.Phone = req.Recipient[:at]
+			}
+		} else {
+			candidates := resolveRecipient(client, messageStore, req.Recipient, 5)
+			if len(candidates) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("no recipient candidates found for query %q. Call /api/resolve-recipient first or pass an explicit JID.", req.Recipient),
+				})
+				return
+			}
+			resolved = candidates[0]
+			if len(candidates) > 1 {
+				others = candidates[1:]
+			}
 		}
 
-		// Send response
+		// Persist pending send keyed by resolved JID so confirmation hits the SAME jid we showed the caller
+		pending := &pendingSend{
+			Recipient: resolved.JID,
+			Message:   req.Message,
+			MediaPath: req.MediaPath,
+			Resolved:  resolved,
+		}
+		token, err := storePendingSend(pending)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("failed to issue confirm token: %v", err),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:           false,
+			Message:           "confirmation required — re-send the SAME recipient/message/media_path with confirm_token within 60s",
+			NeedsConfirmation: true,
+			ConfirmToken:      token,
+			Resolved:          &resolved,
+			OtherCandidates:   others,
 		})
 	})
 
@@ -771,6 +1102,116 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	// Handler for revoking ("delete for everyone") a message.
+	// Uses whatsmeow's client.BuildRevoke + client.SendMessage. Also drops the row from the local messages.db
+	// so list_messages reflects the revoke immediately.
+	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RevokeMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if req.ChatJID == "" || req.MessageID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "chat_jid and message_id are required",
+			})
+			return
+		}
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Not connected to WhatsApp",
+			})
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("invalid chat_jid: %v", err),
+			})
+			return
+		}
+		var senderJID types.JID
+		if req.SenderJID != "" {
+			senderJID, err = types.ParseJID(req.SenderJID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("invalid sender_jid: %v", err),
+				})
+				return
+			}
+		} else if client.Store.ID != nil {
+			// Default to our own JID — revoking our own messages
+			senderJID = *client.Store.ID
+		}
+
+		revoke := client.BuildRevoke(chatJID, senderJID, types.MessageID(req.MessageID))
+		_, err = client.SendMessage(context.Background(), chatJID, revoke)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("revoke send failed: %v", err),
+			})
+			return
+		}
+
+		// Drop from local DB so list_messages reflects the revoke
+		if _, dbErr := messageStore.db.Exec(
+			`DELETE FROM messages WHERE id = ? AND chat_jid = ?`,
+			req.MessageID, req.ChatJID,
+		); dbErr != nil {
+			// Log but don't fail the request — remote revoke already succeeded
+			fmt.Printf("warning: local DB delete after revoke failed: %v\n", dbErr)
+		}
+
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Message %s revoked in chat %s", req.MessageID, req.ChatJID),
+		})
+	})
+
+	// Handler for resolving a free-text query (name/phone) to ranked recipient candidates.
+	// This is the safe alternative to the old LIKE-on-chats search_contacts.
+	http.HandleFunc("/api/resolve-recipient", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ResolveRecipientRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.TrimSpace(req.Query) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ResolveRecipientResponse{
+				Success: false,
+				Message: "query is required",
+			})
+			return
+		}
+		candidates := resolveRecipient(client, messageStore, req.Query, req.Limit)
+		json.NewEncoder(w).Encode(ResolveRecipientResponse{
+			Success:    true,
+			Message:    fmt.Sprintf("%d candidate(s) for %q", len(candidates), req.Query),
+			Candidates: candidates,
 		})
 	})
 
@@ -1306,7 +1747,7 @@ func placeholderWaveform(duration uint32) []byte {
 	waveform := make([]byte, waveformLength)
 
 	// Seed the random number generator for consistent results with the same duration
-	rand.Seed(int64(duration))
+	mathrand.Seed(int64(duration))
 
 	// Create a more natural looking waveform with some patterns and variability
 	// rather than completely random values
@@ -1325,7 +1766,7 @@ func placeholderWaveform(duration uint32) []byte {
 		val += (baseAmplitude / 2) * math.Sin(pos*math.Pi*frequencyFactor*16)
 
 		// Add some randomness to make it look more natural
-		val += (rand.Float64() - 0.5) * 15
+		val += (mathrand.Float64() - 0.5) * 15
 
 		// Add some fade-in and fade-out effects
 		fadeInOut := math.Sin(pos * math.Pi)
