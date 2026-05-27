@@ -1,3 +1,11 @@
+## ⚠️ This is a maintained fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp)
+
+### Changes from original:
+- Updated `go.mau.fi/whatsmeow` to latest version to fix the **405 client outdated** error
+- Added `context.Background()` to all whatsmeow API calls to fix compile errors introduced by the updated library
+
+The original repo is currently unmaintained and broken. Use this fork instead.
+
 # WhatsApp MCP Server
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
