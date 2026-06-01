@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -85,6 +87,16 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS poll_votes (
+			poll_message_id TEXT,
+			chat_jid        TEXT,
+			voter           TEXT,
+			option_hashes   TEXT,
+			timestamp       TIMESTAMP,
+			PRIMARY KEY (poll_message_id, chat_jid, voter),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -151,6 +163,46 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	return messages, nil
 }
 
+// Store a poll vote (upserts — last vote wins per voter)
+func (store *MessageStore) StorePollVote(pollMsgID, chatJID, voter string, optionHashes []string, ts time.Time) error {
+	hashesJSON, err := json.Marshal(optionHashes)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec(
+		`INSERT OR REPLACE INTO poll_votes (poll_message_id, chat_jid, voter, option_hashes, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		pollMsgID, chatJID, voter, string(hashesJSON), ts,
+	)
+	return err
+}
+
+// Get all votes for a poll, returns map[voter] -> []optionHash
+func (store *MessageStore) GetPollVotes(pollMsgID, chatJID string) (map[string][]string, error) {
+	rows, err := store.db.Query(
+		"SELECT voter, option_hashes FROM poll_votes WHERE poll_message_id = ? AND chat_jid = ?",
+		pollMsgID, chatJID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string][]string)
+	for rows.Next() {
+		var voter, hashesJSON string
+		if err := rows.Scan(&voter, &hashesJSON); err != nil {
+			return nil, err
+		}
+		var hashes []string
+		if err := json.Unmarshal([]byte(hashesJSON), &hashes); err != nil {
+			return nil, err
+		}
+		result[voter] = hashes
+	}
+	return result, nil
+}
+
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
@@ -179,15 +231,43 @@ func extractTextContent(msg *waProto.Message) string {
 		return ""
 	}
 
-	// Try to get text content
 	if text := msg.GetConversation(); text != "" {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Poll creation messages (all versions)
+	if poll := msg.GetPollCreationMessage(); poll != nil {
+		return formatPollContent(poll)
+	}
+	if poll := msg.GetPollCreationMessageV2(); poll != nil {
+		return formatPollContent(poll)
+	}
+	if poll := msg.GetPollCreationMessageV3(); poll != nil {
+		return formatPollContent(poll)
+	}
+	if poll := msg.GetPollCreationMessageV5(); poll != nil {
+		return formatPollContent(poll)
+	}
+	if poll := msg.GetPollCreationMessageV6(); poll != nil {
+		return formatPollContent(poll)
+	}
+
 	return ""
+}
+
+func formatPollContent(poll *waProto.PollCreationMessage) string {
+	var sb strings.Builder
+	sb.WriteString("[Poll] ")
+	sb.WriteString(poll.GetName())
+	for i, opt := range poll.GetOptions() {
+		sb.WriteString(fmt.Sprintf("\n  %d. %s", i+1, opt.GetOptionName()))
+	}
+	if max := poll.GetSelectableOptionsCount(); max > 0 {
+		sb.WriteString(fmt.Sprintf("\n(Select up to %d)", max))
+	}
+	return sb.String()
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -424,11 +504,34 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Handle poll votes (encrypted; decrypt and store separately)
+	if msg.Message != nil && msg.Message.GetPollUpdateMessage() != nil {
+		pollVote, err := client.DecryptPollVote(context.Background(), msg)
+		if err == nil {
+			hashes := make([]string, len(pollVote.GetSelectedOptions()))
+			for i, h := range pollVote.GetSelectedOptions() {
+				hashes[i] = hex.EncodeToString(h)
+			}
+			pollMsgID := msg.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID()
+			if storeErr := messageStore.StorePollVote(pollMsgID, chatJID, sender, hashes, msg.Info.Timestamp); storeErr != nil {
+				logger.Warnf("Failed to store poll vote: %v", storeErr)
+			}
+		} else {
+			logger.Warnf("Failed to decrypt poll vote: %v", err)
+		}
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// Tag poll creation messages
+	if mediaType == "" && strings.HasPrefix(content, "[Poll]") {
+		mediaType = "poll"
+	}
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -833,6 +936,87 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting poll results
+	http.HandleFunc("/api/poll-results", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		messageID := r.URL.Query().Get("message_id")
+		chatJID := r.URL.Query().Get("chat_jid")
+		if messageID == "" || chatJID == "" {
+			http.Error(w, "message_id and chat_jid are required", http.StatusBadRequest)
+			return
+		}
+
+		// Look up the poll creation message to get option names
+		var content string
+		err := messageStore.db.QueryRow(
+			"SELECT content FROM messages WHERE id = ? AND chat_jid = ? AND media_type = 'poll'",
+			messageID, chatJID,
+		).Scan(&content)
+		if err != nil {
+			http.Error(w, "Poll not found", http.StatusNotFound)
+			return
+		}
+
+		// Parse poll name and options from stored content
+		// Format: "[Poll] <name>\n  1. <opt>\n  2. <opt>\n(Select up to N)"
+		lines := strings.Split(content, "\n")
+		pollName := strings.TrimPrefix(lines[0], "[Poll] ")
+		var optionNames []string
+		for _, line := range lines[1:] {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "(Select") {
+				break
+			}
+			// Remove "N. " prefix
+			if idx := strings.Index(line, ". "); idx >= 0 {
+				optionNames = append(optionNames, line[idx+2:])
+			}
+		}
+
+		// Fetch votes
+		votes, err := messageStore.GetPollVotes(messageID, chatJID)
+		if err != nil {
+			http.Error(w, "Failed to fetch votes", http.StatusInternalServerError)
+			return
+		}
+
+		// Tally votes per option
+		type OptionResult struct {
+			Name   string   `json:"name"`
+			Votes  int      `json:"votes"`
+			Voters []string `json:"voters"`
+		}
+		optionResults := make([]OptionResult, len(optionNames))
+		for i, name := range optionNames {
+			optionResults[i] = OptionResult{Name: name, Voters: []string{}}
+		}
+		optionIndex := make(map[string]int)
+		for i, name := range optionNames {
+			sum := sha256.Sum256([]byte(name))
+			optionIndex[hex.EncodeToString(sum[:])] = i
+		}
+
+		for voter, hashes := range votes {
+			for _, h := range hashes {
+				if idx, ok := optionIndex[h]; ok {
+					optionResults[idx].Votes++
+					optionResults[idx].Voters = append(optionResults[idx].Voters, voter)
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"poll_name":    pollName,
+			"options":      optionResults,
+			"total_voters": len(votes),
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1141,14 +1325,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1157,6 +1334,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+				}
+
+				// Tag poll creation messages
+				if mediaType == "" && strings.HasPrefix(content, "[Poll]") {
+					mediaType = "poll"
 				}
 
 				// Log the message content for debugging

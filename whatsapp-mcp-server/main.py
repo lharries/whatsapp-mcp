@@ -14,7 +14,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_poll_results as whatsapp_get_poll_results
 )
 
 # Initialize FastMCP server
@@ -265,6 +266,23 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def get_poll_results(message_id: str, chat_jid: str) -> str:
+    """Get the current vote tally for a WhatsApp poll.
+
+    Use the message_id from a poll message (media_type='poll') shown by list_messages.
+    Returns the poll question, each option with a vote bar and list of voters, and total respondents.
+
+    Note: only votes received while the bridge was running are counted —
+    votes from before the bridge started cannot be decrypted.
+
+    Args:
+        message_id: The ID of the poll creation message
+        chat_jid: The JID of the chat containing the poll
+    """
+    return whatsapp_get_poll_results(message_id, chat_jid)
+
 
 if __name__ == "__main__":
     import argparse
