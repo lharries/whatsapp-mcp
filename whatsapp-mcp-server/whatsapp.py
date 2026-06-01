@@ -103,7 +103,11 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        if message.media_type == "poll":
+            # Poll content already contains "[Poll] ..." — no extra prefix needed
+            content_prefix = f"[Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        else:
+            content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
@@ -923,6 +927,50 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except json.JSONDecodeError:
         print(f"Error parsing response: {response.text}")
         return None
+
+
+def get_poll_results(message_id: str, chat_jid: str) -> str:
+    """Get the current vote tally for a poll message.
+
+    Args:
+        message_id: The ID of the poll creation message
+        chat_jid: The JID of the chat containing the poll
+
+    Returns:
+        Formatted string with poll question, options, and vote counts
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/poll-results"
+        response = requests.get(url, params={"message_id": message_id, "chat_jid": chat_jid})
+
+        if response.status_code == 404:
+            return "Poll not found. Make sure the message_id and chat_jid are correct and the poll was received while the bridge was running."
+
+        if response.status_code != 200:
+            return f"Error fetching poll results: HTTP {response.status_code} - {response.text}"
+
+        data = response.json()
+        poll_name = data.get("poll_name", "Unknown poll")
+        options = data.get("options", [])
+        total_voters = data.get("total_voters", 0)
+
+        lines = [f"Poll: {poll_name}"]
+        max_votes = max((o["votes"] for o in options), default=1) or 1
+        bar_width = 10
+        for opt in options:
+            filled = round(opt["votes"] / max_votes * bar_width)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            voters_str = ", ".join(opt["voters"]) if opt["voters"] else "no votes"
+            vote_word = "vote" if opt["votes"] == 1 else "votes"
+            lines.append(f"  {opt['name']} {bar} {opt['votes']} {vote_word} ({voters_str})")
+
+        lines.append(f"{total_voters} {'person' if total_voters == 1 else 'people'} responded.")
+        return "\n".join(lines)
+
+    except requests.RequestException as e:
+        return f"Request error: {str(e)}"
+    except (json.JSONDecodeError, KeyError) as e:
+        return f"Error parsing response: {str(e)}"
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
