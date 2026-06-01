@@ -254,6 +254,20 @@ func extractTextContent(msg *waProto.Message) string {
 		return formatPollContent(poll)
 	}
 
+	// V4 wraps an inner Message in a FutureProofMessage — unwrap and recurse
+	if v4 := msg.GetPollCreationMessageV4(); v4 != nil {
+		if inner := v4.GetMessage(); inner != nil {
+			return extractTextContent(inner)
+		}
+	}
+
+	// Also unwrap other FutureProofMessage fields that may contain polls
+	if fp := msg.GetPollCreationOptionImageMessage(); fp != nil {
+		if inner := fp.GetMessage(); inner != nil {
+			return extractTextContent(inner)
+		}
+	}
+
 	return ""
 }
 
@@ -533,8 +547,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		mediaType = "poll"
 	}
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media — log so we can diagnose missed types
 	if content == "" && mediaType == "" {
+		logger.Infof("Skipping unhandled message type from %s in %s (msg ID: %s)", sender, chatJID, msg.Info.ID)
 		return
 	}
 
