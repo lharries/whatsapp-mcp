@@ -1,0 +1,22 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            git pull origin main
+            # Restart the WhatsApp bridge — uncomment whichever applies:
+            # systemctl restart whatsapp-bridge
+            # pkill -f "go run main.go" && cd whatsapp-bridge && nohup go run main.go > ~/whatsapp-bridge.log 2>&1 &
