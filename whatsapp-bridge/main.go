@@ -184,9 +184,14 @@ func extractTextContent(msg *waProto.Message) string {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
+	} else if poll := msg.GetPollCreationMessage(); poll != nil {
+		options := make([]string, len(poll.GetOptions()))
+		for i, opt := range poll.GetOptions() {
+			options[i] = opt.GetOptionName()
+		}
+		return fmt.Sprintf("[Poll] %s | Options: %s", poll.GetName(), strings.Join(options, ", "))
 	}
 
-	// For now, we're ignoring non-text messages
 	return ""
 }
 
@@ -485,6 +490,21 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// VotePollRequest represents the request body for voting in a poll
+type VotePollRequest struct {
+	ChatJID     string   `json:"chat_jid"`
+	MessageID   string   `json:"message_id"`
+	SenderJID   string   `json:"sender_jid"`
+	OptionNames []string `json:"option_names"`
+	IsFromMe    bool     `json:"is_from_me"`
+}
+
+// VotePollResponse represents the response for the vote poll API
+type VotePollResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -773,6 +793,84 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler for voting in a poll
+	http.HandleFunc("/api/vote-poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req VotePollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" || req.MessageID == "" || req.SenderJID == "" {
+			http.Error(w, "chat_jid, message_id, and sender_jid are required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Allow sender_jid to be passed as just a phone number without server suffix
+		senderJIDStr := req.SenderJID
+		if !strings.Contains(senderJIDStr, "@") {
+			senderJIDStr = senderJIDStr + "@s.whatsapp.net"
+		}
+		senderJID, err := types.ParseJID(senderJIDStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid sender_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		isGroup := chatJID.Server == "g.us"
+
+		pollInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   senderJID,
+				IsFromMe: req.IsFromMe,
+				IsGroup:  isGroup,
+			},
+			ID: types.MessageID(req.MessageID),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		voteMsg, err := client.BuildPollVote(context.Background(), pollInfo, req.OptionNames)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(VotePollResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to build poll vote: %v", err),
+			})
+			return
+		}
+
+		_, err = client.SendMessage(context.Background(), chatJID, voteMsg)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(VotePollResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to send poll vote: %v", err),
+			})
+			return
+		}
+
+		var msg string
+		if len(req.OptionNames) == 0 {
+			msg = "Vote retracted"
+		} else {
+			msg = fmt.Sprintf("Vote sent for options: %s", strings.Join(req.OptionNames, ", "))
+		}
+		json.NewEncoder(w).Encode(VotePollResponse{Success: true, Message: msg})
 	})
 
 	// Handler for getting group info (members, admins, etc.)
