@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kodi.whatsapp-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kodikaraste/Projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kodikaraste/Projects/whatsapp-mcp/whatsapp-bridge</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Always keep the bridge running. The program returns exit 0 on startup
+         errors (DB, connect, logged-out), so an unconditional restart is the
+         safe choice; a Crashed/SuccessfulExit-only policy would leave it dead
+         on those clean-exit failures. The watchdog agent handles the orthogonal
+         "alive but wedged" case that KeepAlive cannot see. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Bound restart loops if the bridge crash-loops on startup. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/whatsapp-bridge.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/whatsapp-bridge.err</string>
+</dict>
+</plist>

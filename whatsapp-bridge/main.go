@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,6 +35,10 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// processStartTime marks when the bridge process came up; surfaced by /health
+// so the watchdog (and humans) can see real uptime, not just "port is bound".
+var processStartTime = time.Now()
 
 // Message represents a chat message for our client
 type Message struct {
@@ -1215,14 +1220,62 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
+	// Health check endpoint. This PROVES the bridge is actually serving HTTP —
+	// not merely holding the port. The watchdog launchd agent probes this; if it
+	// stops returning 200 (the "port held but socket dead" wedge), the watchdog
+	// force-restarts the process via `launchctl kickstart -k`.
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":             "ok",
+			"whatsapp_connected": client.IsConnected(),
+			"logged_in":          client.IsLoggedIn(),
+			"uptime_seconds":     int(time.Since(processStartTime).Seconds()),
+			"time":               time.Now().Format(time.RFC3339),
+		})
+	})
+
+	// Start the server with explicit timeouts so a single slow/stuck client or
+	// handler can't silently wedge the accept loop while leaving the port bound
+	// (the classic "process alive, port held, nothing answers" failure mode).
+	// SO_REUSEADDR lets a fresh instance re-bind 8080 immediately after a forced
+	// restart instead of tripping over a lingering TIME_WAIT socket.
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
-	// Run server in a goroutine so it doesn't block
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			if ctrlErr := c.Control(func(fd uintptr) {
+				sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			}); ctrlErr != nil {
+				return ctrlErr
+			}
+			return sockErr
+		},
+	}
+
+	srv := &http.Server{
+		Addr:              serverAddr,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Run server in a goroutine so it doesn't block. If the listener can't bind
+	// or Serve dies, exit non-zero rather than lingering as a half-dead zombie —
+	// launchd (KeepAlive) then restarts us cleanly.
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		ln, err := lc.Listen(context.Background(), "tcp", serverAddr)
+		if err != nil {
+			fmt.Printf("REST API server listen error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
