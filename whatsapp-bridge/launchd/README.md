@@ -6,17 +6,34 @@ answering. `launchctl`'s `KeepAlive` only restarts a service when the process
 **exits**, so a wedged-but-alive bridge sat there dead — "held the port, stopped
 answering" — until it was relaunched by hand.
 
-This directory makes it self-heal.
+This makes it self-heal, and ships as part of the app: one portable installer
+wires everything up from wherever the app was downloaded to (no hardcoded paths).
 
-## Pieces
+## Install (one command)
 
-| File | What it is |
-|------|------------|
-| `com.kodi.whatsapp-bridge.plist` | The bridge itself. `KeepAlive` + `ThrottleInterval`. |
-| `com.kodi.whatsapp-bridge-watchdog.plist` | Periodic agent (every 15s) that runs `watchdog.sh`. |
-| `../watchdog.sh` | Probes `/health`; force-restarts the bridge after 2 consecutive failures. |
+```bash
+cd whatsapp-bridge
+./install-service.sh        # builds the binary if needed, installs + loads both agents, verifies /health
+```
 
-### 1. Real health endpoint (in the bridge itself)
+Undo any time:
+
+```bash
+./uninstall-service.sh
+```
+
+`install-service.sh` derives every path from its own location and the current
+user, generates the two launchd plists into `~/Library/LaunchAgents/`, loads
+them, and waits for `/health` to go green. Re-running it is safe (idempotent).
+
+## What it installs
+
+| Agent | Role |
+|-------|------|
+| `com.kodi.whatsapp-bridge` | The bridge. `RunAtLoad` + `KeepAlive` + `ThrottleInterval`. |
+| `com.kodi.whatsapp-bridge-watchdog` | Runs `../watchdog.sh` every 15s. |
+
+### 1. Real health endpoint (in the bridge)
 
 `GET http://localhost:8080/health` → `200` with JSON:
 
@@ -26,9 +43,9 @@ This directory makes it self-heal.
 
 It runs on the same HTTP server as `/api/*`, so if the server is wedged the
 probe **hangs and times out** — which is exactly how the watchdog detects a dead
-socket. The listener also now sets `SO_REUSEADDR` and real `http.Server` timeouts
-(Read/Write/Idle), so a stuck client can't silently wedge the accept loop, and a
-fresh instance can re-bind 8080 immediately after a forced restart.
+socket. The listener also sets `SO_REUSEADDR` and real `http.Server` timeouts
+(Read/Write/Idle), so a stuck client can't wedge the accept loop, and a fresh
+instance can re-bind 8080 immediately after a forced restart.
 
 ### 2. Watchdog
 
@@ -40,39 +57,14 @@ launchctl kickstart -k gui/<uid>/com.kodi.whatsapp-bridge
 ```
 
 `-k` SIGKILLs the wedged process (**freeing the port**) and relaunches it. It
-explicitly logs the dead-socket-with-port-held case (`port-HELD-but-dead`) so the
-recurring pattern is visible in `/tmp/whatsapp-bridge-watchdog.log`.
-
-## Install / update
-
-```bash
-cd /Users/kodikaraste/Projects/whatsapp-mcp/whatsapp-bridge
-
-# 1. (re)build the bridge binary the plist points at
-go build -o whatsapp-bridge .
-
-# 2. copy the plists into place
-cp launchd/com.kodi.whatsapp-bridge.plist          ~/Library/LaunchAgents/
-cp launchd/com.kodi.whatsapp-bridge-watchdog.plist ~/Library/LaunchAgents/
-chmod +x watchdog.sh
-
-# 3. (re)load both agents
-launchctl unload ~/Library/LaunchAgents/com.kodi.whatsapp-bridge.plist 2>/dev/null
-launchctl load  ~/Library/LaunchAgents/com.kodi.whatsapp-bridge.plist
-launchctl unload ~/Library/LaunchAgents/com.kodi.whatsapp-bridge-watchdog.plist 2>/dev/null
-launchctl load  ~/Library/LaunchAgents/com.kodi.whatsapp-bridge-watchdog.plist
-```
+logs the dead-socket-with-port-held case (`port-HELD-but-dead`) to
+`/tmp/whatsapp-bridge-watchdog.log` so the recurring pattern is visible.
 
 ## Verify
 
 ```bash
-# both agents loaded (PID in col 1 for the bridge; watchdog shows '-' between ticks)
-launchctl list | grep whatsapp
-
-# health is green
+launchctl list | grep whatsapp                 # bridge has a PID; watchdog shows '-' between ticks
 curl -s http://localhost:8080/health | python3 -m json.tool
-
-# watchdog activity
 tail -f /tmp/whatsapp-bridge-watchdog.log
 ```
 
@@ -90,5 +82,14 @@ launchctl list | awk '$3=="com.kodi.whatsapp-bridge"{print "new pid",$1}'
 curl -s http://localhost:8080/health
 ```
 
-If you ever need to undo a wedge manually before the watchdog fires:
-`kill -CONT "$PID"` (resumes it) or `launchctl kickstart -k gui/$(id -u)/com.kodi.whatsapp-bridge`.
+To undo a wedge manually before the watchdog fires: `kill -CONT "$PID"`.
+
+## Note on `whatsapp_get_status` (hosted mcp-router)
+
+The hosted router's `whatsapp_get_status` tool probes `http://localhost:8080`
+from **its own** host. When the router runs remotely (e.g. Railway) that
+`localhost` is the router's container, not the machine running this bridge, so it
+reports `bridge_unreachable` even when the bridge is perfectly healthy. That is a
+router-config concern (point its `bridgeUrl` at a reachable address), independent
+of this local self-heal. Local clients (the stdio `whatsapp` MCP server, `curl`,
+`node fetch`) reach the bridge normally.
