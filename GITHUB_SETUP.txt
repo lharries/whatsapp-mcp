@@ -1,0 +1,55 @@
+============================================================
+  CONFIGURAR GITHUB PARA CONTROLE DE BUGS — CISMETRO
+============================================================
+
+PASSO 1 — Criar repositório no GitHub
+--------------------------------------
+1. Acesse https://github.com/new
+2. Preencha:
+   - Repository name: cismetro-bugs
+   - Description: Bugs detectados automaticamente no grupo Suporte Cismetro
+   - Visibility: Private (recomendado)
+3. Clique "Create repository"
+
+PASSO 2 — Gerar Token de Acesso
+---------------------------------
+1. Acesse https://github.com/settings/tokens/new
+   (Settings > Developer settings > Personal access tokens > Tokens classic)
+2. Preencha:
+   - Note: Cismetro Bugs Agent
+   - Expiration: 90 days (ou "No expiration")
+   - Scopes: marque apenas "repo" (ou "public_repo" se o repo for público)
+3. Clique "Generate token"
+4. COPIE o token (começa com ghp_...) — ele só aparece uma vez!
+
+PASSO 3 — Executar o agente
+-----------------------------
+1. Clique duplo em "Gerar Relatorio Cismetro.bat"
+2. Na primeira execução ele pedirá:
+   a) API Key Anthropic (se não estiver salva)
+   b) Seu usuário GitHub (ex: seunome)
+   c) Nome do repositório (ex: cismetro-bugs)
+   d) GitHub Token (ghp_...)
+3. Tudo fica salvo para execuções futuras.
+
+RESULTADO
+----------
+- Cada bug detectado nas mensagens → Issue aberta no GitHub
+- Labels automáticas: severidade (critical/high/medium), módulo, auto-detectado
+- Issues fechadas automaticamente quando o suporte confirma resolução
+- Visualize em: https://github.com/SEU_USUARIO/cismetro-bugs/issues
+
+DICAS DE USO DO GITHUB ISSUES
+-------------------------------
+- Filtre por label: Issues > Labels > "severity: critical"
+- Atribua responsável: clique na issue > Assignees
+- Adicione ao projeto Kanban: Issues > Projects
+- Exporte para CSV: use extensão "GitHub Issues to CSV" no Chrome
+
+ARQUIVOS GERADOS
+-----------------
+- .github_token   → Token de acesso (NÃO compartilhe)
+- .github_config  → Usuário e repositório
+- .anthropic_key  → API Key Anthropic (NÃO compartilhe)
+
+============================================================

@@ -383,19 +383,19 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + time.Now().Format("20060102_150405") + "_" + fmt.Sprintf("%x", img.GetFileSHA256()[:4]) + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + time.Now().Format("20060102_150405") + "_" + fmt.Sprintf("%x", vid.GetFileSHA256()[:4]) + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + time.Now().Format("20060102_150405") + "_" + fmt.Sprintf("%x", aud.GetFileSHA256()[:4]) + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -594,8 +594,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path using messageID to guarantee uniqueness
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		ext = ".bin"
+	}
+	localPath = fmt.Sprintf("%s/%s%s", chatDir, messageID, ext)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)

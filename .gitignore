@@ -1,3 +1,23 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Credenciais e tokens — NUNCA versionar
+.anthropic_key
+.github_token
+.github_config
+
+# Sessao WhatsApp (dados de autenticacao)
+whatsapp-bridge/store/
+store/
+
+# Binario compilado e artefatos temporarios
+whatsapp-bridge/whatsapp-bridge.exe
+whatsapp-bridge/qrcode.png
+*.exe
+__pycache__/
+*.pyc
+*.pyo
+
+# Saida de relatorios
+Relatorios_Cismetro/
