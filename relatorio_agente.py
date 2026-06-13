@@ -29,8 +29,9 @@ except ImportError:
     from openpyxl.utils import get_column_letter
 
 # ── Configurações ─────────────────────────────────────────────────────────────
-BRIDGE_EXE   = r"C:\Users\eduar\whatsapp-mcp\whatsapp-bridge\whatsapp-bridge.exe"
-BRIDGE_DIR   = r"C:\Users\eduar\whatsapp-mcp\whatsapp-bridge"
+_BASE        = Path(__file__).parent
+BRIDGE_EXE   = str(_BASE / "whatsapp-bridge" / "whatsapp-bridge.exe")
+BRIDGE_DIR   = str(_BASE / "whatsapp-bridge")
 BRIDGE_URL   = "http://localhost:8080/api"
 DB_PATH      = os.path.join(os.path.expanduser("~"), "store", "messages.db")
 OUTPUT_DIR   = os.path.join(os.path.expanduser("~"), "Relatorios_Cismetro")

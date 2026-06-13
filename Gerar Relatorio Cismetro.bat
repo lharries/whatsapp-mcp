@@ -7,14 +7,49 @@ echo   AGENTE CISMETRO - Relatorios Automaticos
 echo  ================================================
 echo.
 
+set SCRIPT_DIR=%~dp0
 set DIAS=7
 if not "%~1"=="" set DIAS=%~1
 
 echo  Periodo: ultimos %DIAS% dias
 echo.
 
+REM ── Detecta Python automaticamente ───────────────────────────────────────────
+set PYTHON=
+for %%P in (
+    "%SCRIPT_DIR%venv\Scripts\python.exe"
+    "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+    "%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+    "%USERPROFILE%\anaconda3\python.exe"
+    "%USERPROFILE%\miniconda3\python.exe"
+    "%USERPROFILE%\AppData\Local\anaconda3\python.exe"
+    "C:\Python312\python.exe"
+    "C:\Python311\python.exe"
+    "C:\Python310\python.exe"
+    "C:\anaconda3\python.exe"
+) do (
+    if exist %%P (
+        if "!PYTHON!"=="" set PYTHON=%%P
+    )
+)
+
+REM Tenta pelo PATH
+if "%PYTHON%"=="" (
+    where python >nul 2>&1
+    if not errorlevel 1 set PYTHON=python
+)
+
+if "%PYTHON%"=="" (
+    echo  [ERRO] Python nao encontrado.
+    echo  Instale em https://python.org ou rode setup_windows.bat
+    pause & exit /b 1
+)
+echo  [OK] Python: %PYTHON%
+echo.
+
 REM ── Verifica / pede API Key Anthropic ────────────────────────────────────────
-set KEY_FILE=%~dp0.anthropic_key
+set KEY_FILE=%SCRIPT_DIR%.anthropic_key
 
 if not exist "%KEY_FILE%" goto PEDIR_KEY
 set /p ANTHROPIC_API_KEY=<"%KEY_FILE%"
@@ -37,10 +72,9 @@ echo.
 :TEM_ANTHROPIC_KEY
 
 REM ── Verifica / pede Token GitHub ──────────────────────────────────────────────
-set GH_TOKEN_FILE=%~dp0.github_token
-set GH_CONFIG_FILE=%~dp0.github_config
+set GH_TOKEN_FILE=%SCRIPT_DIR%.github_token
+set GH_CONFIG_FILE=%SCRIPT_DIR%.github_config
 
-REM Le configuracoes do repositorio
 set GITHUB_OWNER=
 set GITHUB_REPO=
 if exist "%GH_CONFIG_FILE%" (
@@ -64,7 +98,7 @@ echo.
 set /p GITHUB_OWNER="  Seu usuario GitHub (ex: seunome): "
 set /p GITHUB_REPO="  Nome do repositorio (ex: cismetro-bugs): "
 if "%GITHUB_OWNER%"=="" (
-    echo  [ERRO] Usuario nao informado. GitHub desativado nesta execucao.
+    echo  [AVISO] GitHub desativado nesta execucao.
     set GITHUB_OWNER=SKIP
     goto TEM_GH_TOKEN
 )
@@ -83,21 +117,17 @@ goto TEM_GH_TOKEN
 
 :PEDIR_GH_TOKEN
 echo  ------------------------------------------------
-echo  Token GitHub necessario para criar Issues.
-echo  Acesse: https://github.com/settings/tokens/new
-echo    - Nome: Cismetro Bugs
-echo    - Permissoes: repo (somente Issues = public_repo)
-echo    - Expiracao: 90 dias ou "No expiration"
+echo  Token GitHub: https://github.com/settings/tokens/new
+echo    - Permissoes: repo (ou public_repo)
 echo  ------------------------------------------------
-echo.
 set /p GITHUB_TOKEN="  Cole seu GitHub Token (ghp_...): "
 if "%GITHUB_TOKEN%"=="" (
-    echo  [AVISO] Token nao informado. Sincronizacao GitHub sera ignorada.
+    echo  [AVISO] Token nao informado. GitHub ignorado.
     set GITHUB_TOKEN=SKIP
     goto TEM_GH_TOKEN
 )
 echo %GITHUB_TOKEN%> "%GH_TOKEN_FILE%"
-echo  [OK] Token GitHub salvo para proximas execucoes.
+echo  [OK] Token GitHub salvo.
 echo.
 
 :TEM_GH_TOKEN
@@ -105,7 +135,7 @@ echo.
 REM ── Passo 1: Relatorio de Mensagens (Excel) ───────────────────────────────────
 echo  [1/3] Gerando relatorio de mensagens (Excel)...
 echo  ------------------------------------------------
-"C:\Users\eduar\anaconda3\python.exe" "C:\Users\eduar\whatsapp-mcp\relatorio_agente.py" %DIAS%
+%PYTHON% "%SCRIPT_DIR%relatorio_agente.py" %DIAS%
 
 if errorlevel 1 (
     echo  [ERRO] Falha no relatorio Excel.
@@ -116,13 +146,11 @@ echo.
 echo  ------------------------------------------------
 echo  [2/3] Gerando relatorio executivo (Word + IA)...
 echo  ------------------------------------------------
-"C:\Users\eduar\anaconda3\python.exe" "C:\Users\eduar\whatsapp-mcp\gerar_relatorio_executivo.py" %DIAS%
+%PYTHON% "%SCRIPT_DIR%gerar_relatorio_executivo.py" %DIAS%
 
 if errorlevel 1 (
-    echo.
     echo  [ERRO] Falha no relatorio executivo.
-    echo  Se a API Key for invalida, delete o arquivo e tente novamente:
-    echo  %KEY_FILE%
+    echo  Se a API Key for invalida, delete: %KEY_FILE%
     pause & exit /b 1
 )
 
@@ -132,20 +160,18 @@ echo  [3/3] Sincronizando bugs com GitHub Issues...
 echo  ------------------------------------------------
 
 if "%GITHUB_TOKEN%"=="SKIP" (
-    echo  [--] Sincronizacao GitHub ignorada (token nao configurado).
+    echo  [--] GitHub ignorado (token nao configurado).
     goto FIM
 )
 if "%GITHUB_OWNER%"=="SKIP" (
-    echo  [--] Sincronizacao GitHub ignorada (repositorio nao configurado).
+    echo  [--] GitHub ignorado (repositorio nao configurado).
     goto FIM
 )
 
-"C:\Users\eduar\anaconda3\python.exe" "C:\Users\eduar\whatsapp-mcp\github_bugs_sync.py" %DIAS%
+%PYTHON% "%SCRIPT_DIR%github_bugs_sync.py" %DIAS%
 
 if errorlevel 1 (
-    echo.
-    echo  [AVISO] Falha na sincronizacao GitHub. Relatorios foram gerados normalmente.
-    echo  Verifique o token em: %GH_TOKEN_FILE%
+    echo  [AVISO] Falha no GitHub. Relatorios gerados normalmente.
 )
 
 :FIM

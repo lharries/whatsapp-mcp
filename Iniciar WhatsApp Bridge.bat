@@ -7,7 +7,7 @@ echo   WhatsApp Bridge - Iniciando...
 echo  ================================================
 echo.
 
-cd /d "C:\Users\eduar\whatsapp-mcp\whatsapp-bridge"
+cd /d "%~dp0whatsapp-bridge"
 start "" "whatsapp-bridge.exe"
 
 echo  Bridge iniciado! Esta janela pode ser fechada.
