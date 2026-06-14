@@ -1,3 +1,11 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Windows background runner artifacts
+whatsapp-bridge/*.exe
+whatsapp-bridge/logs/
+whatsapp-bridge/run/
+
+# Local-only notes (do not commit secrets / private info)
+/.claude
