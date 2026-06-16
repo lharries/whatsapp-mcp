@@ -107,6 +107,15 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// GetChatDisplayName returns the stored name for a chat, or "" if unknown.
+func (store *MessageStore) GetChatDisplayName(jid string) string {
+	var name string
+	if err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name); err != nil {
+		return ""
+	}
+	return name
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -203,7 +212,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,10 +371,32 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, recipien
 	}
 
 	// Send message
-	_, err = client.SendMessage(ctx, recipientJID, msg)
-
+	resp, err := client.SendMessage(ctx, recipientJID, msg)
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// whatsmeow doesn't deliver a self-echo event for messages this client
+	// sends, so handleMessage never sees them. Persist the outgoing message
+	// here so it appears in the local history like any received one.
+	chatJID := recipientJID.String()
+	name := messageStore.GetChatDisplayName(chatJID)
+	if name == "" {
+		name = recipientJID.User
+	}
+	if err := messageStore.StoreChat(chatJID, name, resp.Timestamp); err != nil {
+		fmt.Printf("Warning: failed to store chat for sent message: %v\n", err)
+	}
+
+	var sender string
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	content := extractTextContent(msg)
+	mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, content, resp.Timestamp, true,
+		mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		fmt.Printf("Warning: failed to store sent message: %v\n", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -706,7 +737,7 @@ func startRESTServer(ctx context.Context, client *whatsmeow.Client, messageStore
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(ctx, client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(ctx, client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
