@@ -889,6 +889,35 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def vote_poll(chat_jid: str, message_id: str, sender_jid: str, option_names: List[str], is_from_me: bool = False) -> Tuple[bool, str]:
+    try:
+        if not chat_jid or not message_id or not sender_jid:
+            return False, "chat_jid, message_id, and sender_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/vote-poll"
+        payload = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "sender_jid": sender_jid,
+            "option_names": option_names,
+            "is_from_me": is_from_me,
+        }
+
+        response = requests.post(url, json=payload)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
     

@@ -15,7 +15,8 @@ from whatsapp import (
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
-    get_poll_results as whatsapp_get_poll_results
+    get_poll_results as whatsapp_get_poll_results,
+    vote_poll as whatsapp_vote_poll,
 )
 
 # Initialize FastMCP server
@@ -241,6 +242,36 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def send_poll_vote(
+    chat_jid: str,
+    message_id: str,
+    sender_jid: str,
+    option_names: List[str],
+    is_from_me: bool = False,
+) -> Dict[str, Any]:
+    """Vote in a WhatsApp poll, or retract a previous vote. Use list_messages to find polls — they appear as "[Poll] question | Options: ..." in message content.
+
+    Args:
+        chat_jid: The JID of the chat containing the poll (e.g. "123456789@g.us" or "123456789@s.whatsapp.net")
+        message_id: The ID of the poll creation message (from list_messages)
+        sender_jid: The JID of the user who created the poll (e.g. "447837537557@s.whatsapp.net" or just "447837537557")
+        option_names: List of option name strings to vote for — must match the poll option text exactly.
+                      Pass an empty list [] to retract a previously cast vote.
+        is_from_me: Set to True if the poll was created by you (default False)
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_vote_poll(
+        chat_jid=chat_jid,
+        message_id=message_id,
+        sender_jid=sender_jid,
+        option_names=option_names,
+        is_from_me=is_from_me,
+    )
+    return {"success": success, "message": status_message}
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
