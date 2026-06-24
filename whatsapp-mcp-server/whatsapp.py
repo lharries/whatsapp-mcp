@@ -8,6 +8,8 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# The whatsmeow session store; holds the LID <-> phone-number mapping.
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -580,14 +582,46 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             conn.close()
 
 
+def _lids_for_phone(phone_number: str) -> List[str]:
+    """Return any LID identifiers mapped to the given phone number.
+
+    A direct chat may be keyed by a WhatsApp LID (e.g. "12345@lid") instead of
+    the phone JID, in which case the phone number never appears in chats.jid.
+    The LID <-> phone mapping lives in the bridge's whatsapp.db
+    (whatsmeow_lid_map). Returns an empty list if the store or table is absent.
+    """
+    if not os.path.exists(WHATSAPP_DB_PATH):
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT lid FROM whatsmeow_lid_map WHERE pn LIKE ?",
+            (f"%{phone_number}%",),
+        )
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
+
+        # Match the phone JID ("<number>@s.whatsapp.net") as well as any LID
+        # ("<lid>@lid") mapped to the same number, so LID-keyed chats are found.
+        patterns = [f"%{sender_phone_number}%"]
+        patterns += [f"%{lid}%" for lid in _lids_for_phone(sender_phone_number)]
+        jid_filter = " OR ".join("c.jid LIKE ?" for _ in patterns)
+
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -595,11 +629,12 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE ({jid_filter}) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, patterns)
         
         chat_data = cursor.fetchone()
         
