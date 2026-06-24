@@ -927,8 +927,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && existingName != jid.User {
+		// Chat already has a resolved name (not a bare JID/LID fallback), reuse it.
+		// Names equal to jid.User are stale fallbacks and get re-resolved below.
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -987,14 +988,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Prefer the richest display name available. LID-based chats
+		// ("<id>@lid") typically have an empty FullName but a populated
+		// PushName, so fall back through the available name fields before
+		// using the raw JID, which otherwise surfaces as a bare number.
 		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
+		switch {
+		case err == nil && contact.FullName != "":
 			name = contact.FullName
-		} else if sender != "" {
+		case err == nil && contact.PushName != "":
+			name = contact.PushName
+		case err == nil && contact.BusinessName != "":
+			name = contact.BusinessName
+		case sender != "":
 			// Fallback to sender
 			name = sender
-		} else {
+		default:
 			// Last fallback to JID
 			name = jid.User
 		}
