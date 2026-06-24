@@ -6,6 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"math"
 	"math/rand"
 	"net/http"
@@ -23,11 +27,14 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -54,7 +61,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -202,6 +209,39 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// generateImageThumbnail decodes mediaData, returns a ~72px-edge JPEG preview
+// plus the original width/height. Returns ok=false on any decode/encode error
+// so the caller can skip thumbnail fields silently.
+func generateImageThumbnail(mediaData []byte) (thumb []byte, width uint32, height uint32, ok bool) {
+	src, _, err := image.Decode(bytes.NewReader(mediaData))
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return nil, 0, 0, false
+	}
+	const maxEdge = 72
+	dstW, dstH := srcW, srcH
+	if srcW > maxEdge || srcH > maxEdge {
+		if srcW >= srcH {
+			dstW = maxEdge
+			dstH = int(math.Round(float64(srcH) * float64(maxEdge) / float64(srcW)))
+		} else {
+			dstH = maxEdge
+			dstW = int(math.Round(float64(srcW) * float64(maxEdge) / float64(srcH)))
+		}
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 50}); err != nil {
+		return nil, 0, 0, false
+	}
+	return buf.Bytes(), uint32(srcW), uint32(srcH), true
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -293,7 +333,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Create the appropriate message type based on media type
 		switch mediaType {
 		case whatsmeow.MediaImage:
-			msg.ImageMessage = &waProto.ImageMessage{
+			imgMsg := &waProto.ImageMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -303,6 +343,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
+			if thumb, w, h, ok := generateImageThumbnail(mediaData); ok {
+				imgMsg.JPEGThumbnail = thumb
+				imgMsg.Width = proto.Uint32(w)
+				imgMsg.Height = proto.Uint32(h)
+			}
+			msg.ImageMessage = imgMsg
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
 			var seconds uint32 = 30 // Default fallback
@@ -641,7 +687,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +846,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,6 +893,10 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Pull the address book via app-state sync so whatsmeow_contacts
+			// populates. Without this, contact/chat names fall back to bare
+			// phone numbers and name-based sending fails (e.g. "send to pallavi").
+			go syncContacts(client, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -858,7 +908,9 @@ func main() {
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
+		// No ID stored — pair with phone number (WA_PHONE env) or QR code fallback
+		phone := os.Getenv("WA_PHONE")
+
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
@@ -866,15 +918,39 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		if phone != "" {
+			// Wait for first QR event (required before PairPhone works)
+			go func() {
+				for evt := range qrChan {
+					if evt.Event == "success" {
+						connected <- true
+						return
+					}
+				}
+			}()
+
+			// Small delay to let the QR channel initialise
+			time.Sleep(2 * time.Second)
+
+			code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if err != nil {
+				logger.Errorf("PairPhone failed: %v", err)
+				return
 			}
+			fmt.Printf("\nEnter this code in WhatsApp → Linked Devices → Link with phone number:\n\n  %s\n\n", code)
+		} else {
+			// QR code flow
+			go func() {
+				for evt := range qrChan {
+					if evt.Event == "code" {
+						fmt.Println("\nScan this QR code with your WhatsApp app:")
+						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					} else if evt.Event == "success" {
+						connected <- true
+						return
+					}
+				}
+			}()
 		}
 
 		// Wait for connection
@@ -882,7 +958,7 @@ func main() {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+			logger.Errorf("Timeout waiting for pairing")
 			return
 		}
 	} else {
@@ -973,7 +1049,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1064,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1145,6 +1221,31 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+}
+
+// syncContacts forces an app-state fetch so the local whatsmeow_contacts table
+// is populated from the user's WhatsApp address book. It retries a few times
+// because app-state sync keys may not be ready immediately after connect.
+func syncContacts(client *whatsmeow.Client, logger waLog.Logger) {
+	time.Sleep(3 * time.Second)
+	for attempt := 1; attempt <= 5; attempt++ {
+		for _, name := range appstate.AllPatchNames {
+			if err := client.FetchAppState(context.Background(), name, false, false); err != nil {
+				logger.Warnf("FetchAppState(%s) failed: %v", name, err)
+			}
+		}
+		contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+		if err != nil {
+			logger.Warnf("GetAllContacts failed: %v", err)
+		} else {
+			logger.Infof("Contact sync attempt %d → %d contacts", attempt, len(contacts))
+			if len(contacts) > 0 {
+				return
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	logger.Warnf("Contact sync finished with no contacts after retries")
 }
 
 // Request history sync from the server
