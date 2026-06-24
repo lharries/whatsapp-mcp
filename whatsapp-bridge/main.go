@@ -27,6 +27,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -892,6 +893,10 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Pull the address book via app-state sync so whatsmeow_contacts
+			// populates. Without this, contact/chat names fall back to bare
+			// phone numbers and name-based sending fails (e.g. "send to pallavi").
+			go syncContacts(client, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -1216,6 +1221,31 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+}
+
+// syncContacts forces an app-state fetch so the local whatsmeow_contacts table
+// is populated from the user's WhatsApp address book. It retries a few times
+// because app-state sync keys may not be ready immediately after connect.
+func syncContacts(client *whatsmeow.Client, logger waLog.Logger) {
+	time.Sleep(3 * time.Second)
+	for attempt := 1; attempt <= 5; attempt++ {
+		for _, name := range appstate.AllPatchNames {
+			if err := client.FetchAppState(context.Background(), name, false, false); err != nil {
+				logger.Warnf("FetchAppState(%s) failed: %v", name, err)
+			}
+		}
+		contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+		if err != nil {
+			logger.Warnf("GetAllContacts failed: %v", err)
+		} else {
+			logger.Infof("Contact sync attempt %d → %d contacts", attempt, len(contacts))
+			if len(contacts) > 0 {
+				return
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	logger.Warnf("Contact sync finished with no contacts after retries")
 }
 
 // Request history sync from the server
