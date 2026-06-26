@@ -84,6 +84,45 @@ Here's an example of what you can do when it's connected to Claude.
 
    Or restart Cursor.
 
+### Multiple accounts (optional)
+
+A single MCP server can talk to more than one WhatsApp account. Each account is
+backed by its own bridge instance (separate `store/` and REST port), and every
+MCP tool takes an `account` argument (e.g. `"main"` or `"second"`) to choose which
+one to act on. Call the `list_whatsapp_accounts` tool to see what's configured.
+If you don't configure multiple accounts, everything keeps working exactly as
+before (a single `"main"` account).
+
+1. **Run a second bridge** from its own directory, on a different port via
+   `WHATSAPP_BRIDGE_PORT`, so it gets its own `store/` (its own linked session):
+
+   ```bash
+   mkdir -p account2 && cd account2
+   WHATSAPP_BRIDGE_PORT=8081 go run ../whatsapp-bridge/main.go   # scan the QR with your 2nd account
+   ```
+
+2. **Point the MCP server at both accounts** with the `WHATSAPP_ACCOUNTS` env var
+   (JSON mapping account name → `db` path + bridge `api` URL):
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "{{PATH_TO_UV}}",
+         "args": ["--directory", "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"],
+         "env": {
+           "WHATSAPP_ACCOUNTS": "{\"main\": {\"db\": \"{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-bridge/store/messages.db\", \"api\": \"http://localhost:8080/api\"}, \"second\": {\"db\": \"{{PATH_TO_SRC}}/whatsapp-mcp/account2/store/messages.db\", \"api\": \"http://localhost:8081/api\"}}"
+         }
+       }
+     }
+   }
+   ```
+
+   When `WHATSAPP_ACCOUNTS` is unset, the server falls back to a single `"main"`
+   account using the optional `WHATSAPP_MESSAGES_DB` / `WHATSAPP_API_BASE_URL`
+   env vars (or the repo-relative defaults) — so existing single-account setups
+   need no changes.
+
 ### Windows Compatibility
 
 If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
