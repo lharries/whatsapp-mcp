@@ -12,20 +12,35 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_accounts as whatsapp_list_accounts,
 )
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
+# Every tool accepts an `account` argument selecting which linked WhatsApp
+# account to act on (e.g. "main" or "second"). Omit it to use the default
+# ("main"). Call list_whatsapp_accounts to see what's configured.
+
 @mcp.tool()
-def search_contacts(query: str) -> List[Dict[str, Any]]:
+def list_whatsapp_accounts() -> List[str]:
+    """List the configured WhatsApp accounts you can target with the `account` argument.
+
+    Returns the account names (e.g. ["main", "second"]). Use one of these as the
+    `account` parameter on any other tool to act on that specific WhatsApp account.
+    """
+    return whatsapp_list_accounts()
+
+@mcp.tool()
+def search_contacts(query: str, account: str = "main") -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
-    
+
     Args:
         query: Search term to match against contact names or phone numbers
+        account: Which linked WhatsApp account to search ("main" or "second"; default "main")
     """
-    contacts = whatsapp_search_contacts(query)
+    contacts = whatsapp_search_contacts(query, account=account)
     return contacts
 
 @mcp.tool()
@@ -39,10 +54,11 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    account: str = "main"
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp messages matching specified criteria with optional context.
-    
+
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
@@ -54,6 +70,7 @@ def list_messages(
         include_context: Whether to include messages before and after matches (default True)
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
+        account: Which linked WhatsApp account to search ("main" or "second"; default "main")
     """
     messages = whatsapp_list_messages(
         after=after,
@@ -65,7 +82,8 @@ def list_messages(
         page=page,
         include_context=include_context,
         context_before=context_before,
-        context_after=context_after
+        context_after=context_after,
+        account=account
     )
     return messages
 
@@ -75,89 +93,99 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    account: str = "main"
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats matching specified criteria.
-    
+
     Args:
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
+        account=account
     )
     return chats
 
 @mcp.tool()
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
+def get_chat(chat_jid: str, include_last_message: bool = True, account: str = "main") -> Dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
-    
+
     Args:
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
-    chat = whatsapp_get_chat(chat_jid, include_last_message)
+    chat = whatsapp_get_chat(chat_jid, include_last_message, account=account)
     return chat
 
 @mcp.tool()
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
+def get_direct_chat_by_contact(sender_phone_number: str, account: str = "main") -> Dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
-    
+
     Args:
         sender_phone_number: The phone number to search for
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
-    chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
+    chat = whatsapp_get_direct_chat_by_contact(sender_phone_number, account=account)
     return chat
 
 @mcp.tool()
-def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
+def get_contact_chats(jid: str, limit: int = 20, page: int = 0, account: str = "main") -> List[Dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
-    
+
     Args:
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
-    chats = whatsapp_get_contact_chats(jid, limit, page)
+    chats = whatsapp_get_contact_chats(jid, limit, page, account=account)
     return chats
 
 @mcp.tool()
-def get_last_interaction(jid: str) -> str:
+def get_last_interaction(jid: str, account: str = "main") -> str:
     """Get most recent WhatsApp message involving the contact.
-    
+
     Args:
         jid: The JID of the contact to search for
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
-    message = whatsapp_get_last_interaction(jid)
+    message = whatsapp_get_last_interaction(jid, account=account)
     return message
 
 @mcp.tool()
 def get_message_context(
     message_id: str,
     before: int = 5,
-    after: int = 5
+    after: int = 5,
+    account: str = "main"
 ) -> Dict[str, Any]:
     """Get context around a specific WhatsApp message.
-    
+
     Args:
         message_id: The ID of the message to get context for
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
+        account: Which linked WhatsApp account to query ("main" or "second"; default "main")
     """
-    context = whatsapp_get_message_context(message_id, before, after)
+    context = whatsapp_get_message_context(message_id, before, after, account=account)
     return context
 
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    account: str = "main"
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -165,7 +193,8 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+        account: Which linked WhatsApp account to send from ("main" or "second"; default "main")
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -175,65 +204,68 @@ def send_message(
             "success": False,
             "message": "Recipient must be provided"
         }
-    
+
     # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
+    success, status_message = whatsapp_send_message(recipient, message, account=account)
     return {
         "success": success,
         "message": status_message
     }
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str, account: str = "main") -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
-    
+        account: Which linked WhatsApp account to send from ("main" or "second"; default "main")
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
+
     # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    success, status_message = whatsapp_send_file(recipient, media_path, account=account)
     return {
         "success": success,
         "message": status_message
     }
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_audio_message(recipient: str, media_path: str, account: str = "main") -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+        account: Which linked WhatsApp account to send from ("main" or "second"; default "main")
+
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+    success, status_message = whatsapp_audio_voice_message(recipient, media_path, account=account)
     return {
         "success": success,
         "message": status_message
     }
 
 @mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
+def download_media(message_id: str, chat_jid: str, account: str = "main") -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
-    
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+        account: Which linked WhatsApp account the message is on ("main" or "second"; default "main")
+
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
+    file_path = whatsapp_download_media(message_id, chat_jid, account=account)
+
     if file_path:
         return {
             "success": True,
