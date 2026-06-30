@@ -155,6 +155,27 @@ You can send various media types to your WhatsApp contacts:
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
   - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
 
+> [!IMPORTANT]
+> **Outbound files are restricted to an allowlist of directories.** Because
+> `media_path` is supplied by the model, an injected prompt could otherwise
+> coax the agent into sending sensitive local files (e.g. `~/.ssh/id_rsa`) to
+> an arbitrary recipient (see [the lethal trifecta](#whatsapp-mcp-server) note
+> above). `send_file` and `send_audio_message` therefore reject any path that
+> does not resolve inside an allowed directory.
+>
+> By default the allowed directories are `~/whatsapp-mcp-outbox` and
+> `~/Downloads`. Override them with the `WHATSAPP_ALLOWED_MEDIA_DIRS`
+> environment variable (one or more paths, separated by your OS path separator
+> — `:` on macOS/Linux, `;` on Windows):
+>
+> ```bash
+> export WHATSAPP_ALLOWED_MEDIA_DIRS="/Users/me/whatsapp-files:/Users/me/Downloads"
+> ```
+>
+> Note: files produced by `download_media` live in the bridge's store
+> directory, so to forward a downloaded file you must add that directory to
+> `WHATSAPP_ALLOWED_MEDIA_DIRS`.
+
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.

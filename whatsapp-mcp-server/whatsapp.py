@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
@@ -27,6 +28,57 @@ def _clamp_pagination(limit: int, page: int) -> Tuple[int, int]:
     except (TypeError, ValueError):
         page = 0
     return max(1, min(limit, MAX_PAGE_SIZE)), max(0, page)
+
+
+# Outbound file sends (send_file / send_audio_message) are restricted to these
+# directories. `media_path` is agent-controlled, so without an allowlist a
+# prompt-injected agent could send arbitrary files (e.g. ~/.ssh/id_rsa) to any
+# recipient. Override the roots with WHATSAPP_ALLOWED_MEDIA_DIRS (os.pathsep
+# separated). Defaults to a dedicated outbox plus the user's Downloads folder.
+_DEFAULT_MEDIA_DIRS = [
+    os.path.join(os.path.expanduser("~"), "whatsapp-mcp-outbox"),
+    os.path.join(os.path.expanduser("~"), "Downloads"),
+]
+WHATSAPP_ALLOWED_MEDIA_DIRS = [
+    os.path.realpath(os.path.expanduser(p))
+    for p in os.environ.get("WHATSAPP_ALLOWED_MEDIA_DIRS", "").split(os.pathsep)
+    if p.strip()
+] or [os.path.realpath(p) for p in _DEFAULT_MEDIA_DIRS]
+
+
+def _resolve_outbound_media_path(media_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Validate an outbound media path against the allowlist.
+
+    Returns (resolved_path, None) on success or (None, error_message) on
+    rejection. Resolves symlinks and `..` before checking containment so the
+    allowlist cannot be escaped via traversal.
+    """
+    if not media_path:
+        return None, "Media path must be provided"
+
+    resolved = os.path.realpath(os.path.expanduser(media_path))
+
+    if not os.path.isfile(resolved):
+        return None, f"Media file not found: {media_path}"
+
+    # Compare via commonpath on case-normalized paths so containment is correct
+    # on case-insensitive filesystems (macOS/Windows) and immune to sibling
+    # prefixes like ".../Downloads-evil".
+    resolved_cmp = os.path.normcase(resolved)
+    for root in WHATSAPP_ALLOWED_MEDIA_DIRS:
+        root_cmp = os.path.normcase(root)
+        try:
+            if os.path.commonpath([resolved_cmp, root_cmp]) == root_cmp:
+                return resolved, None
+        except ValueError:
+            # Different drives (Windows) or mixed abs/rel — not contained.
+            continue
+
+    return None, (
+        "Refusing to send file outside the allowed media directories "
+        f"({os.pathsep.join(WHATSAPP_ALLOWED_MEDIA_DIRS)}). "
+        "Set WHATSAPP_ALLOWED_MEDIA_DIRS to permit other locations."
+    )
 
 
 @dataclass
@@ -682,13 +734,11 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
+
+        media_path, path_error = _resolve_outbound_media_path(media_path)
+        if path_error:
+            return False, path_error
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
@@ -716,12 +766,10 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+
+        media_path, path_error = _resolve_outbound_media_path(media_path)
+        if path_error:
+            return False, path_error
 
         if not media_path.endswith(".ogg"):
             try:
