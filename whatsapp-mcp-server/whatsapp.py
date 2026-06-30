@@ -10,6 +10,25 @@ import audio
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
+# Cap how many rows any paginated query can return. Without this, an
+# agent-supplied (and therefore prompt-injectable) `limit` could request an
+# unbounded result set and exhaust memory.
+MAX_PAGE_SIZE = 100
+
+
+def _clamp_pagination(limit: int, page: int) -> Tuple[int, int]:
+    """Coerce and bound caller-supplied pagination to a safe range."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    return max(1, min(limit, MAX_PAGE_SIZE)), max(0, page)
+
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -178,7 +197,8 @@ def list_messages(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
-        # Add pagination
+        # Add pagination (bounded to avoid unbounded result sets)
+        limit, page = _clamp_pagination(limit, page)
         offset = page * limit
         query_parts.append("ORDER BY messages.timestamp DESC")
         query_parts.append("LIMIT ? OFFSET ?")
@@ -364,9 +384,10 @@ def list_chats(
         }
         order_by = sort_columns.get(sort_by, sort_columns["last_active"])
         query_parts.append(f"ORDER BY {order_by}")
-        
-        # Add pagination
-        offset = (page ) * limit
+
+        # Add pagination (bounded to avoid unbounded result sets)
+        limit, page = _clamp_pagination(limit, page)
+        offset = page * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
         
@@ -448,7 +469,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        limit, page = _clamp_pagination(limit, page)
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
