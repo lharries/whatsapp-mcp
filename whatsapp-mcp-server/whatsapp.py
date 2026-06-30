@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
@@ -9,6 +10,76 @@ import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+# Cap how many rows any paginated query can return. Without this, an
+# agent-supplied (and therefore prompt-injectable) `limit` could request an
+# unbounded result set and exhaust memory.
+MAX_PAGE_SIZE = 100
+
+
+def _clamp_pagination(limit: int, page: int) -> Tuple[int, int]:
+    """Coerce and bound caller-supplied pagination to a safe range."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    return max(1, min(limit, MAX_PAGE_SIZE)), max(0, page)
+
+
+# Outbound file sends (send_file / send_audio_message) are restricted to these
+# directories. `media_path` is agent-controlled, so without an allowlist a
+# prompt-injected agent could send arbitrary files (e.g. ~/.ssh/id_rsa) to any
+# recipient. Override the roots with WHATSAPP_ALLOWED_MEDIA_DIRS (os.pathsep
+# separated). Defaults to a dedicated outbox plus the user's Downloads folder.
+_DEFAULT_MEDIA_DIRS = [
+    os.path.join(os.path.expanduser("~"), "whatsapp-mcp-outbox"),
+    os.path.join(os.path.expanduser("~"), "Downloads"),
+]
+WHATSAPP_ALLOWED_MEDIA_DIRS = [
+    os.path.realpath(os.path.expanduser(p))
+    for p in os.environ.get("WHATSAPP_ALLOWED_MEDIA_DIRS", "").split(os.pathsep)
+    if p.strip()
+] or [os.path.realpath(p) for p in _DEFAULT_MEDIA_DIRS]
+
+
+def _resolve_outbound_media_path(media_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Validate an outbound media path against the allowlist.
+
+    Returns (resolved_path, None) on success or (None, error_message) on
+    rejection. Resolves symlinks and `..` before checking containment so the
+    allowlist cannot be escaped via traversal.
+    """
+    if not media_path:
+        return None, "Media path must be provided"
+
+    resolved = os.path.realpath(os.path.expanduser(media_path))
+
+    if not os.path.isfile(resolved):
+        return None, f"Media file not found: {media_path}"
+
+    # Compare via commonpath on case-normalized paths so containment is correct
+    # on case-insensitive filesystems (macOS/Windows) and immune to sibling
+    # prefixes like ".../Downloads-evil".
+    resolved_cmp = os.path.normcase(resolved)
+    for root in WHATSAPP_ALLOWED_MEDIA_DIRS:
+        root_cmp = os.path.normcase(root)
+        try:
+            if os.path.commonpath([resolved_cmp, root_cmp]) == root_cmp:
+                return resolved, None
+        except ValueError:
+            # Different drives (Windows) or mixed abs/rel — not contained.
+            continue
+
+    return None, (
+        "Refusing to send file outside the allowed media directories "
+        f"({os.pathsep.join(WHATSAPP_ALLOWED_MEDIA_DIRS)}). "
+        "Set WHATSAPP_ALLOWED_MEDIA_DIRS to permit other locations."
+    )
+
 
 @dataclass
 class Message:
@@ -178,7 +249,8 @@ def list_messages(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
-        # Add pagination
+        # Add pagination (bounded to avoid unbounded result sets)
+        limit, page = _clamp_pagination(limit, page)
         offset = page * limit
         query_parts.append("ORDER BY messages.timestamp DESC")
         query_parts.append("LIMIT ? OFFSET ?")
@@ -356,12 +428,18 @@ def list_chats(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
-        # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        # Add sorting. Map the caller-supplied sort key to a fixed SQL fragment
+        # via an explicit allowlist so no caller input can reach the query text.
+        sort_columns = {
+            "last_active": "chats.last_message_time DESC",
+            "name": "chats.name",
+        }
+        order_by = sort_columns.get(sort_by, sort_columns["last_active"])
         query_parts.append(f"ORDER BY {order_by}")
-        
-        # Add pagination
-        offset = (page ) * limit
+
+        # Add pagination (bounded to avoid unbounded result sets)
+        limit, page = _clamp_pagination(limit, page)
+        offset = page * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
         
@@ -443,7 +521,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        limit, page = _clamp_pagination(limit, page)
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
@@ -655,13 +734,11 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
+
+        media_path, path_error = _resolve_outbound_media_path(media_path)
+        if path_error:
+            return False, path_error
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
@@ -689,12 +766,10 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+
+        media_path, path_error = _resolve_outbound_media_path(media_path)
+        if path_error:
+            return False, path_error
 
         if not media_path.endswith(".ogg"):
             try:
