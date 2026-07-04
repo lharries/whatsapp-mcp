@@ -1,3 +1,6 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+# never commit the WhatsApp session store (auth + message history) or the compiled binary
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-bridge
