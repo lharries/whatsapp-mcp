@@ -84,6 +84,22 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- #278: without these indexes every list_messages / list_chats /
+		-- get_message_context / get_last_interaction call is a full-table
+		-- scan. Latency then scales linearly with history size. The three
+		-- messages indexes cover the hot filter+sort predicates; the chats
+		-- index covers the last-active ORDER BY in list_chats. All are
+		-- IF NOT EXISTS so an existing store gets them for free on first
+		-- start after the upgrade.
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_time
+			ON messages(chat_jid, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_sender_time
+			ON messages(sender, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+			ON messages(timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_message
+			ON chats(last_message_time DESC);
 	`)
 	if err != nil {
 		db.Close()
