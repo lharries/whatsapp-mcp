@@ -341,9 +341,18 @@ def list_chats(
         """]
         
         if include_last_message:
+            # #282: join to the actual latest message via rowid subquery,
+            # not by chats.last_message_time = messages.timestamp. The
+            # timestamp-equality join drops chats where the two columns
+            # drift, and duplicates chat rows when two messages in the
+            # same chat share a timestamp.
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
+                LEFT JOIN messages ON messages.rowid = (
+                    SELECT rowid FROM messages
+                    WHERE chat_jid = chats.jid
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
             """)
             
         where_clauses = []
@@ -550,9 +559,14 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         """
         
         if include_last_message:
+            # #282: rowid subquery instead of timestamp equality join.
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+                LEFT JOIN messages m ON m.rowid = (
+                    SELECT rowid FROM messages
+                    WHERE chat_jid = c.jid
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
             """
             
         query += " WHERE c.jid = ?"
@@ -586,8 +600,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
+        # #282: rowid subquery instead of timestamp equality join.
         cursor.execute("""
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -595,8 +610,12 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+            LEFT JOIN messages m ON m.rowid = (
+                SELECT rowid FROM messages
+                WHERE chat_jid = c.jid
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
