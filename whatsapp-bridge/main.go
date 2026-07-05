@@ -202,6 +202,51 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// validateMediaPath closes CWE-22 (Path Traversal) in /api/send by refusing
+// paths that contain ".." components and, if the WHATSAPP_MEDIA_ROOTS env
+// var is set, restricting reads to that colon-separated allowlist of
+// directories. Without the env var the historical behavior (accept any
+// absolute path the process can read) is preserved so existing users are
+// not broken - the ".." check alone blocks the CVE POC in #241.
+func validateMediaPath(mediaPath string) error {
+	if mediaPath == "" {
+		return fmt.Errorf("media_path is empty")
+	}
+	if strings.Contains(mediaPath, "..") {
+		return fmt.Errorf("media_path must not contain \"..\"")
+	}
+	roots := strings.Split(os.Getenv("WHATSAPP_MEDIA_ROOTS"), string(os.PathListSeparator))
+	if len(roots) == 0 || (len(roots) == 1 && roots[0] == "") {
+		return nil
+	}
+	abs, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return fmt.Errorf("bad media_path: %v", err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("cannot resolve media_path: %v", err)
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		rootReal, err := filepath.EvalSymlinks(rootAbs)
+		if err != nil {
+			rootReal = rootAbs
+		}
+		rootClean := filepath.Clean(rootReal)
+		if real == rootClean || strings.HasPrefix(real, rootClean+string(os.PathSeparator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("media_path is not under any WHATSAPP_MEDIA_ROOTS entry")
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -233,6 +278,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// CWE-22 guard - refuse traversal paths and (optionally) enforce
+		// WHATSAPP_MEDIA_ROOTS before touching the filesystem.
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Refusing media_path: %v", err)
+		}
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
