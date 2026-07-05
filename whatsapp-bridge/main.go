@@ -195,15 +195,19 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
-// SendMessageRequest represents the request body for the send message API
+// SendMessageRequest represents the request body for the send message API.
+// The Reply* fields (added for #121) are optional; when both are set the
+// outbound message quotes the referenced original in the recipient's chat.
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient        string `json:"recipient"`
+	Message          string `json:"message"`
+	MediaPath        string `json:"media_path,omitempty"`
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	ReplyToSenderJID string `json:"reply_to_sender_jid,omitempty"`
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToMessageID string, replyToSenderJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -359,6 +363,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 	} else {
 		msg.Conversation = proto.String(message)
+	}
+
+	// #121: quote-reply support. A WhatsApp reply is a message that carries a
+	// ContextInfo{StanzaID, Participant} pointing at the original. For group
+	// replies, Participant is required and must be the original sender's JID;
+	// for direct chats it can be omitted. Building ExtendedTextMessage is
+	// necessary because Conversation cannot carry ContextInfo.
+	if replyToMessageID != "" {
+		ctxInfo := &waProto.ContextInfo{StanzaID: proto.String(replyToMessageID)}
+		if replyToSenderJID != "" {
+			ctxInfo.Participant = proto.String(replyToSenderJID)
+		}
+		if msg.ExtendedTextMessage != nil {
+			msg.ExtendedTextMessage.ContextInfo = ctxInfo
+		} else if msg.ImageMessage != nil {
+			msg.ImageMessage.ContextInfo = ctxInfo
+		} else if msg.VideoMessage != nil {
+			msg.VideoMessage.ContextInfo = ctxInfo
+		} else if msg.AudioMessage != nil {
+			msg.AudioMessage.ContextInfo = ctxInfo
+		} else if msg.DocumentMessage != nil {
+			msg.DocumentMessage.ContextInfo = ctxInfo
+		} else {
+			// Plain text - upgrade Conversation to ExtendedTextMessage so it
+			// can carry ContextInfo.
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: ctxInfo,
+			}
+			msg.Conversation = nil
+		}
 	}
 
 	// Send message
@@ -705,8 +740,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (with optional reply-to context per #121)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToMessageID, req.ReplyToSenderJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")

@@ -622,18 +622,30 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(
+    recipient: str,
+    message: str,
+    reply_to_message_id: Optional[str] = None,
+    reply_to_sender_jid: Optional[str] = None,
+) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        # #121: quote-reply to an existing message. sender_jid is required for
+        # group replies (WhatsApp needs to know whose message you're quoting);
+        # for direct chats the field is optional.
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply_to_sender_jid:
+            payload["reply_to_sender_jid"] = reply_to_sender_jid
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful
