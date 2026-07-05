@@ -20,6 +20,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    sender_name: Optional[str] = None
 
 @dataclass
 class Chat:
@@ -29,6 +30,7 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    last_sender_name: Optional[str] = None
 
     @property
     def is_group(self) -> bool:
@@ -46,6 +48,29 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+def _resolve_sender_names(cursor, sender_jids) -> dict:
+    """Resolve a batch of sender JIDs to their human-readable names in one query.
+
+    Used by list_messages and list_chats to populate the sender_name /
+    last_sender_name fields (issue #144) without an N+1 per-row lookup.
+    Direct-chat sender rows in `chats` carry their display name; unknown
+    or empty senders are left absent from the returned dict.
+    """
+    result = {}
+    unique_jids = {j for j in sender_jids if j}
+    if not unique_jids:
+        return result
+    placeholders = ",".join("?" * len(unique_jids))
+    cursor.execute(
+        f"SELECT jid, name FROM chats WHERE jid IN ({placeholders})",
+        tuple(unique_jids),
+    )
+    for jid, name in cursor.fetchall():
+        if name:
+            result[jid] = name
+    return result
+
 
 def get_sender_name(sender_jid: str) -> str:
     try:
@@ -186,7 +211,10 @@ def list_messages(
         
         cursor.execute(" ".join(query_parts), tuple(params))
         messages = cursor.fetchall()
-        
+
+        # #144: batch-resolve sender_name for messages on this page.
+        sender_names = _resolve_sender_names(cursor, {m[1] for m in messages})
+
         result = []
         for msg in messages:
             message = Message(
@@ -197,23 +225,25 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                sender_name=sender_names.get(msg[1]),
             )
             result.append(message)
             
+        # #144: return the structured list so the tool wrapper serializes it to
+        # dicts (matching the declared `List[Dict[str, Any]]` type). Previously
+        # this returned format_messages_list(...) which is a str, meaning the
+        # sender_name / media_type / id fields were unreachable to clients.
         if include_context and result:
-            # Add context for each message
             messages_with_context = []
             for msg in result:
                 context = get_message_context(msg.id, context_before, context_after)
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+            return messages_with_context
+
+        return result
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -367,16 +397,24 @@ def list_chats(
         
         cursor.execute(" ".join(query_parts), tuple(params))
         chats = cursor.fetchall()
-        
+
+        # #144: batch-resolve last_sender_name for chats on this page.
+        last_sender_names = _resolve_sender_names(
+            cursor,
+            {c[4] for c in chats if len(c) > 4 and c[4]},
+        )
+
         result = []
         for chat_data in chats:
+            last_sender = chat_data[4] if len(chat_data) > 4 else None
             chat = Chat(
                 jid=chat_data[0],
                 name=chat_data[1],
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_sender=last_sender,
+                last_is_from_me=chat_data[5],
+                last_sender_name=last_sender_names.get(last_sender) if last_sender else None,
             )
             result.append(chat)
             
