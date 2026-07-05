@@ -90,6 +90,54 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// #280: FTS5-backed content search. go-sqlite3 omits FTS5 by default; if
+	// the binary was NOT built with `-tags sqlite_fts5`, the CREATE VIRTUAL
+	// TABLE will fail with "no such module: fts5". We log a helpful message
+	// and continue - the MCP server checks for the FTS table and falls back
+	// to LIKE-based search when it isn't present, so this is fully optional.
+	_, err = db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+			content,
+			content='messages',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
+		CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages
+			WHEN new.content IS NOT NULL AND new.content != ''
+		BEGIN
+			INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+		END;
+		CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages
+			WHEN old.content IS NOT NULL AND old.content != ''
+		BEGIN
+			INSERT INTO messages_fts(messages_fts, rowid, content)
+				VALUES('delete', old.rowid, old.content);
+		END;
+		CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+		BEGIN
+			INSERT INTO messages_fts(messages_fts, rowid, content)
+				SELECT 'delete', old.rowid, old.content
+				WHERE old.content IS NOT NULL AND old.content != '';
+			INSERT INTO messages_fts(rowid, content)
+				SELECT new.rowid, new.content
+				WHERE new.content IS NOT NULL AND new.content != '';
+		END;
+	`)
+	if err != nil {
+		fmt.Printf(
+			"FTS5 unavailable (%v); content search will fall back to LIKE. "+
+				"To enable full-text search, rebuild with:  go build -tags sqlite_fts5\n",
+			err,
+		)
+	} else {
+		// Backfill pre-existing rows into the FTS index. `('rebuild')` is the
+		// documented way to (re)populate an external-content FTS5 table;
+		// idempotent, so it's safe to run every start.
+		if _, rebuildErr := db.Exec(`INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')`); rebuildErr != nil {
+			fmt.Printf("FTS5 backfill failed (non-fatal): %v\n", rebuildErr)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 

@@ -172,9 +172,25 @@ def list_messages(
             params.append(chat_jid)
             
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
-            
+            # #280: prefer FTS5 (inverted index) over LIKE %q% (full scan).
+            # Probe for the messages_fts table; if it's present (bridge built
+            # with -tags sqlite_fts5), join it and MATCH. Otherwise fall back
+            # to the historical behavior so mismatched bridge/server versions
+            # keep working.
+            cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+            )
+            if cursor.fetchone() is not None:
+                query_parts.append("JOIN messages_fts ON messages_fts.rowid = messages.rowid")
+                where_clauses.append("messages_fts MATCH ?")
+                # Quote-wrap the query so FTS5 treats it as a literal phrase
+                # rather than a mini-DSL (blocks operators like AND / NEAR /
+                # column filters embedded in user input). Escape embedded ".
+                params.append('"' + query.replace('"', '""') + '"')
+            else:
+                where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
+                params.append(f"%{query}%")
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
