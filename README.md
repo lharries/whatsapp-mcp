@@ -106,6 +106,10 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+#### Running the bridge unattended on Windows
+
+To keep the bridge running in the background on Windows — **hidden** (no console window), **auto-restarting** on crash, and surfacing the login **QR only when the session is genuinely unlinked** — see [WINDOWS.md](./WINDOWS.md) and the helper scripts in the [`windows/`](./windows) folder. These are additive and optional; they wrap the existing bridge and MCP server without changing them.
+
 ## Architecture Overview
 
 This application consists of two main components:
