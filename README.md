@@ -66,6 +66,14 @@ Here's an example of what you can do when it's connected to Claude.
    }
    ```
 
+   For Autohand Code, register the same Python server from the command line:
+
+   ```bash
+   autohand mcp add whatsapp /absolute/path/to/uv --directory /absolute/path/to/whatsapp-mcp/whatsapp-mcp-server run main.py
+   ```
+
+   Add `--scope project` after `add` to keep the server configuration in the current project. Keep the WhatsApp bridge from step 2 running. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
+
    For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
    ```
