@@ -1,3 +1,17 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Go bridge binary + logs + message store
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/bridge.log
+whatsapp-bridge/store/
+
+# Node bridge: session secrets, QR, deps, backups, rotated logs (NEVER commit)
+whatsapp-bridge/tokens/
+whatsapp-bridge/qr.png
+whatsapp-bridge/qr.old.png
+whatsapp-bridge/qr_live.html
+whatsapp-bridge/node_modules/
+whatsapp-bridge/*.bak-*
+whatsapp-bridge/bridge.log.*

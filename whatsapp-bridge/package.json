@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-bridge-node",
+  "version": "1.0.0",
+  "description": "Node-based WhatsApp bridge for the whatsapp-mcp server, using wppconnect (Puppeteer + WhatsApp Web internal JS). Supports interactive button clicks unlike whatsmeow-based bridges.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "@wppconnect-team/wppconnect": "^1.39.0",
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.2"
+  }
+}
