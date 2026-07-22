@@ -15,6 +15,26 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+
+def _to_dict(obj):
+    if is_dataclass(obj):
+        d = asdict(obj)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = v.isoformat()
+            elif is_dataclass(v) or isinstance(v, (list, dict)):
+                d[k] = _to_dict(v)
+        return d
+    elif isinstance(obj, list):
+        return [_to_dict(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: _to_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
@@ -26,7 +46,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return _to_dict(contacts)
 
 @mcp.tool()
 def list_messages(
@@ -93,7 +113,7 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return _to_dict(chats)
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
@@ -104,7 +124,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return _to_dict(chat)
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
@@ -114,7 +134,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return _to_dict(chat)
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -126,7 +146,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return _to_dict(chats)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -152,7 +172,7 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return _to_dict(context)
 
 @mcp.tool()
 def send_message(
