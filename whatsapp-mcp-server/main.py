@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -17,6 +18,12 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# Local change: read-only by default. The send tools below are fully defined but are
+# only registered with the MCP server when this is switched on, so Claude never sees
+# them otherwise. To re-enable sending, set WHATSAPP_MCP_ALLOW_SEND=1 in the "env"
+# block of this server's entry in claude_desktop_config.json, then restart Claude.
+ALLOW_SEND = os.environ.get("WHATSAPP_MCP_ALLOW_SEND", "0").lower() in ("1", "true", "yes")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -154,7 +161,10 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+# --- Send tools -------------------------------------------------------------
+# Defined unconditionally, but only registered as MCP tools when ALLOW_SEND is on
+# (see the registration block at the bottom of this file).
+
 def send_message(
     recipient: str,
     message: str
@@ -165,7 +175,7 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -175,7 +185,7 @@ def send_message(
             "success": False,
             "message": "Recipient must be provided"
         }
-    
+
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
     return {
@@ -183,19 +193,18 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
+
     # Call the whatsapp_send_file function
     success, status_message = whatsapp_send_file(recipient, media_path)
     return {
@@ -203,15 +212,14 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -220,6 +228,13 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+if ALLOW_SEND:
+    mcp.tool()(send_message)
+    mcp.tool()(send_file)
+    mcp.tool()(send_audio_message)
+
+# --- End send tools ---------------------------------------------------------
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

@@ -677,8 +677,26 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Local change: read-only by default. The /api/send route below is refused
+	// unless WHATSAPP_MCP_ALLOW_SEND is switched on (see start-bridge.ps1).
+	// This mirrors the same flag in the Python MCP server, so sending has to be
+	// enabled in both places before a message can actually leave this machine.
+	allowSend := os.Getenv("WHATSAPP_MCP_ALLOW_SEND")
+	sendEnabled := allowSend == "1" || strings.EqualFold(allowSend, "true") || strings.EqualFold(allowSend, "yes")
+	if sendEnabled {
+		fmt.Println("WARNING: send API is ENABLED (WHATSAPP_MCP_ALLOW_SEND=" + allowSend + ")")
+	} else {
+		fmt.Println("Send API is DISABLED (read-only mode). Set WHATSAPP_MCP_ALLOW_SEND=1 to enable.")
+	}
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		// Read-only guard: refuse before parsing or touching WhatsApp at all
+		if !sendEnabled {
+			http.Error(w, "Sending is disabled: bridge is running in read-only mode", http.StatusForbidden)
+			return
+		}
+
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

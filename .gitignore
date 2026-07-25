@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Local: compiled bridge binaries and dependency-pin backups
+whatsapp-bridge/whatsapp-bridge.exe*
+*.bak
