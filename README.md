@@ -1,5 +1,24 @@
 # WhatsApp MCP Server
 
+> ## About this fork
+>
+> This is a personal fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) with two changes.
+>
+> **1. Read-only by default.** Sending is disabled unless you explicitly turn it on. Nothing is removed — the upstream send code is intact behind a flag, `WHATSAPP_MCP_ALLOW_SEND`, which has to be set in *both* layers before a message can leave your machine:
+>
+> | Layer | Where to set it | What it controls |
+> |---|---|---|
+> | MCP server | `env` block of the `whatsapp` entry in `claude_desktop_config.json` | Whether the `send_*` tools are registered at all, i.e. whether the agent can see them |
+> | Bridge | `WHATSAPP_MCP_ALLOW_SEND` in the environment (see `start-bridge.ps1`) | Whether `POST /api/send` works, or returns `403` before parsing |
+>
+> Set both to `1` for upstream behaviour; leave either at `0` and sending is blocked. Gating both matters: the bridge's REST endpoint is reachable by any local process regardless of which tools the agent has, so hiding the tools alone is not sufficient.
+>
+> Given the [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) warning below, read-only is a meaningful reduction in blast radius — prompt injection can still exfiltrate what the agent reads, but it cannot send messages as you.
+>
+> **2. Fixed `Client outdated (405)` on login.** Upstream pins a March 2025 `whatsmeow`, whose advertised client version WhatsApp's servers now reject, so pairing never completes. This fork bumps the dependency and updates the five call sites that gained a `context.Context` parameter. If you hit that error on upstream, that's the fix — it isn't specific to this fork.
+>
+> `start-bridge.ps1` is a Windows launcher that sets the flag, ensures the binary is built, and prints the active mode. On Windows you also need CGO enabled and a C compiler on PATH; see the Windows section below.
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
