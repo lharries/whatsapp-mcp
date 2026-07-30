@@ -641,7 +641,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -668,10 +668,11 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string. whatsmeow builds the final download URL as
+	// "https://<host>" + directPath + "&hash=...&mms-type=..." (see
+	// DownloadMediaWithPath), using "&" as the separator because it assumes the
+	// WhatsApp-signed query ("?ccb=...&oh=...&oe=...") is already present.
+	// Stripping it yields a malformed URL and the media host answers 403.
 	return "/" + pathPart
 }
 
@@ -800,14 +801,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +974,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,10 +988,29 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		// LID-style JIDs (@lid) are opaque identifiers WhatsApp uses instead of the
+		// phone number. The contact store is keyed by phone JID, so the lookup below
+		// always misses for them and the raw LID ends up as the chat name. Resolve
+		// the LID to its phone JID first.
+		lookupJID := jid
+		if jid.Server == types.HiddenUserServer {
+			if altJID, err := client.Store.GetAltJID(context.Background(), jid); err == nil && !altJID.IsEmpty() {
+				logger.Infof("Resolved LID %s to %s", jid.String(), altJID.String())
+				lookupJID = altJID
+			}
+		}
+
+		// Use contact info, preferring the most human-readable field available
+		contact, err := client.Store.Contacts.GetContact(context.Background(), lookupJID)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+		} else if err == nil && contact.BusinessName != "" {
+			name = contact.BusinessName
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
+		} else if lookupJID.Server == types.DefaultUserServer {
+			// No saved contact: the phone number still beats an opaque LID
+			name = lookupJID.User
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
