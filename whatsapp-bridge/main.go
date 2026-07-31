@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"strconv"
 )
 
 // Message represents a chat message for our client
@@ -46,7 +48,7 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-// Initialize message store
+// NewMessageStore Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -202,8 +204,15 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+type SendFileMessageRequest struct {
+	Recipient string `json:"recipient"`
+	Message   string `json:"message"`
+	FileData  []byte `json:"file_data"`
+	FileName  string `json:"file_name"`
+}
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, fileName string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -241,6 +250,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 		// Determine media type and mime type based on file extension
 		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		if fileName != "" {
+			fileExt = strings.ToLower(fileName[strings.LastIndex(fileName, ".")+1:])
+		}
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -276,6 +288,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
@@ -288,7 +304,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		// If no filename was provided, use the one from mediaPath
+		if fileName == "" {
+			fileName = filepath.Base(mediaPath)
+		}
+
+		fmt.Printf("Media uploaded %v with filename %s\n", resp, fileName)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -347,6 +368,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(fileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -641,7 +663,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -679,48 +701,91 @@ func extractDirectPathFromURL(url string) string {
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
+		// Check content type
+		contentType := r.Header.Get("Content-Type")
+
+		if strings.HasPrefix(contentType, "multipart/form-data") {
+			// Handle multipart form data (file upload)
+			err := r.ParseMultipartForm(10 << 20) // 10 MB max memory
+			if err != nil {
+				http.Error(w, "Failed to parse form data", http.StatusBadRequest)
+				return
+			}
+
+			recipient := r.FormValue("recipient")
+			message := r.FormValue("message")
+
+			file, handler, err := r.FormFile("file")
+			if err != nil {
+				if err != http.ErrMissingFile {
+					http.Error(w, "Error retrieving file", http.StatusBadRequest)
+					return
+				}
+				// No file provided, handle as regular message
+				success, responseMsg := sendWhatsAppMessage(client, recipient, message, "", "")
+				w.Header().Set("Content-Type", "application/json")
+				if !success {
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: success,
+					Message: responseMsg,
+				})
+				return
+			}
+			defer file.Close()
+
+			// Create temporary file
+			tempFile, err := os.CreateTemp("store", handler.Filename)
+			if err != nil {
+				http.Error(w, "Failed to create temporary file", http.StatusInternalServerError)
+				return
+			}
+			defer os.Remove(tempFile.Name())
+			defer tempFile.Close()
+
+			// Copy file data to temp file
+			_, err = io.Copy(tempFile, file)
+			if err != nil {
+				http.Error(w, "Failed to save file", http.StatusInternalServerError)
+				return
+			}
+
+			// Send message with media
+			success, responseMsg := sendWhatsAppMessage(client, recipient, message, tempFile.Name(), handler.Filename)
+
+			w.Header().Set("Content-Type", "application/json")
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: success,
+				Message: responseMsg,
+			})
+		} else {
+			// Handle regular JSON request
+			var req SendMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "Invalid request format", http.StatusBadRequest)
+				return
+			}
+
+			success, responseMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, "")
+
+			w.Header().Set("Content-Type", "application/json")
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: success,
+				Message: responseMsg,
+			})
 		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
 	})
 
 	// Handler for downloading media
@@ -774,6 +839,47 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for fetching last N messages from a chat
+	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse query parameters: chat_jid (required), limit (optional)
+		chatJID := r.URL.Query().Get("chat_jid")
+		fmt.Printf("chat_jid param: '%s'\n", chatJID)
+		if chatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		// If chatJID does not contain '@', treat as phone number and append suffix
+		if !strings.Contains(chatJID, "@") {
+			chatJID = chatJID + "@s.whatsapp.net"
+			fmt.Printf("chat_jid normalized to: '%s'\n", chatJID)
+		}
+		limit := 10 // default
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 100 {
+				limit = n
+			} else {
+				fmt.Printf("Invalid limit param: '%s', err: %v\n", l, err)
+			}
+		}
+		fmt.Printf("Fetching messages for chat_jid='%s' with limit=%d\n", chatJID, limit)
+
+		messages, err := messageStore.GetMessages(chatJID, limit)
+		if err != nil {
+			http.Error(w, "Failed to fetch messages: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Printf("Fetched %d messages from DB\n", len(messages))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(messages)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +906,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1079,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1094,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
