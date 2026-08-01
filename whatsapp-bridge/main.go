@@ -54,7 +54,13 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// WAL so a reader never blocks on a writer. The Go bridge writes while the
+	// Python MCP server reads the same file, and in rollback-journal mode that
+	// races into "database is locked" — silently returning nothing rather than
+	// erroring loudly. busy_timeout gives contention 5s to resolve instead of
+	// failing on the first attempt.
+	db, err := sql.Open("sqlite3",
+		"file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -89,6 +95,21 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Every read filters by chat_jid and sorts by timestamp DESC, and the only
+	// index was the (id, chat_jid) primary key — so 108k rows were being
+	// scanned and sorted on every list_messages. This is the index the queries
+	// were always asking for.
+	if _, iErr := db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_jid, timestamp DESC)`,
+	); iErr != nil {
+		fmt.Printf("Warning: could not create messages index: %v\n", iErr)
+	}
+	if _, iErr := db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_chats_last_time ON chats(last_message_time DESC)`,
+	); iErr != nil {
+		fmt.Printf("Warning: could not create chats index: %v\n", iErr)
 	}
 
 	// Existing stores predate direct_path. CREATE TABLE IF NOT EXISTS silently
@@ -216,7 +237,17 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, quotedID string, quotedMsg string, quotedSender string, mentions []string) (bool, string) {
+// sendWhatsAppMessage sends, and then RECORDS WHAT IT SENT.
+//
+// The send response was previously discarded into `_`, and nothing was written
+// to the message store. whatsmeow does not echo your own API sends back as
+// events.Message the way the phone's own sends arrive over history sync, so
+// every message sent through this bridge simply did not exist afterwards.
+//
+// That is not cosmetic. On 1 Aug it meant nobody could tell which release
+// notes had already gone out to a tester group, and the only way to find out
+// was to ask a human what they remembered sending.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedID string, quotedMsg string, quotedSender string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -448,13 +479,58 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	// Record it, using the server's own ID and timestamp so this row is
+	// indistinguishable from one that arrived over sync. Best effort: a failed
+	// write must never turn a delivered message into a reported failure — the
+	// message really did send.
+	if messageStore != nil {
+		chatJID := recipientJID.String()
+		ts := resp.Timestamp
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		content := message
+		mediaType, filename := "", ""
+		if mediaPath != "" {
+			filename = filepath.Base(mediaPath)
+			mediaType = detectMediaKind(mediaPath)
+			if content == "" {
+				content = ""
+			}
+		}
+		if cErr := messageStore.StoreChat(chatJID, "", ts); cErr != nil {
+			fmt.Printf("Warning: could not upsert chat on send: %v\n", cErr)
+		}
+		if sErr := messageStore.StoreMessage(
+			resp.ID, chatJID, "me", content, ts, true,
+			mediaType, filename, "", nil, nil, nil, 0, "",
+		); sErr != nil {
+			fmt.Printf("Warning: could not record sent message: %v\n", sErr)
+		}
+	}
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// detectMediaKind mirrors the categories the receive path stores, so a sent
+// image and a received image look the same to every reader.
+func detectMediaKind(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+		return "image"
+	case ".mp4", ".mov", ".avi", ".mkv":
+		return "video"
+	case ".ogg", ".opus", ".m4a", ".mp3", ".wav":
+		return "audio"
+	default:
+		return "document"
+	}
 }
 
 // Extract media info from a message
@@ -825,7 +901,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.QuotedID, req.QuotedMsg, req.QuotedSender, req.Mentions)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.QuotedID, req.QuotedMsg, req.QuotedSender, req.Mentions)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
