@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -46,27 +48,43 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-// Initialize message store
+// Initialize message store using the default "store" directory.
 func NewMessageStore() (*MessageStore, error) {
+	return NewMessageStoreAt("store")
+}
+
+// NewMessageStoreAt initializes the message store in the given directory.
+// Split out from NewMessageStore so tests can point it at a temp directory.
+func NewMessageStoreAt(dir string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// Open SQLite database for messages. WAL journal mode lets the Go bridge
+	// (writer) and the Python MCP server (reader) access the file concurrently
+	// instead of excluding each other, as the default DELETE journal mode does.
+	dbPath := filepath.ToSlash(filepath.Join(dir, "messages.db"))
+	dsn := fmt.Sprintf("file:%s?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL", dbPath)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
+	// Keep the connection pool small: SQLite serializes writers anyway, and
+	// a small pool bounds memory/file-descriptor usage.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	// Create tables (and supporting indices) if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -84,6 +102,9 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_jid, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_message_time ON chats(last_message_time DESC);
 	`)
 	if err != nil {
 		db.Close()
@@ -202,10 +223,87 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// whatsAppSender is the subset of *whatsmeow.Client used by the REST API
+// handlers. Extracting it as an interface lets tests exercise the HTTP and
+// media-validation logic without a real WhatsApp connection.
+type whatsAppSender interface {
+	IsConnected() bool
+	Upload(ctx context.Context, plaintext []byte, appInfo whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	SendMessage(ctx context.Context, to types.JID, message *waProto.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+}
+
+// maxMediaFileSize caps the size of any local file read for outgoing media
+// (F-03/F-02: bound resource usage and file disclosure blast radius).
+const maxMediaFileSize int64 = 64 * 1024 * 1024 // 64 MB
+
+// allowedMediaRoot is the only directory tree that media_path is allowed to
+// reference. It is a package variable (rather than a constant) so tests can
+// point it at a temp directory.
+var allowedMediaRoot = "store"
+
+// resolveMediaPath validates that requestedPath refers to a real, regular
+// file located under root, and returns its cleaned absolute path.
+//
+// It defends against the media_path arbitrary-file-read vulnerability (F-02):
+//   - directory traversal and absolute paths outside root are rejected
+//   - symlinks are rejected (os.Lstat, not os.Stat, so we never follow them)
+//   - non-regular files (devices, sockets, pipes, directories, ...) are rejected
+//   - files larger than maxMediaFileSize are rejected
+func resolveMediaPath(root, requestedPath string) (string, error) {
+	if requestedPath == "" {
+		return "", fmt.Errorf("media path is empty")
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve media root: %w", err)
+	}
+	absRoot = filepath.Clean(absRoot)
+
+	var candidate string
+	if filepath.IsAbs(requestedPath) {
+		candidate = requestedPath
+	} else {
+		candidate = filepath.Join(absRoot, requestedPath)
+	}
+
+	absPath, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve media path: %w", err)
+	}
+	absPath = filepath.Clean(absPath)
+
+	if absPath != absRoot && !strings.HasPrefix(absPath, absRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("media path is outside the allowed directory")
+	}
+
+	// Use Lstat (not Stat) so a symlink is detected instead of followed.
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		return "", fmt.Errorf("media file not accessible: %w", err)
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("media path must not be a symlink")
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("media path must be a regular file")
+	}
+
+	if info.Size() > maxMediaFileSize {
+		return "", fmt.Errorf("media file exceeds maximum allowed size of %d bytes", maxMediaFileSize)
+	}
+
+	return absPath, nil
+}
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client whatsAppSender, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		log.Printf("send message rejected: WhatsApp client is not connected")
+		return false, "internal error"
 	}
 
 	// Create JID for recipient
@@ -219,7 +317,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			log.Printf("failed to parse recipient JID %q: %v", recipient, err)
+			return false, "invalid request"
 		}
 	} else {
 		// Create JID from phone number
@@ -233,14 +332,23 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		// Validate that mediaPath refers to a real, regular file under the
+		// allowed media root before ever touching the filesystem (F-02).
+		resolvedPath, err := resolveMediaPath(allowedMediaRoot, mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			log.Printf("rejected media path %q: %v", mediaPath, err)
+			return false, "invalid request"
+		}
+
+		// Read media file
+		mediaData, err := os.ReadFile(resolvedPath)
+		if err != nil {
+			log.Printf("failed to read media file %q: %v", resolvedPath, err)
+			return false, "internal error"
 		}
 
 		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		fileExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(resolvedPath), "."))
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -285,7 +393,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			log.Printf("failed to upload media: %v", err)
+			return false, "internal error"
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +424,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					log.Printf("failed to analyze Ogg Opus file %q: %v", resolvedPath, err)
+					return false, "invalid request"
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -346,7 +456,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(resolvedPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -365,7 +475,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		log.Printf("failed to send message to %q: %v", recipient, err)
+		return false, "internal error"
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -554,7 +665,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client whatsAppSender, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -641,7 +752,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -675,15 +786,44 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+// maxRequestBodySize bounds REST request bodies to guard against unbounded
+// memory allocation (F-03).
+const maxRequestBodySize = 1 << 20 // 1 MB
+
+// requireAuth wraps a handler with bearer-token authentication (F-01).
+// The comparison is constant-time to avoid leaking the token via timing.
+// A missing/empty token always fails closed (never authorizes requests).
+func requireAuth(token string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+
+		authHeader := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHeader, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		provided := strings.TrimPrefix(authHeader, prefix)
+		if token == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// sendHandler builds the /api/send handler.
+func sendHandler(client whatsAppSender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		// Bound the request body size (F-03)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 
 		// Parse the request body
 		var req SendMessageRequest
@@ -703,11 +843,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -721,15 +859,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}
+}
 
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+// downloadHandler builds the /api/download handler.
+func downloadHandler(client whatsAppSender, messageStore *MessageStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		// Bound the request body size (F-03)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 
 		// Parse the request body
 		var req DownloadMediaRequest
@@ -750,17 +893,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
-		// Handle download result
+		// Handle download result. Only a generic message is sent to the client;
+		// the real error (which may contain raw sql errors or absolute
+		// filesystem paths) is only ever logged server-side (F-07).
 		if !success || err != nil {
-			errMsg := "Unknown error"
 			if err != nil {
-				errMsg = err.Error()
+				log.Printf("download media failed (message=%s chat=%s): %v", req.MessageID, req.ChatJID, err)
 			}
 
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
 				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
+				Message: "internal error",
 			})
 			return
 		}
@@ -772,18 +916,50 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}
+}
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+// buildRESTMux wires up the REST API routes behind bearer-token auth.
+// Split out from startRESTServer so tests can drive the handlers directly
+// with httptest, without binding a real network listener.
+func buildRESTMux(client whatsAppSender, messageStore *MessageStore, token string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/send", requireAuth(token, sendHandler(client)))
+	mux.HandleFunc("/api/download", requireAuth(token, downloadHandler(client, messageStore)))
+	return mux
+}
+
+// Start a REST API server to expose the WhatsApp client functionality.
+//
+// Fails closed (F-01): if token is empty, the server is never started and an
+// error is returned so the caller can abort startup instead of silently
+// exposing an unauthenticated API.
+func startRESTServer(client whatsAppSender, messageStore *MessageStore, addr string, token string) error {
+	if token == "" {
+		return fmt.Errorf("WHATSAPP_BRIDGE_TOKEN is not set; refusing to start REST API server without authentication")
+	}
+
+	mux := buildRESTMux(client, messageStore, token)
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	fmt.Printf("Starting REST API server on %s...\n", addr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+
+	return nil
 }
 
 func main() {
@@ -800,14 +976,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -905,8 +1081,17 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server. Bind address is configurable via
+	// WHATSAPP_BRIDGE_ADDR (default ":8080"); the auth token is required via
+	// WHATSAPP_BRIDGE_TOKEN and the server refuses to start without it.
+	restAddr := os.Getenv("WHATSAPP_BRIDGE_ADDR")
+	if restAddr == "" {
+		restAddr = ":8080"
+	}
+	if err := startRESTServer(client, messageStore, restAddr, os.Getenv("WHATSAPP_BRIDGE_TOKEN")); err != nil {
+		logger.Errorf("Failed to start REST API server: %v", err)
+		return
+	}
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1158,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1173,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

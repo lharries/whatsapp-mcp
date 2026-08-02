@@ -1,0 +1,113 @@
+services:
+  whatsapp-bridge:
+    build: .
+    image: whatsapp-mcp:latest
+    container_name: whatsapp-bridge
+    command: ["bridge"]
+    environment:
+      WHATSAPP_BRIDGE_TOKEN: ${WHATSAPP_BRIDGE_TOKEN:?Set WHATSAPP_BRIDGE_TOKEN in .env - see .env.example}
+    # No `ports:` here on purpose. The bridge's REST API has no business
+    # being reachable from the LAN; whatsapp-mcp reaches it over the
+    # internal compose network at http://whatsapp-bridge:8080. Publishing
+    # this port to 0.0.0.0 is exactly the finding a pentest confirmed as
+    # exploitable (arbitrary WhatsApp send + arbitrary file read from any
+    # host on the LAN) - do not reintroduce it.
+    volumes:
+      - whatsapp-store:/app/whatsapp-bridge/store
+    restart: unless-stopped
+    # Needed only here: first-login QR code is printed to the bridge's tty.
+    stdin_open: true
+    tty: true
+    init: true
+    mem_limit: 1g
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # No /health endpoint exists on the bridge. Any HTTP response (this
+      # route fails auth with 401 when no token is sent) proves the REST
+      # listener is up; a refused/timed-out connection means it is not.
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - |
+          import sys, urllib.request, urllib.error
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8080/api/send", timeout=3)
+          except urllib.error.HTTPError as e:
+              sys.exit(0 if e.code == 401 else 1)
+          except Exception:
+              sys.exit(1)
+          sys.exit(1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  whatsapp-mcp:
+    build: .
+    image: whatsapp-mcp:latest
+    container_name: whatsapp-mcp
+    command: ["mcp"]
+    depends_on:
+      whatsapp-bridge:
+        condition: service_healthy
+    environment:
+      WHATSAPP_BRIDGE_TOKEN: ${WHATSAPP_BRIDGE_TOKEN:?Set WHATSAPP_BRIDGE_TOKEN in .env - see .env.example}
+    # Loopback-only, never `8081:8081`. The MCP endpoint (/mcp) has no
+    # authentication of its own - FastMCP's allowed_hosts is only an
+    # anti-DNS-rebinding check, not access control. The bind to 127.0.0.1
+    # plus an SSH tunnel from the client is the *only* access barrier for
+    # every WhatsApp message and the ability to send as the logged-in user.
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - whatsapp-store:/app/whatsapp-bridge/store
+    restart: unless-stopped
+    init: true
+    mem_limit: 512m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - |
+          import sys, urllib.request, urllib.error
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8081/mcp", timeout=3)
+          except urllib.error.HTTPError as e:
+              sys.exit(0 if e.code in (400, 406) else 1)
+          except Exception:
+              sys.exit(1)
+          sys.exit(1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  whatsapp-store:

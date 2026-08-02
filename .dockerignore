@@ -1,0 +1,8 @@
+.git
+whatsapp-bridge/store
+example-use.png
+README.md
+.env
+.env.example
+whatsapp-mcp-server/.venv
+whatsapp-mcp-server/tests
