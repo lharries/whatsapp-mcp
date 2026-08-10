@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +25,9 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	qrcode "github.com/skip2/go-qrcode"
+
+	"encoding/base64"
 
 	"bytes"
 
@@ -39,6 +43,30 @@ import (
 // processStartTime marks when the bridge process came up; surfaced by /health
 // so the watchdog (and humans) can see real uptime, not just "port is bound".
 var processStartTime = time.Now()
+
+// Pairing state shared between the QR pairing loop and GET /api/qr, so the
+// Cave app (or any local client) can render the current QR code in-app instead
+// of the operator digging it out of stdout. Guarded by pairMu; cleared on
+// pairing success so a paired bridge never serves a stale code.
+var (
+	pairMu     sync.Mutex
+	pairQRCode string
+	pairQRAt   time.Time
+)
+
+func setPairQR(code string) {
+	pairMu.Lock()
+	pairQRCode = code
+	pairQRAt = time.Now()
+	pairMu.Unlock()
+}
+
+func clearPairQR() {
+	pairMu.Lock()
+	pairQRCode = ""
+	pairQRAt = time.Time{}
+	pairMu.Unlock()
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -1224,6 +1252,37 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// not merely holding the port. The watchdog launchd agent probes this; if it
 	// stops returning 200 (the "port held but socket dead" wedge), the watchdog
 	// force-restarts the process via `launchctl kickstart -k`.
+	// GET /api/qr — current pairing state for in-app QR rendering (Cave app's
+	// Link-conversation setup step). While unpaired the pairing loop keeps a
+	// fresh code here; once logged in the code fields go empty and logged_in
+	// flips true, which is the client's signal to proceed.
+	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		pairMu.Lock()
+		code := pairQRCode
+		at := pairQRAt
+		pairMu.Unlock()
+
+		loggedIn := client.IsLoggedIn()
+		resp := map[string]interface{}{
+			"logged_in": loggedIn,
+			"connected": client.IsConnected(),
+			"qr_code":   "",
+			"qr_png":    "",
+		}
+		if !loggedIn && code != "" {
+			resp["qr_code"] = code
+			resp["qr_generated_at"] = at.Format(time.RFC3339)
+			// PNG as a data URL so clients can <img src> it without their own
+			// QR encoder. Failure to encode degrades to the raw code string.
+			if png, err := qrcode.Encode(code, qrcode.Medium, 512); err == nil {
+				resp["qr_png"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1278,6 +1337,55 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			os.Exit(1)
 		}
 	}()
+}
+
+// runPairingLoop drives QR pairing until it succeeds, publishing each fresh
+// code to the shared pair state (for /api/qr) AND printing it to stdout (the
+// pre-existing terminal flow, kept for operators pairing over SSH). Returns
+// true once paired, false only on unrecoverable client errors.
+func runPairingLoop(client *whatsmeow.Client, logger waLog.Logger) bool {
+	defer clearPairQR()
+	for attempt := 1; ; attempt++ {
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			// Store gained an ID between cycles (paired via another path).
+			if client.Store.ID != nil {
+				return client.IsConnected() || client.Connect() == nil
+			}
+			logger.Errorf("Failed to get QR channel (attempt %d): %v", attempt, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if err := client.Connect(); err != nil {
+			logger.Errorf("Failed to connect for pairing (attempt %d): %v", attempt, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		success := false
+		for evt := range qrChan {
+			switch evt.Event {
+			case "code":
+				setPairQR(evt.Code)
+				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			case "success":
+				success = true
+			default:
+				// "timeout" / transient errors — channel is about to close;
+				// the outer loop starts a fresh cycle.
+			}
+		}
+		clearPairQR()
+
+		if success {
+			fmt.Println("\nSuccessfully connected and authenticated!")
+			return true
+		}
+		client.Disconnect()
+		logger.Warnf("QR pairing cycle %d ended without a scan — starting a fresh cycle", attempt)
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func main() {
@@ -1347,36 +1455,28 @@ func main() {
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start the REST API server BEFORE pairing so GET /api/qr (and /health) are
+	// reachable while the bridge is still unpaired — that's what lets the Cave
+	// app render the QR code in-app instead of the operator reading stdout.
+	// Handlers degrade gracefully pre-login (sends error, /health reports
+	// logged_in:false), so serving early is safe.
+	port := 8080
+	if raw := os.Getenv("WHATSAPP_BRIDGE_PORT"); raw != "" {
+		if p, perr := strconv.Atoi(raw); perr == nil && p > 0 && p < 65536 {
+			port = p
+		} else {
+			logger.Warnf("Ignoring invalid WHATSAPP_BRIDGE_PORT=%q, using %d", raw, port)
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+		// No ID stored — pair with phone. Loop forever: each whatsmeow QR
+		// cycle lasts ~3 minutes then closes its channel; instead of dying
+		// (the old behavior), disconnect and start a fresh cycle so /api/qr
+		// always has a scannable code however long the user takes.
+		if !runPairingLoop(client, logger) {
 			return
 		}
 	} else {
@@ -1386,7 +1486,6 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -1398,9 +1497,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

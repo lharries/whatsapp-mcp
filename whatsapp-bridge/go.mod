@@ -19,6 +19,7 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/petermattis/goid v0.0.0-20260330135022-df67b199bc81 // indirect
 	github.com/rs/zerolog v1.35.1 // indirect
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e // indirect
 	github.com/vektah/gqlparser/v2 v2.5.33 // indirect
 	go.mau.fi/libsignal v0.2.1 // indirect
 	go.mau.fi/util v0.9.8 // indirect
