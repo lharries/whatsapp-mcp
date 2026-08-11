@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    mark_messages_read as whatsapp_mark_messages_read,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -178,6 +179,35 @@ def send_message(
     
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def mark_messages_read(
+    message_ids: List[str],
+    chat_jid: str,
+    sender_jid: Optional[str] = None,
+    timestamp: Optional[str] = None
+) -> Dict[str, Any]:
+    """Mark one or more WhatsApp messages as read and send read receipts.
+
+    Args:
+        message_ids: IDs of messages to mark as read
+        chat_jid: JID of the chat containing the messages
+        sender_jid: Optional sender JID, required for some group messages
+        timestamp: Optional RFC3339 read timestamp; defaults to the current time
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_mark_messages_read(
+        message_ids=message_ids,
+        chat_jid=chat_jid,
+        sender_jid=sender_jid,
+        timestamp=timestamp
+    )
     return {
         "success": success,
         "message": status_message
