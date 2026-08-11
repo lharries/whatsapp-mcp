@@ -821,7 +821,12 @@ func main() {
 	}
 
 	// Set a clear device name shown under WhatsApp > Linked Devices
-	deviceName := "WhatsApp MCP (Mac)"
+	// Name shown under WhatsApp > Linked devices. Override with WA_DEVICE_NAME
+	// to tell several bridges apart, or to note the host they run on.
+	deviceName := os.Getenv("WA_DEVICE_NAME")
+	if deviceName == "" {
+		deviceName = "WhatsApp MCP"
+	}
 	waStore.DeviceProps.Os = &deviceName
 
 	// Create client instance
