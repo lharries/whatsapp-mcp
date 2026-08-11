@@ -194,9 +194,9 @@ def mark_messages_read(
     """Mark one or more WhatsApp messages as read and send read receipts.
 
     Args:
-        message_ids: IDs of messages to mark as read
+        message_ids: IDs of messages from the same chat and sender to mark as read
         chat_jid: JID of the chat containing the messages
-        sender_jid: Optional sender JID, required for some group messages
+        sender_jid: Sender JID; required for group messages
         timestamp: Optional RFC3339 read timestamp; defaults to the current time
 
     Returns:

@@ -228,6 +228,9 @@ func markWhatsAppMessagesRead(client *whatsmeow.Client, request MarkReadRequest)
 			return false, fmt.Sprintf("Error parsing sender JID: %v", err)
 		}
 	}
+	if chatJID.Server == types.GroupServer && senderJID.IsEmpty() {
+		return false, "Sender JID is required for group messages"
+	}
 
 	readAt := time.Now()
 	if request.Timestamp != "" {

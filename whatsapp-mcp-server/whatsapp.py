@@ -662,6 +662,8 @@ def mark_messages_read(
             return False, "At least one non-empty message ID must be provided"
         if not chat_jid:
             return False, "Chat JID must be provided"
+        if chat_jid.endswith("@g.us") and not sender_jid:
+            return False, "Sender JID is required for group messages"
 
         payload = {
             "message_ids": message_ids,
