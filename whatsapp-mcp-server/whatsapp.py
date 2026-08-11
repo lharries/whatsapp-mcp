@@ -650,6 +650,41 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def mark_messages_read(
+    message_ids: List[str],
+    chat_jid: str,
+    sender_jid: Optional[str] = None,
+    timestamp: Optional[str] = None
+) -> Tuple[bool, str]:
+    """Mark messages as read and send WhatsApp read receipts."""
+    try:
+        if not message_ids or any(not message_id for message_id in message_ids):
+            return False, "At least one non-empty message ID must be provided"
+        if not chat_jid:
+            return False, "Chat JID must be provided"
+
+        payload = {
+            "message_ids": message_ids,
+            "chat_jid": chat_jid,
+        }
+        if sender_jid:
+            payload["sender_jid"] = sender_jid
+        if timestamp:
+            payload["timestamp"] = timestamp
+
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/mark-read", json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input

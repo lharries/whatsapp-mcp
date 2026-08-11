@@ -202,6 +202,55 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// MarkReadRequest represents the request body for the mark read API.
+type MarkReadRequest struct {
+	MessageIDs []string `json:"message_ids"`
+	ChatJID    string   `json:"chat_jid"`
+	SenderJID  string   `json:"sender_jid,omitempty"`
+	Timestamp  string   `json:"timestamp,omitempty"`
+}
+
+// Function to mark WhatsApp messages as read and send the corresponding receipt.
+func markWhatsAppMessagesRead(client *whatsmeow.Client, request MarkReadRequest) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	chatJID, err := types.ParseJID(request.ChatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing chat JID: %v", err)
+	}
+
+	var senderJID types.JID
+	if request.SenderJID != "" {
+		senderJID, err = types.ParseJID(request.SenderJID)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing sender JID: %v", err)
+		}
+	}
+
+	readAt := time.Now()
+	if request.Timestamp != "" {
+		readAt, err = time.Parse(time.RFC3339, request.Timestamp)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing timestamp: %v", err)
+		}
+	}
+
+	messageIDs := make([]types.MessageID, len(request.MessageIDs))
+	for index, messageID := range request.MessageIDs {
+		if messageID == "" {
+			return false, "Message IDs must not contain empty values"
+		}
+		messageIDs[index] = types.MessageID(messageID)
+	}
+
+	if err := client.MarkRead(messageIDs, readAt, chatJID, senderJID); err != nil {
+		return false, fmt.Sprintf("Error marking messages as read: %v", err)
+	}
+	return true, "Messages marked as read"
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -677,6 +726,34 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler for sending read receipts.
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			http.Error(w, "Chat JID and at least one message ID are required", http.StatusBadRequest)
+			return
+		}
+
+		success, message := markWhatsAppMessagesRead(client, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
