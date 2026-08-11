@@ -1,3 +1,9 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Compiled bridge binary (~28 MB)
+whatsapp-bridge/whatsapp-bridge-bin
+
+# Local WhatsApp session, message snapshot and downloaded media
+whatsapp-bridge/store/
