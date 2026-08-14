@@ -932,10 +932,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		// Allow sender_jid to be passed as just a phone number without server suffix
+		// Allow sender_jid to be passed as just a bare number without a server suffix.
+		// A bare number is ambiguous: it may be a phone number (@s.whatsapp.net) or a
+		// privacy LID (@lid) — WhatsApp now identifies many group participants by LID,
+		// and the poll's message secret is stored under whichever JID form the sender
+		// actually used, so guessing wrong here means the vote can't be encrypted.
 		senderJIDStr := req.SenderJID
 		if !strings.Contains(senderJIDStr, "@") {
-			senderJIDStr = senderJIDStr + "@s.whatsapp.net"
+			lidJID := types.NewJID(senderJIDStr, types.HiddenUserServer)
+			if pn, lidErr := client.Store.LIDs.GetPNForLID(context.Background(), lidJID); lidErr == nil && !pn.IsEmpty() {
+				senderJIDStr = lidJID.String()
+			} else {
+				senderJIDStr = senderJIDStr + "@" + types.DefaultUserServer
+			}
 		}
 		senderJID, err := types.ParseJID(senderJIDStr)
 		if err != nil {
