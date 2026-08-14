@@ -8,7 +8,8 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+DEVICE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+WHATSAPP_API_BASE_URL = "http://localhost:8081/api"
 
 @dataclass
 class Message:
@@ -102,7 +103,11 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        if message.media_type == "poll":
+            # Poll content already contains "[Poll] ..." — no extra prefix needed
+            content_prefix = f"[Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        else:
+            content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
@@ -164,12 +169,35 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+            sender_variants = [sender_phone_number]
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (sender_phone_number,)).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    sender_variants.append(str(lid_row[0]))
+            except sqlite3.Error:
+                pass
+            placeholders = ",".join("?" * len(sender_variants))
+            where_clauses.append(f"messages.sender IN ({placeholders})")
+            params.extend(sender_variants)
             
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            jid_variants = [chat_jid]
+            # If this is a phone JID, also query the LID variant (WhatsApp migrates direct chats to LIDs)
+            if chat_jid.endswith("@s.whatsapp.net"):
+                phone = chat_jid.split("@")[0]
+                try:
+                    dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                    lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+                    dev_conn.close()
+                    if lid_row:
+                        jid_variants.append(f"{lid_row[0]}@lid")
+                except sqlite3.Error:
+                    pass
+            placeholders = ",".join("?" * len(jid_variants))
+            where_clauses.append(f"messages.chat_jid IN ({placeholders})")
+            params.extend(jid_variants)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -393,43 +421,103 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
+        search_pattern = '%' + query + '%'
+        seen_jids = set()
+        result = []
+
+        # Search whatsmeow_contacts (all known contacts, including those with no direct chat)
+        try:
+            dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+            rows = dev_conn.execute("""
+                SELECT their_jid, full_name, push_name
+                FROM whatsmeow_contacts
+                WHERE their_jid NOT LIKE '%@g.us'
+                  AND (LOWER(full_name) LIKE LOWER(?)
+                    OR LOWER(push_name) LIKE LOWER(?)
+                    OR LOWER(their_jid) LIKE LOWER(?))
+                ORDER BY full_name, their_jid
+                LIMIT 50
+            """, (search_pattern, search_pattern, search_pattern)).fetchall()
+            dev_conn.close()
+            for jid, full_name, push_name in rows:
+                if jid not in seen_jids:
+                    seen_jids.add(jid)
+                    result.append(Contact(
+                        phone_number=jid.split('@')[0],
+                        name=full_name or push_name,
+                        jid=jid
+                    ))
+        except sqlite3.Error:
+            pass
+
+        # Also search chats table (catches contacts whose name is only in chat history)
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            SELECT DISTINCT jid, name FROM chats
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+              AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
+        for jid, name in cursor.fetchall():
+            if jid not in seen_jids:
+                seen_jids.add(jid)
+                result.append(Contact(phone_number=jid.split('@')[0], name=name, jid=jid))
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
             conn.close()
+
+
+def get_contact_groups(jid: str) -> List[dict]:
+    """Find groups the contact has sent messages in, using message history."""
+    # Resolve sender identifiers: phone JID and LID variant
+    sender_variants = []
+    if jid.endswith("@s.whatsapp.net"):
+        phone = jid.split("@")[0]
+        sender_variants.append(phone)
+        try:
+            dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+            lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+            dev_conn.close()
+            if lid_row:
+                sender_variants.append(str(lid_row[0]))
+        except sqlite3.Error:
+            pass
+    else:
+        sender_variants.append(jid.split("@")[0])
+
+    if not sender_variants:
+        return []
+
+    phone = sender_variants[0]  # always the phone number
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        placeholders = ",".join("?" * len(sender_variants))
+        # Match exact sender (phone or LID) OR old-format group sender (phone-timestamp)
+        rows = conn.execute(f"""
+            SELECT DISTINCT
+                c.jid,
+                c.name,
+                MAX(m.timestamp) as last_active
+            FROM chats c
+            JOIN messages m ON c.jid = m.chat_jid
+            WHERE c.jid LIKE '%@g.us'
+              AND (m.sender IN ({placeholders}) OR m.sender LIKE ?)
+            GROUP BY c.jid, c.name
+            ORDER BY last_active DESC
+        """, sender_variants + [f"{phone}-%"]).fetchall()
+        conn.close()
+        return [{"jid": r[0], "name": r[1], "last_message": r[2]} for r in rows]
+    except sqlite3.Error as e:
+        return [{"error": str(e)}]
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
@@ -443,8 +531,32 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
+
+        # Build sender variants: phone number (from JID) + LID
+        sender_variants = []
+        jid_variants = [jid]
+        if jid.endswith("@s.whatsapp.net"):
+            phone = jid.split("@")[0]
+            sender_variants.append(phone)
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute(
+                    "SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)
+                ).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    sender_variants.append(str(lid_row[0]))
+                    jid_variants.append(f"{lid_row[0]}@lid")
+            except sqlite3.Error:
+                pass
+        else:
+            sender_variants.append(jid.split("@")[0])
+
+        sender_placeholders = ",".join("?" * len(sender_variants))
+        jid_placeholders = ",".join("?" * len(jid_variants))
+        phone_prefix = sender_variants[0] if sender_variants else ""
+
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -454,11 +566,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({sender_placeholders})
+               OR c.jid IN ({jid_placeholders})
+               OR c.jid LIKE ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
-        
+        """, sender_variants + jid_variants + [f"{phone_prefix}-%", limit, page * limit])
+
         chats = cursor.fetchall()
         
         result = []
@@ -489,8 +603,20 @@ def get_last_interaction(jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        jid_variants = [jid]
+        if jid.endswith("@s.whatsapp.net"):
+            phone = jid.split("@")[0]
+            try:
+                dev_conn = sqlite3.connect(DEVICE_DB_PATH)
+                lid_row = dev_conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+                dev_conn.close()
+                if lid_row:
+                    jid_variants.append(f"{lid_row[0]}@lid")
+            except sqlite3.Error:
+                pass
+        placeholders = ",".join("?" * len(jid_variants))
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -501,10 +627,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, jid_variants + jid_variants)
         
         msg_data = cursor.fetchone()
         
@@ -578,6 +704,45 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
     finally:
         if 'conn' in locals():
             conn.close()
+
+
+def get_group_info(group_jid: str) -> dict:
+    """Get group info including members and admins via the WhatsApp bridge API."""
+    response = requests.get(f"{WHATSAPP_API_BASE_URL}/group-info", params={"jid": group_jid})
+    if not response.ok:
+        return {"error": f"Error fetching group info: {response.text}"}
+
+    data = response.json()
+
+    # Build LID -> phone -> name resolution map from the device store
+    lid_to_info = {}
+    try:
+        conn = sqlite3.connect(DEVICE_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT m.lid, m.pn, c.full_name, c.push_name
+            FROM whatsmeow_lid_map m
+            LEFT JOIN whatsmeow_contacts c ON c.their_jid = m.pn || '@s.whatsapp.net'
+        """)
+        for lid, pn, full_name, push_name in cursor.fetchall():
+            lid_to_info[str(lid)] = {
+                "phone": pn,
+                "name": full_name or push_name or None,
+            }
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+    # Annotate each member with resolved phone/name
+    for member in data.get("members", []):
+        raw_jid = member.get("jid", "")
+        lid = raw_jid.split("@")[0]
+        info = lid_to_info.get(lid)
+        if info:
+            member["phone"] = info["phone"]
+            member["name"] = info["name"]
+
+    return data
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
@@ -724,6 +889,35 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def vote_poll(chat_jid: str, message_id: str, sender_jid: str, option_names: List[str], is_from_me: bool = False) -> Tuple[bool, str]:
+    try:
+        if not chat_jid or not message_id or not sender_jid:
+            return False, "chat_jid, message_id, and sender_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/vote-poll"
+        payload = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "sender_jid": sender_jid,
+            "option_names": option_names,
+            "is_from_me": is_from_me,
+        }
+
+        response = requests.post(url, json=payload)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
     
@@ -762,6 +956,50 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except json.JSONDecodeError:
         print(f"Error parsing response: {response.text}")
         return None
+
+
+def get_poll_results(message_id: str, chat_jid: str) -> str:
+    """Get the current vote tally for a poll message.
+
+    Args:
+        message_id: The ID of the poll creation message
+        chat_jid: The JID of the chat containing the poll
+
+    Returns:
+        Formatted string with poll question, options, and vote counts
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/poll-results"
+        response = requests.get(url, params={"message_id": message_id, "chat_jid": chat_jid})
+
+        if response.status_code == 404:
+            return "Poll not found. Make sure the message_id and chat_jid are correct and the poll was received while the bridge was running."
+
+        if response.status_code != 200:
+            return f"Error fetching poll results: HTTP {response.status_code} - {response.text}"
+
+        data = response.json()
+        poll_name = data.get("poll_name", "Unknown poll")
+        options = data.get("options", [])
+        total_voters = data.get("total_voters", 0)
+
+        lines = [f"Poll: {poll_name}"]
+        max_votes = max((o["votes"] for o in options), default=1) or 1
+        bar_width = 10
+        for opt in options:
+            filled = round(opt["votes"] / max_votes * bar_width)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            voters_str = ", ".join(opt["voters"]) if opt["voters"] else "no votes"
+            vote_word = "vote" if opt["votes"] == 1 else "votes"
+            lines.append(f"  {opt['name']} {bar} {opt['votes']} {vote_word} ({voters_str})")
+
+        lines.append(f"{total_voters} {'person' if total_voters == 1 else 'people'} responded.")
+        return "\n".join(lines)
+
+    except requests.RequestException as e:
+        return f"Request error: {str(e)}"
+    except (json.JSONDecodeError, KeyError) as e:
+        return f"Error parsing response: {str(e)}"
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None

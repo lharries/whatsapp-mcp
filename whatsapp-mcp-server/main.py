@@ -5,14 +5,18 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
     get_chat as whatsapp_get_chat,
+    get_group_info as whatsapp_get_group_info,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
+    get_contact_groups as whatsapp_get_contact_groups,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_poll_results as whatsapp_get_poll_results,
+    vote_poll as whatsapp_vote_poll,
 )
 
 # Initialize FastMCP server
@@ -107,6 +111,15 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
     return chat
 
 @mcp.tool()
+def get_group_info(group_jid: str) -> Dict[str, Any]:
+    """Get WhatsApp group info including name, description, and full member list with admin status.
+
+    Args:
+        group_jid: The JID of the group (e.g. "123456789@g.us")
+    """
+    return whatsapp_get_group_info(group_jid)
+
+@mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
     
@@ -127,6 +140,15 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
     return chats
+
+@mcp.tool()
+def get_contact_groups(jid: str) -> List[Dict[str, Any]]:
+    """Get all WhatsApp groups a contact has sent messages in, based on message history.
+
+    Args:
+        jid: The contact's JID (e.g. "447837537557@s.whatsapp.net")
+    """
+    return whatsapp_get_contact_groups(jid)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -222,6 +244,36 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     }
 
 @mcp.tool()
+def send_poll_vote(
+    chat_jid: str,
+    message_id: str,
+    sender_jid: str,
+    option_names: List[str],
+    is_from_me: bool = False,
+) -> Dict[str, Any]:
+    """Vote in a WhatsApp poll, or retract a previous vote. Use list_messages to find polls — they appear as "[Poll] question | Options: ..." in message content.
+
+    Args:
+        chat_jid: The JID of the chat containing the poll (e.g. "123456789@g.us" or "123456789@s.whatsapp.net")
+        message_id: The ID of the poll creation message (from list_messages)
+        sender_jid: The JID of the user who created the poll (e.g. "447837537557@s.whatsapp.net" or just "447837537557")
+        option_names: List of option name strings to vote for — must match the poll option text exactly.
+                      Pass an empty list [] to retract a previously cast vote.
+        is_from_me: Set to True if the poll was created by you (default False)
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_vote_poll(
+        chat_jid=chat_jid,
+        message_id=message_id,
+        sender_jid=sender_jid,
+        option_names=option_names,
+        is_from_me=is_from_me,
+    )
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
     
@@ -246,6 +298,60 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+@mcp.tool()
+def get_poll_results(message_id: str, chat_jid: str) -> str:
+    """Get the current vote tally for a WhatsApp poll.
+
+    Use the message_id from a poll message (media_type='poll') shown by list_messages.
+    Returns the poll question, each option with a vote bar and list of voters, and total respondents.
+
+    Note: only votes received while the bridge was running are counted —
+    votes from before the bridge started cannot be decrypted.
+
+    Args:
+        message_id: The ID of the poll creation message
+        chat_jid: The JID of the chat containing the poll
+    """
+    return whatsapp_get_poll_results(message_id, chat_jid)
+
+
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import argparse
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.routing import Mount, Route
+
+    from auth import (
+        BearerAuthMiddleware,
+        authorize_get,
+        authorize_post,
+        health,
+        oauth_metadata,
+        protected_resource_metadata,
+        token_endpoint,
+    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run as HTTP/SSE server (default: stdio)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+    args = parser.parse_args()
+
+    if args.http:
+        app = Starlette(
+            routes=[
+                Route("/authorize", endpoint=authorize_get, methods=["GET"]),
+                Route("/authorize", endpoint=authorize_post, methods=["POST"]),
+                Route("/oauth/token", endpoint=token_endpoint, methods=["POST"]),
+                Route("/.well-known/oauth-authorization-server", endpoint=oauth_metadata),
+                Route("/.well-known/openid-configuration", endpoint=oauth_metadata),
+                Route("/.well-known/oauth-protected-resource", endpoint=protected_resource_metadata),
+                Route("/health", endpoint=health),
+                Mount("/", app=mcp.sse_app()),
+            ],
+            middleware=[Middleware(BearerAuthMiddleware)],
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        mcp.run(transport='stdio')
