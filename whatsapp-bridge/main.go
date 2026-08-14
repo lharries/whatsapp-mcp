@@ -276,10 +276,42 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+
+		// Anything else: fall back to a generic document, sniffing the content
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			mimeType = http.DetectContentType(mediaData)
 		}
 
 		// Upload media to WhatsApp servers
@@ -345,8 +377,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			// filepath.Base handles both / and \ separators (Windows paths included),
+			// so the document keeps its real name and extension instead of the full path.
+			docName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(docName),
+				FileName:      proto.String(docName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
