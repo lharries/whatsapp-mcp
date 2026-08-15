@@ -44,6 +44,14 @@ Here's an example of what you can do when it's connected to Claude.
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
+   **Linking without scanning a QR (headless / remote):** set `WHATSAPP_PAIR_PHONE` to your number (country code, digits only) before starting the bridge. Instead of a QR it prints an 8-char code (`PAIR_CODE:...`) which you enter in WhatsApp via **Linked Devices → Link a device → "Link with phone number instead"**:
+
+   ```bash
+   WHATSAPP_PAIR_PHONE=491701234567 go run main.go
+   ```
+
+   The bridge also prints the raw QR payload as `QR_CODE_RAW:<code>` so tooling can render the QR itself (e.g. as an image) rather than relying on the terminal output.
+
    After approximately 20 days, you will might need to re-authenticate.
 
 3. **Connect to the MCP server**
@@ -83,6 +91,38 @@ Here's an example of what you can do when it's connected to Claude.
    Open Claude Desktop and you should now see WhatsApp as an available integration.
 
    Or restart Cursor.
+
+### Running the bridge as a background service (macOS)
+
+Instead of keeping `go run .` open in a terminal, you can run the bridge as a
+`launchd` LaunchAgent so it starts at login and restarts if it crashes.
+
+```bash
+cd whatsapp-bridge
+go build -o whatsapp-bridge .          # compile the binary once
+
+# edit the example: replace /ABSOLUTE/PATH/TO with this repo's path
+cp com.whatsapp-mcp.bridge.plist.example ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+$EDITOR ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+```
+
+Manage it with:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.whatsapp-mcp.bridge   # restart (e.g. after rebuilding)
+launchctl bootout     gui/$(id -u)/com.whatsapp-mcp.bridge    # stop / uninstall
+tail -f ~/Library/Logs/whatsapp-mcp-bridge.log                # logs
+```
+
+> **Note:** the bridge logs full message content to its log file. Keep the log
+> inside your home directory (as the example plist does) — a log in `/tmp`
+> would be readable by every user on the machine.
+
+Link WhatsApp once via a manual `go run .` (scan the QR) before relying on the
+service; it then reconnects automatically with the saved session. If the device
+is unlinked later, the log will show a QR prompt and you'll need to re-link.
 
 ### Windows Compatibility
 

@@ -1,3 +1,8 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+# agent-deck writes local MCP config here
+.mcp.json
+
+# compiled bridge binary
+whatsapp-bridge/whatsapp-bridge

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent to run the WhatsApp bridge in the background.
+
+  Setup:
+    1. Build the binary:  cd whatsapp-bridge && go build -o whatsapp-bridge .
+    2. Replace /ABSOLUTE/PATH/TO below with the absolute path to this repo's
+       whatsapp-bridge directory (launchd does NOT expand ~ or $HOME).
+    3. Copy to ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+    4. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+
+  Link WhatsApp once (scan the QR from a manual `go run .`) before relying on
+  the service; it then reconnects automatically with the saved session.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp-mcp.bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge</string>
+    </array>
+
+    <!-- Bridge writes to ./store/, so run from its own directory. -->
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/whatsapp-mcp/whatsapp-bridge</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits (crash, network drop). -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts so a broken session can't spin the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- The bridge logs full message content to stdout. Keep the log in your
+         home directory (0700 by default), NOT /tmp, where it would be readable
+         by every user on the machine. launchd does not expand ~, so replace
+         /ABSOLUTE/HOME with your home directory (e.g. /Users/yourname). -->
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/HOME/Library/Logs/whatsapp-mcp-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/HOME/Library/Logs/whatsapp-mcp-bridge.log</string>
+</dict>
+</plist>
