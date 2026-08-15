@@ -1,3 +1,7 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [project]
 name = "whatsapp-mcp-server"
 version = "0.1.0"
@@ -8,4 +12,9 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
 ]

@@ -119,6 +119,7 @@ This application consists of two main components:
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
+- The MCP server reads `whatsapp-bridge/store/messages.db` by default; set `WHATSAPP_MESSAGES_DB` to point it at a different SQLite file
 
 ## Usage
 
@@ -140,6 +141,54 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+
+### Restricting access to specific chats (whitelist)
+
+By default the MCP server can read from and send to **any** chat in the local
+database. To limit Claude to a chosen set of conversations, add a whitelist.
+
+The easiest way is the `whitelist_cli.py` helper (bridge must have synced):
+
+```bash
+cd whatsapp-mcp-server
+uv run python whitelist_cli.py chats            # list chats; [✓] = whitelisted
+uv run python whitelist_cli.py add "family"     # search by name, confirm, add
+uv run python whitelist_cli.py list             # show the current whitelist
+uv run python whitelist_cli.py remove "family"  # remove a chat
+```
+
+`add` searches chat names and, on a single match, asks to confirm (use `-y` to
+skip). This writes `whitelist.json` for you.
+
+Prefer to edit by hand? Copy `whitelist.example.json` to `whitelist.json` and
+list the JIDs directly (individual chats end in `@s.whatsapp.net`, groups in
+`@g.us`); run `uv run python whitelist_cli.py chats` to discover them.
+
+Either way, changes take effect immediately — the server re-reads
+`whitelist.json` on every request; no restart needed.
+
+Once `whitelist.json` exists, every read tool returns results **only** from
+whitelisted chats, and every send/download is refused for non-whitelisted
+recipients. The path can be overridden with the `WHATSAPP_WHITELIST_PATH`
+environment variable.
+
+**Opt-in, then fail closed.** The whitelist is *active* when either
+`whitelist.json` exists at the default path or `WHATSAPP_WHITELIST_PATH` is set:
+
+- **Not active** (no file, no env var) → access is unrestricted, exactly as
+  before this feature existed.
+- **Active** → enforcement applies, and if the whitelist is empty or malformed
+  it denies **everything** rather than silently opening up. So while it's
+  active, deleting or breaking the file locks access down; it never widens it.
+
+To restrict access, create `whitelist.json`. To return to unrestricted access,
+delete `whitelist.json` **and** unset `WHATSAPP_WHITELIST_PATH`. `whitelist.json`
+is gitignored so your private JIDs are never committed.
+
+> **Note:** the whitelist is enforced in the MCP server only. The Go bridge's
+> local HTTP API (`localhost:8080`) is unauthenticated and not whitelist-aware,
+> so anything able to reach that port can send/read directly. Keep it bound to
+> localhost and don't expose it.
 
 ### Media Handling Features
 

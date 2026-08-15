@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to whitelist.json and list ONLY the chats Claude may read from and send to. Individual JIDs end in @s.whatsapp.net, groups in @g.us. Run `uv run python whitelist_cli.py chats` to discover JIDs (or `whitelist_cli.py add <name>` to add one). An empty or missing whitelist.json denies all access (fail closed).",
+  "allowed_jids": [
+    "491701234567@s.whatsapp.net",
+    "120363012345678901@g.us"
+  ]
+}

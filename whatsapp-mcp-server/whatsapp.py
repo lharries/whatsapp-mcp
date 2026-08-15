@@ -6,8 +6,12 @@ import os.path
 import requests
 import json
 import audio
+import whitelist
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+MESSAGES_DB_PATH = os.environ.get(
+    "WHATSAPP_MESSAGES_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db'),
+)
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -174,7 +178,12 @@ def list_messages(
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
             params.append(f"%{query}%")
-            
+
+        # Whitelist gate: only ever return messages from allowed chats.
+        wl_clause, wl_params = whitelist.sql_filter("chats.jid")
+        where_clauses.append(wl_clause)
+        params.extend(wl_params)
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
@@ -233,13 +242,15 @@ def get_message_context(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Get the target message first
-        cursor.execute("""
+        # Get the target message first (whitelist-gated: a message in a
+        # non-allowed chat is treated as not found, so no context leaks).
+        wl_clause, wl_params = whitelist.sql_filter("chats.jid")
+        cursor.execute(f"""
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
-        """, (message_id,))
+            WHERE messages.id = ? AND {wl_clause}
+        """, (message_id, *wl_params))
         msg_data = cursor.fetchone()
         
         if not msg_data:
@@ -352,7 +363,12 @@ def list_chats(
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
+        # Whitelist gate: only ever list allowed chats.
+        wl_clause, wl_params = whitelist.sql_filter("chats.jid")
+        where_clauses.append(wl_clause)
+        params.extend(wl_params)
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
@@ -399,17 +415,19 @@ def search_contacts(query: str) -> List[Contact]:
         # Split query into characters to support partial matching
         search_pattern = '%' +query + '%'
         
-        cursor.execute("""
-            SELECT DISTINCT 
+        wl_clause, wl_params = whitelist.sql_filter("jid")
+        cursor.execute(f"""
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
+            WHERE
                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
+                AND {wl_clause}
             ORDER BY name, jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
+        """, (search_pattern, search_pattern, *wl_params))
         
         contacts = cursor.fetchall()
         
@@ -444,7 +462,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
+        wl_clause, wl_params = whitelist.sql_filter("c.jid")
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -454,10 +473,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE (m.sender = ? OR c.jid = ?) AND {wl_clause}
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """, (jid, jid, *wl_params, limit, page * limit))
         
         chats = cursor.fetchall()
         
@@ -489,8 +508,9 @@ def get_last_interaction(jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        wl_clause, wl_params = whitelist.sql_filter("c.jid")
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -501,10 +521,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE (m.sender = ? OR c.jid = ?) AND {wl_clause}
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, (jid, jid, *wl_params))
         
         msg_data = cursor.fetchone()
         
@@ -555,9 +575,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 AND c.last_message_time = m.timestamp
             """
             
-        query += " WHERE c.jid = ?"
-        
-        cursor.execute(query, (chat_jid,))
+        wl_clause, wl_params = whitelist.sql_filter("c.jid")
+        query += f" WHERE c.jid = ? AND {wl_clause}"
+
+        cursor.execute(query, (chat_jid, *wl_params))
         chat_data = cursor.fetchone()
         
         if not chat_data:
@@ -586,8 +607,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        wl_clause, wl_params = whitelist.sql_filter("c.jid")
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -595,11 +617,11 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us' AND {wl_clause}
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, (f"%{sender_phone_number}%", *wl_params))
         
         chat_data = cursor.fetchone()
         
@@ -627,7 +649,10 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
+        if not whitelist.is_allowed(recipient):
+            return False, f"Recipient {recipient} is not in the whitelist; message not sent"
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
@@ -658,25 +683,28 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
+        if not whitelist.is_allowed(recipient):
+            return False, f"Recipient {recipient} is not in the whitelist; file not sent"
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
+
         response = requests.post(url, json=payload)
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -689,12 +717,15 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+
+        if not whitelist.is_allowed(recipient):
+            return False, f"Recipient {recipient} is not in the whitelist; audio not sent"
 
         if not media_path.endswith(".ogg"):
             try:
@@ -735,6 +766,10 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         The local file path if download was successful, None otherwise
     """
     try:
+        if not whitelist.is_allowed(chat_jid):
+            print(f"Chat {chat_jid} is not in the whitelist; media not downloaded")
+            return None
+
         url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {
             "message_id": message_id,
