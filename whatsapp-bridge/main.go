@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -463,7 +464,7 @@ func extractQuotedMessageID(msg *waProto.Message) string {
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, webhookManager *WebhookManager, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -527,6 +528,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 
+		if webhookManager != nil {
+			webhookManager.Fire(WebhookMessagePayload{
+				Event:     "message",
+				ID:        msg.Info.ID,
+				ChatJID:   chatJID,
+				Sender:    sender,
+				Content:   content,
+				Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
+				IsFromMe:  msg.Info.IsFromMe,
+				MediaType: mediaType,
+				Filename:  filename,
+			}, logger)
+		}
+
 		// Proactively download media right away rather than waiting for an
 		// on-demand /api/download request -- WhatsApp's media hosts have
 		// been observed rejecting fetches for messages that are only
@@ -542,6 +557,112 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				}
 			}(msg.Info.ID)
 		}
+	}
+}
+
+// WebhookRequest represents the request body for registering/unregistering a webhook
+type WebhookRequest struct {
+	URL string `json:"url"`
+}
+
+// WebhookResponse is returned by the webhook management endpoints
+type WebhookResponse struct {
+	Success  bool     `json:"success"`
+	Message  string   `json:"message"`
+	Webhooks []string `json:"webhooks,omitempty"`
+}
+
+// WebhookMessagePayload is POSTed to every registered webhook when a new message arrives
+type WebhookMessagePayload struct {
+	Event     string `json:"event"`
+	ID        string `json:"id"`
+	ChatJID   string `json:"chat_jid"`
+	Sender    string `json:"sender"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+	IsFromMe  bool   `json:"is_from_me"`
+	MediaType string `json:"media_type,omitempty"`
+	Filename  string `json:"filename,omitempty"`
+}
+
+// WebhookManager tracks registered webhook URLs and fires them on new messages.
+// Registrations persist to a JSON file so they survive a bridge restart.
+type WebhookManager struct {
+	mu       sync.Mutex
+	path     string
+	webhooks []string
+}
+
+func NewWebhookManager(path string) *WebhookManager {
+	wm := &WebhookManager{path: path}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &wm.webhooks)
+	}
+	return wm
+}
+
+func (wm *WebhookManager) save() error {
+	data, err := json.Marshal(wm.webhooks)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(wm.path, data, 0644)
+}
+
+func (wm *WebhookManager) Register(url string) error {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	for _, existing := range wm.webhooks {
+		if existing == url {
+			return nil
+		}
+	}
+	wm.webhooks = append(wm.webhooks, url)
+	return wm.save()
+}
+
+func (wm *WebhookManager) Unregister(url string) (bool, error) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	for i, existing := range wm.webhooks {
+		if existing == url {
+			wm.webhooks = append(wm.webhooks[:i], wm.webhooks[i+1:]...)
+			return true, wm.save()
+		}
+	}
+	return false, nil
+}
+
+func (wm *WebhookManager) List() []string {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	out := make([]string, len(wm.webhooks))
+	copy(out, wm.webhooks)
+	return out
+}
+
+// Fire POSTs the payload to every registered webhook URL concurrently, with a
+// short timeout each. Failures are logged but never block message processing.
+func (wm *WebhookManager) Fire(payload WebhookMessagePayload, logger waLog.Logger) {
+	urls := wm.List()
+	if len(urls) == 0 {
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf("Failed to marshal webhook payload: %v", err)
+		return
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, url := range urls {
+		go func(url string) {
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+			if err != nil {
+				logger.Warnf("Webhook POST to %s failed: %v", url, err)
+				return
+			}
+			resp.Body.Close()
+		}(url)
 	}
 }
 
@@ -770,7 +891,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, webhookManager *WebhookManager, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -868,6 +989,67 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for registering/listing/unregistering webhooks. POST registers
+	// a URL to be called with a JSON payload on every new message; GET lists
+	// current registrations; DELETE removes one. Registrations persist to
+	// store/webhooks.json so they survive a bridge restart.
+	http.HandleFunc("/api/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodGet:
+			json.NewEncoder(w).Encode(WebhookResponse{
+				Success:  true,
+				Webhooks: webhookManager.List(),
+			})
+
+		case http.MethodPost:
+			var req WebhookRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(WebhookResponse{Success: false, Message: "url is required"})
+				return
+			}
+			if err := webhookManager.Register(req.URL); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(WebhookResponse{Success: false, Message: err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(WebhookResponse{
+				Success:  true,
+				Message:  "Webhook registered",
+				Webhooks: webhookManager.List(),
+			})
+
+		case http.MethodDelete:
+			var req WebhookRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(WebhookResponse{Success: false, Message: "url is required"})
+				return
+			}
+			removed, err := webhookManager.Unregister(req.URL)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(WebhookResponse{Success: false, Message: err.Error()})
+				return
+			}
+			if !removed {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(WebhookResponse{Success: false, Message: "webhook not registered"})
+				return
+			}
+			json.NewEncoder(w).Encode(WebhookResponse{
+				Success:  true,
+				Message:  "Webhook removed",
+				Webhooks: webhookManager.List(),
+			})
+
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -928,12 +1110,15 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Initialize webhook manager (registrations persist across restarts)
+	webhookManager := NewWebhookManager("store/webhooks.json")
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, webhookManager, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -1001,7 +1186,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, webhookManager, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
