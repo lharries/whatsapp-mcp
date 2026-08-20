@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    register_webhook as whatsapp_register_webhook,
+    list_webhooks as whatsapp_list_webhooks,
+    unregister_webhook as whatsapp_unregister_webhook
 )
 
 # Initialize FastMCP server
@@ -245,6 +248,55 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def register_webhook(url: str) -> Dict[str, Any]:
+    """Register a URL to receive a JSON POST for every new WhatsApp message.
+
+    Payload POSTed to the URL: {"event": "message", "id", "chat_jid",
+    "sender", "content", "timestamp", "is_from_me", "media_type", "filename"}.
+    Registration persists across bridge restarts.
+
+    Args:
+        url: The URL to POST new-message payloads to
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_register_webhook(url)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def list_webhooks() -> Dict[str, Any]:
+    """List all currently registered webhook URLs.
+
+    Returns:
+        A dictionary containing success status and the list of registered URLs
+    """
+    success, webhooks = whatsapp_list_webhooks()
+    return {
+        "success": success,
+        "webhooks": webhooks
+    }
+
+@mcp.tool()
+def unregister_webhook(url: str) -> Dict[str, Any]:
+    """Remove a previously registered webhook URL.
+
+    Args:
+        url: The URL to unregister
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_unregister_webhook(url)
+    return {
+        "success": success,
+        "message": status_message
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

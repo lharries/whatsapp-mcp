@@ -765,3 +765,41 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def register_webhook(url: str) -> Tuple[bool, str]:
+    """Register a URL to be POSTed a JSON payload on every new message.
+
+    Payload shape: {"event": "message", "id", "chat_jid", "sender", "content",
+    "timestamp", "is_from_me", "media_type", "filename"}. Registrations
+    persist across bridge restarts.
+    """
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/webhooks", json={"url": url})
+        result = response.json()
+        return result.get("success", False), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def list_webhooks() -> Tuple[bool, List[str]]:
+    """List all currently registered webhook URLs."""
+    try:
+        response = requests.get(f"{WHATSAPP_API_BASE_URL}/webhooks")
+        result = response.json()
+        return result.get("success", False), result.get("webhooks", [])
+    except requests.RequestException as e:
+        return False, []
+    except Exception as e:
+        return False, []
+
+def unregister_webhook(url: str) -> Tuple[bool, str]:
+    """Remove a previously registered webhook URL."""
+    try:
+        response = requests.delete(f"{WHATSAPP_API_BASE_URL}/webhooks", json={"url": url})
+        result = response.json()
+        return result.get("success", False), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
