@@ -82,6 +82,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
 			direct_path TEXT,
+			quoted_message_id TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -91,11 +92,16 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	// Migrate older databases that predate this column.
-	if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN direct_path TEXT`); err != nil {
-		if !strings.Contains(err.Error(), "duplicate column") {
-			db.Close()
-			return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+	// Migrate older databases that predate these columns.
+	for _, stmt := range []string{
+		`ALTER TABLE messages ADD COLUMN direct_path TEXT`,
+		`ALTER TABLE messages ADD COLUMN quoted_message_id TEXT`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				db.Close()
+				return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+			}
 		}
 	}
 
@@ -118,7 +124,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, quotedMessageID string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -126,9 +132,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path, quoted_message_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath, quotedMessageID,
 	)
 	return err
 }
@@ -421,6 +427,41 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", "", nil, nil, nil, 0
 }
 
+// Extract the ID of the message being replied to (quoted), if any. WhatsApp
+// carries this in ContextInfo, which lives on whichever specific message
+// type wrapper is actually populated (text, image, video, etc.).
+func extractQuotedMessageID(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if id := extendedText.GetContextInfo().GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		if id := img.GetContextInfo().GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		if id := vid.GetContextInfo().GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	if aud := msg.GetAudioMessage(); aud != nil {
+		if id := aud.GetContextInfo().GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		if id := doc.GetContextInfo().GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
@@ -441,6 +482,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Extract media info
 	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// Extract quoted message ID, if this message is a reply
+	quotedMessageID := extractQuotedMessageID(msg.Message)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -463,6 +507,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageID,
 	)
 
 	if err != nil {
@@ -1118,8 +1163,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
+				var quotedMessageID string
+
 				if msg.Message.Message != nil {
 					mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					quotedMessageID = extractQuotedMessageID(msg.Message.Message)
 				}
 
 				// Log the message content for debugging
@@ -1177,6 +1225,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedMessageID,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
