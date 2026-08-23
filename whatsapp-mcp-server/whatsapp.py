@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from dataclasses import dataclass, asdict, is_dataclass
+from typing import Any, Optional, List, Tuple
 import os.path
 import requests
 import json
@@ -46,6 +46,20 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+
+def to_jsonable(obj: Any) -> Any:
+    """Turn dataclasses/datetimes into JSON-safe dicts for FastMCP HTTP (mcp 1.12+)."""
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {k: to_jsonable(v) for k, v in asdict(obj).items()}
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, list):
+        return [to_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    return obj
+
 
 def get_sender_name(sender_jid: str) -> str:
     try:
@@ -328,9 +342,10 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
+        # Build base query. Message columns only exist if we JOIN messages.
+        if include_last_message:
+            query_parts = ["""
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
@@ -338,14 +353,20 @@ def list_chats(
                 messages.sender as last_sender,
                 messages.is_from_me as last_is_from_me
             FROM chats
-        """]
-        
-        if include_last_message:
-            query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+            LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
-            """)
-            
+            """]
+        else:
+            query_parts = ["""
+            SELECT
+                chats.jid,
+                chats.name,
+                chats.last_message_time,
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me
+            FROM chats
+            """] 
         where_clauses = []
         params = []
         

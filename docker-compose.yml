@@ -6,7 +6,7 @@ services:
     container_name: whatsapp-bridge
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8181:8080"
+      - "${WA_PUBLISH:-127.0.0.1}:8181:8080"
     volumes:
       # Persistent WhatsApp session + message store
       # Mounted to host so MCP server (running on host) can read messages.db
@@ -17,3 +17,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  whatsapp-mcp:
+    image: whatsapp-mcp-whatsapp-bridge:latest
+    container_name: whatsapp-mcp
+    restart: unless-stopped
+    depends_on:
+      - whatsapp-bridge
+    environment:
+      WHATSAPP_API_BASE_URL: http://whatsapp-bridge:8080/api
+      WHATSAPP_MESSAGES_DB_PATH: /app/store/messages.db
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8766
+    ports:
+      - "${WA_PUBLISH:-127.0.0.1}:8766:8766"
+    volumes:
+      - ./store:/app/store
+      - ./whatsapp-mcp-server/main.py:/app/whatsapp-mcp-server/main.py:ro
+      - ./whatsapp-mcp-server/whatsapp.py:/app/whatsapp-mcp-server/whatsapp.py:ro
+    working_dir: /app/whatsapp-mcp-server
+    command: ["sh", "-c", "uv pip install --python .venv/bin/python 'mcp[cli]==1.12.4' && .venv/bin/python main.py"]
