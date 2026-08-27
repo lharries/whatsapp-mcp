@@ -203,7 +203,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -216,16 +216,40 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	isJID := strings.Contains(recipient, "@")
 
 	if isJID {
-		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
 		}
 	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
+		cleanNum := strings.TrimPrefix(recipient, "+")
+		withPlus := "+" + cleanNum
+		resp, err := client.IsOnWhatsApp(context.Background(), []string{cleanNum, withPlus})
+		fmt.Printf("IsOnWhatsApp response for %s: resp=%+v, err=%v\n", cleanNum, resp, err)
+		found := false
+		if err == nil && len(resp) > 0 {
+			for _, r := range resp {
+				if r.IsIn {
+					recipientJID = r.JID
+					fmt.Printf("Resolved JID for %s: %s\n", recipient, recipientJID.String())
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			recipientJID = types.JID{
+				User:   cleanNum,
+				Server: types.DefaultUserServer,
+			}
+		}
+	}
+
+	// Try resolving LID from Store if sending to standard user server and LID mapping is required
+	if recipientJID.Server == types.DefaultUserServer {
+		lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), recipientJID)
+		if err == nil && !lid.IsEmpty() {
+			fmt.Printf("Resolved LID %s for PN %s\n", lid.String(), recipientJID.String())
+			recipientJID = lid
 		}
 	}
 
@@ -275,6 +299,38 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		case "mov":
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
+
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
 
 		// Document types (for any other file type)
 		default:
@@ -345,8 +401,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			fileName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(fileName),
+				FileName:      proto.String(fileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -363,6 +421,35 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Send message
 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "no LID found") {
+			fmt.Println("No LID found error caught. Attempting contact resolution for:", recipientJID.User)
+			// Try resolving via Contact/Usync or check chats table
+			var knownLID string
+			dbErr := messageStore.db.QueryRow("SELECT jid FROM chats WHERE jid LIKE ? AND jid LIKE '%@lid' LIMIT 1", "%"+recipientJID.User+"%").Scan(&knownLID)
+			if dbErr == nil && knownLID != "" {
+				if parsedLID, parseErr := types.ParseJID(knownLID); parseErr == nil {
+					recipientJID = parsedLID
+					fmt.Printf("Found LID from chats DB: %s, retrying SendMessage...\n", recipientJID.String())
+					_, err = client.SendMessage(context.Background(), recipientJID, msg)
+				}
+			} else {
+				// Try contact sync lookup
+				resp, lookupErr := client.IsOnWhatsApp(context.Background(), []string{"+" + recipientJID.User, recipientJID.User})
+				if lookupErr == nil && len(resp) > 0 {
+					for _, r := range resp {
+						if r.IsIn && !r.JID.IsEmpty() {
+							recipientJID = r.JID
+							fmt.Printf("IsOnWhatsApp retry success with JID: %s\n", recipientJID.String())
+							_, err = client.SendMessage(context.Background(), recipientJID, msg)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
@@ -454,18 +541,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
-		// Log message reception
+		// Log message reception only when a real message arrives
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 		direction := "←"
 		if msg.Info.IsFromMe {
 			direction = "→"
 		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		if !msg.Info.IsFromMe {
+			fmt.Printf("\n[NEW INCOMING MESSAGE] [%s] %s %s: %s\n", timestamp, direction, name, content)
 		}
 	}
 }
@@ -641,7 +724,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -657,22 +740,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
+	// The direct path is in the URL, we need to extract it including query params
 	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -706,7 +781,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -800,14 +875,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -906,7 +981,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, 9095)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1048,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1063,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
