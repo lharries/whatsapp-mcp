@@ -1,4 +1,8 @@
+[tool.uv]
+package = false
+
 [project]
+
 name = "whatsapp-mcp-server"
 version = "0.1.0"
 description = "Add your description here"
