@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -54,7 +54,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite", "file:store/messages.db?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -876,7 +876,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -970,9 +970,32 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		var firstQR *whatsmeow.QRChannelItem
+		if item, ok := <-qrChan; ok {
+			firstQR = &item
+		}
+		if firstQR != nil && firstQR.Event == "code" {
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			fmt.Printf("RAW_QR:%s\n", firstQR.Code)
+			qrterminal.GenerateHalfBlock(firstQR.Code, qrterminal.L, os.Stdout)
+			if phone := os.Getenv("WA_PAIR_PHONE"); phone != "" {
+				go func() {
+					for client.Store.ID == nil {
+						pairCode, pairErr := client.PairPhone(context.Background(), phone, false, whatsmeow.PairClientChrome, "Chrome (Windows)")
+						if pairErr != nil {
+							logger.Errorf("PairPhone failed: %v", pairErr)
+							return
+						}
+						fmt.Printf("\nPAIR_CODE:%s\n", pairCode)
+						time.Sleep(80 * time.Second)
+					}
+				}()
+			}
+		}
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Printf("RAW_QR:%s\n", evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				fmt.Println("\nSuccessfully paired with WhatsApp!")
