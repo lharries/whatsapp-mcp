@@ -106,6 +106,112 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+## Docker Deployment
+
+For headless or containerized deployments (Docker, Kubernetes, etc.), the WhatsApp bridge supports HTTP-based QR authentication instead of terminal display.
+
+### Quick Start with Docker
+
+1. **Build and run the WhatsApp bridge**
+
+   ```bash
+   cd whatsapp-bridge
+   docker build -t whatsapp-bridge .
+   docker run -p 8080:8080 -v whatsapp-session:/app/store whatsapp-bridge
+   ```
+
+2. **Start authentication via HTTP API**
+
+   ```bash
+   # Start QR code generation
+   curl -X POST http://localhost:8080/api/auth/start
+
+   # Get QR code as base64 PNG
+   curl http://localhost:8080/api/auth/qr
+   # Response: {"success": true, "qr": "base64_png_data...", "expires_at": 1234567890}
+
+   # Check connection status
+   curl http://localhost:8080/api/auth/status
+   # Response: {"connected": true, "logged_in": true, "phone": "1234567890"}
+   ```
+
+3. **Display QR code**
+
+   Decode the base64 PNG and display it in your web UI or save to file:
+   ```bash
+   curl -s http://localhost:8080/api/auth/qr | jq -r '.qr' | base64 -d > qr.png
+   open qr.png  # or display in your app
+   ```
+
+4. **Scan with WhatsApp mobile app**
+
+   The session will be persisted in the Docker volume for subsequent restarts.
+
+### Docker Compose Example
+
+```yaml
+version: '3.8'
+
+services:
+  whatsapp-bridge:
+    build: ./whatsapp-bridge
+    ports:
+      - "8080:8080"
+    environment:
+      - HTTP_PORT=8080
+      - QR_MODE=http
+    volumes:
+      - whatsapp-session:/app/store
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/auth/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  whatsapp-mcp:
+    build: ./whatsapp-mcp-server
+    environment:
+      - BRIDGE_URL=http://whatsapp-bridge:8080
+      - DATABASE_PATH=/data/messages.db
+    volumes:
+      - whatsapp-session:/data:ro
+    depends_on:
+      whatsapp-bridge:
+        condition: service_healthy
+
+volumes:
+  whatsapp-session:
+```
+
+### Environment Variables
+
+| Variable | Service | Default | Description |
+|----------|---------|---------|-------------|
+| `HTTP_PORT` | Bridge | `8080` | HTTP server port |
+| `QR_MODE` | Bridge | (terminal) | Set to `http` for HTTP-based QR authentication |
+| `BRIDGE_URL` | MCP Server | `http://localhost:8080` | URL of the WhatsApp bridge |
+| `DATABASE_PATH` | MCP Server | `../whatsapp-bridge/store/messages.db` | Path to messages database |
+
+### HTTP API Endpoints
+
+The WhatsApp bridge exposes these REST endpoints:
+
+#### Authentication
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/auth/status` | GET | Get connection status (`connected`, `logged_in`, `phone`) |
+| `/api/auth/start` | POST | Start QR code generation |
+| `/api/auth/qr` | GET | Get QR code as base64 PNG |
+| `/api/auth/logout` | POST | Disconnect and clear session state |
+
+#### Messaging
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/send` | POST | Send text or media message |
+| `/api/download` | POST | Download media from a message |
+
 ## Architecture Overview
 
 This application consists of two main components:

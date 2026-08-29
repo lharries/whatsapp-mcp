@@ -1,26 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
+	"github.com/skip2/go-qrcode"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -30,6 +33,26 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// AuthState holds the current authentication state for HTTP API access
+type AuthState struct {
+	sync.RWMutex
+	QRCode       string    // Current QR code string (for generating image)
+	QRExpiry     time.Time // When the QR code expires
+	IsConnected  bool      // Whether we're connected to WhatsApp
+	IsLoggedIn   bool      // Whether we have a valid session
+	Phone        string    // Connected phone number
+	Name         string    // Connected account name
+	AuthInProgress bool    // Whether auth flow is in progress
+	// History sync status
+	HistorySyncInProgress bool      // Whether history sync is happening
+	HistorySyncStarted    time.Time // When sync started
+	HistorySyncConversations int    // Total conversations being synced
+	HistorySyncMessages   int       // Messages synced so far
+	HistorySyncComplete   bool      // Whether sync completed
+}
+
+var authState = &AuthState{}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -641,7 +664,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -655,24 +678,24 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
+// Extract direct path from a WhatsApp media URL.
+//
+// WhatsApp builds the media URL as "https://mmg.whatsapp.net" + directPath + "&mms3=true",
+// and the direct path INCLUDES the signed query string ("?ccb=..&oh=..&oe=..&_nc_sid=..").
+// whatsmeow then requests "https://<host>" + directPath + "&hash=..&mms-type=..", so the
+// query must survive: stripping it produced an unsigned, malformed request that the CDN
+// answered with 403 on every download.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
+	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...&mms3=true
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	directPath := "/" + parts[1]
+	directPath = strings.Replace(directPath, "&mms3=true", "", 1)
+	directPath = strings.Replace(directPath, "?mms3=true", "", 1)
+	return directPath
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -756,6 +779,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			if err != nil {
 				errMsg = err.Error()
 			}
+			fmt.Printf("Media download failed for message %s in chat %s: %s\n", req.MessageID, req.ChatJID, errMsg)
 
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
@@ -771,6 +795,530 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	// Auth status endpoint - check connection status
+	http.HandleFunc("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		response := map[string]interface{}{
+			"connected":        client.IsConnected(),
+			"logged_in":        client.Store.ID != nil,
+			"auth_in_progress": authState.AuthInProgress,
+		}
+
+		if client.Store.ID != nil {
+			response["phone"] = client.Store.ID.User
+			response["device"] = client.Store.ID.Device
+		}
+
+		// Include history sync status
+		response["history_sync"] = map[string]interface{}{
+			"in_progress":   authState.HistorySyncInProgress,
+			"complete":      authState.HistorySyncComplete,
+			"conversations": authState.HistorySyncConversations,
+			"messages":      authState.HistorySyncMessages,
+		}
+		authState.RUnlock()
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Auth start endpoint - initiate QR code generation
+	http.HandleFunc("/api/auth/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if already logged in
+		if client.Store.ID != nil && client.IsConnected() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Already logged in",
+				"status":  "connected",
+			})
+			return
+		}
+
+		// Check if auth is already in progress
+		authState.Lock()
+		if authState.AuthInProgress {
+			authState.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Auth already in progress",
+				"status":  "pending",
+			})
+			return
+		}
+		authState.AuthInProgress = true
+		authState.Unlock()
+
+		// Start QR code generation in background
+		go func() {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err := client.Connect()
+			if err != nil {
+				authState.Lock()
+				authState.AuthInProgress = false
+				authState.Unlock()
+				fmt.Printf("Failed to connect for QR: %v\n", err)
+				return
+			}
+
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					authState.Lock()
+					authState.QRCode = evt.Code
+					authState.QRExpiry = time.Now().Add(60 * time.Second) // QR codes typically expire in ~60s
+					authState.Unlock()
+
+					// Also print to terminal for debugging
+					fmt.Println("\nQR code available via HTTP API")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					authState.Lock()
+					authState.QRCode = ""
+					authState.AuthInProgress = false
+					authState.IsConnected = true
+					authState.IsLoggedIn = true
+					authState.Unlock()
+					fmt.Println("\nSuccessfully authenticated via QR code!")
+					break
+				} else if evt.Event == "timeout" {
+					authState.Lock()
+					authState.QRCode = ""
+					authState.AuthInProgress = false
+					authState.Unlock()
+					fmt.Println("\nQR code scan timeout")
+					break
+				}
+			}
+		}()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "QR code generation started",
+			"status":  "pending",
+		})
+	})
+
+	// Auth QR endpoint - get current QR code as base64 PNG
+	http.HandleFunc("/api/auth/qr", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		qrCode := authState.QRCode
+		expiry := authState.QRExpiry
+		inProgress := authState.AuthInProgress
+		authState.RUnlock()
+
+		if qrCode == "" {
+			status := "no_qr"
+			if !inProgress {
+				status = "not_started"
+			}
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "No QR code available",
+				"status":  status,
+			})
+			return
+		}
+
+		// Generate QR code as PNG
+		png, err := qrcode.Encode(qrCode, qrcode.Medium, 256)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to generate QR image: %v", err),
+			})
+			return
+		}
+
+		// Encode as base64
+		base64PNG := base64.StdEncoding.EncodeToString(png)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"qr":         base64PNG,
+			"qr_raw":     qrCode, // Raw string for terminal display if needed
+			"expires_at": expiry.Unix(),
+		})
+	})
+
+	// ==========================================
+	// CHAT & MESSAGE ENDPOINTS
+	// ==========================================
+
+	// List all chats endpoint
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get limit from query params (default 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := fmt.Sscanf(limitStr, "%d", &limit); l != 1 || err != nil {
+				limit = 50
+			}
+		}
+
+		// Get chats from database
+		chatTimes, err := messageStore.GetChats()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chats: %v", err),
+			})
+			return
+		}
+
+		// Get chat names from database
+		rows, err := messageStore.db.Query("SELECT jid, name, last_message_time FROM chats ORDER BY last_message_time DESC LIMIT ?", limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to query chats: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type ChatResponse struct {
+			JID             string `json:"jid"`
+			Name            string `json:"name"`
+			LastMessageTime string `json:"last_message_time"`
+			IsGroup         bool   `json:"is_group"`
+		}
+
+		var chats []ChatResponse
+		for rows.Next() {
+			var jid, name string
+			var lastMessageTime time.Time
+			if err := rows.Scan(&jid, &name, &lastMessageTime); err != nil {
+				continue
+			}
+			chats = append(chats, ChatResponse{
+				JID:             jid,
+				Name:            name,
+				LastMessageTime: lastMessageTime.Format(time.RFC3339),
+				IsGroup:         strings.Contains(jid, "@g.us"),
+			})
+		}
+
+		// Handle empty chats
+		if chats == nil {
+			chats = []ChatResponse{}
+		}
+
+		_ = chatTimes // Unused but keeping for potential future use
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"chats":   chats,
+		})
+	})
+
+	// Get messages from a chat endpoint
+	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get chat_jid from query params (required)
+		chatJID := r.URL.Query().Get("chat_jid")
+		if chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "chat_jid parameter is required",
+			})
+			return
+		}
+
+		// Get limit from query params (default 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := fmt.Sscanf(limitStr, "%d", &limit); l != 1 || err != nil {
+				limit = 50
+			}
+		}
+
+		// Get messages from database
+		rows, err := messageStore.db.Query(
+			`SELECT id, sender, content, timestamp, is_from_me, media_type, filename
+			 FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?`,
+			chatJID, limit,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get messages: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type MessageResponse struct {
+			ID        string `json:"id"`
+			Sender    string `json:"sender"`
+			Content   string `json:"content"`
+			Timestamp string `json:"timestamp"`
+			IsFromMe  bool   `json:"is_from_me"`
+			MediaType string `json:"media_type,omitempty"`
+			Filename  string `json:"filename,omitempty"`
+		}
+
+		var messages []MessageResponse
+		for rows.Next() {
+			var id, sender, content string
+			var timestamp time.Time
+			var isFromMe bool
+			var mediaType, filename sql.NullString
+
+			if err := rows.Scan(&id, &sender, &content, &timestamp, &isFromMe, &mediaType, &filename); err != nil {
+				continue
+			}
+			messages = append(messages, MessageResponse{
+				ID:        id,
+				Sender:    sender,
+				Content:   content,
+				Timestamp: timestamp.Format(time.RFC3339),
+				IsFromMe:  isFromMe,
+				MediaType: mediaType.String,
+				Filename:  filename.String,
+			})
+		}
+
+		// Handle empty messages
+		if messages == nil {
+			messages = []MessageResponse{}
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"messages": messages,
+		})
+	})
+
+	// Search contacts endpoint
+	http.HandleFunc("/api/contacts/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get search query from params
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "q parameter is required",
+			})
+			return
+		}
+
+		// Search in chats table (contacts are stored as chats)
+		rows, err := messageStore.db.Query(
+			`SELECT jid, name FROM chats
+			 WHERE name LIKE ? OR jid LIKE ?
+			 ORDER BY last_message_time DESC LIMIT 50`,
+			"%"+query+"%", "%"+query+"%",
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to search contacts: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type ContactResponse struct {
+			JID     string `json:"jid"`
+			Name    string `json:"name"`
+			IsGroup bool   `json:"is_group"`
+		}
+
+		var contacts []ContactResponse
+		for rows.Next() {
+			var jid, name string
+			if err := rows.Scan(&jid, &name); err != nil {
+				continue
+			}
+			contacts = append(contacts, ContactResponse{
+				JID:     jid,
+				Name:    name,
+				IsGroup: strings.Contains(jid, "@g.us"),
+			})
+		}
+
+		// Handle empty contacts
+		if contacts == nil {
+			contacts = []ContactResponse{}
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"contacts": contacts,
+		})
+	})
+
+	// Get single chat metadata endpoint
+	http.HandleFunc("/api/chats/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Extract chat JID from path
+		chatJID := strings.TrimPrefix(r.URL.Path, "/api/chats/")
+		if chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "chat JID is required",
+			})
+			return
+		}
+
+		// URL decode the JID
+		chatJID, _ = url.QueryUnescape(chatJID)
+
+		// Get chat from database
+		var name string
+		var lastMessageTime time.Time
+		err := messageStore.db.QueryRow(
+			"SELECT name, last_message_time FROM chats WHERE jid = ?",
+			chatJID,
+		).Scan(&name, &lastMessageTime)
+
+		if err == sql.ErrNoRows {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Chat not found",
+			})
+			return
+		} else if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chat: %v", err),
+			})
+			return
+		}
+
+		// Count messages in chat
+		var messageCount int
+		messageStore.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&messageCount)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"chat": map[string]interface{}{
+				"jid":               chatJID,
+				"name":              name,
+				"last_message_time": lastMessageTime.Format(time.RFC3339),
+				"is_group":          strings.Contains(chatJID, "@g.us"),
+				"message_count":     messageCount,
+			},
+		})
+	})
+
+	// History sync status endpoint
+	http.HandleFunc("/api/history/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		response := map[string]interface{}{
+			"in_progress":   authState.HistorySyncInProgress,
+			"complete":      authState.HistorySyncComplete,
+			"conversations": authState.HistorySyncConversations,
+			"messages":      authState.HistorySyncMessages,
+		}
+		if !authState.HistorySyncStarted.IsZero() {
+			response["started_at"] = authState.HistorySyncStarted.Format(time.RFC3339)
+			response["duration_seconds"] = int(time.Since(authState.HistorySyncStarted).Seconds())
+		}
+		authState.RUnlock()
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Trigger history sync endpoint
+	http.HandleFunc("/api/history/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Reset sync status
+		authState.Lock()
+		authState.HistorySyncInProgress = true
+		authState.HistorySyncStarted = time.Now()
+		authState.HistorySyncConversations = 0
+		authState.HistorySyncMessages = 0
+		authState.HistorySyncComplete = false
+		authState.Unlock()
+
+		// Trigger history sync in background
+		go func() {
+			requestHistorySync(client)
+		}()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "History sync requested. Check /api/history/status for progress.",
+		})
+	})
+
+	// Auth logout endpoint - disconnect and clear session
+	http.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected",
+			})
+			return
+		}
+
+		// Disconnect the client
+		client.Disconnect()
+
+		// Clear auth state
+		authState.Lock()
+		authState.IsConnected = false
+		authState.QRCode = ""
+		authState.AuthInProgress = false
+		authState.Unlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Logged out successfully",
 		})
 	})
 
@@ -791,6 +1339,16 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Get configuration from environment
+	httpPort := 8080
+	if portStr := os.Getenv("HTTP_PORT"); portStr != "" {
+		if p, err := fmt.Sscanf(portStr, "%d", &httpPort); p != 1 || err != nil {
+			logger.Warnf("Invalid HTTP_PORT, using default 8080")
+			httpPort = 8080
+		}
+	}
+	qrMode := os.Getenv("QR_MODE") // "http" for HTTP-based QR, anything else for terminal
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -800,14 +1358,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,43 +1405,73 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			authState.Lock()
+			authState.IsConnected = true
+			authState.Unlock()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			authState.Lock()
+			authState.IsConnected = false
+			authState.IsLoggedIn = false
+			authState.Unlock()
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start REST API server early if in HTTP QR mode (so it's available for auth)
+	if qrMode == "http" {
+		startRESTServer(client, messageStore, httpPort)
+		fmt.Printf("REST API server started on port %d\n", httpPort)
+	}
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		if qrMode == "http" {
+			// HTTP mode: Don't block, wait for auth via /api/auth/start
+			fmt.Println("\n⏳ No WhatsApp session found.")
+			fmt.Println("   Use POST /api/auth/start to initiate QR code authentication.")
+			fmt.Println("   Then GET /api/auth/qr to retrieve the QR code.")
+			fmt.Println("   Poll GET /api/auth/status to check connection status.")
+		} else {
+			// Terminal mode: Show QR in terminal and block
+			connected := make(chan bool, 1)
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
 			}
-		}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+			// Print QR code for pairing with phone
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
+			}
+
+			// Wait for connection
+			select {
+			case <-connected:
+				fmt.Println("\nSuccessfully connected and authenticated!")
+			case <-time.After(3 * time.Minute):
+				logger.Errorf("Timeout waiting for QR code scan")
+				return
+			}
+
+			// Wait a moment for connection to stabilize
+			time.Sleep(2 * time.Second)
+
+			if !client.IsConnected() {
+				logger.Errorf("Failed to establish stable connection")
+				return
+			}
+
+			fmt.Println("\n✓ Connected to WhatsApp!")
 		}
 	} else {
 		// Already logged in, just connect
@@ -892,27 +1480,31 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
+
+		// Wait a moment for connection to stabilize
+		time.Sleep(2 * time.Second)
+
+		if client.IsConnected() {
+			authState.Lock()
+			authState.IsConnected = true
+			authState.IsLoggedIn = true
+			authState.Unlock()
+			fmt.Println("\n✓ Connected to WhatsApp!")
+		} else {
+			logger.Warnf("Connection established but not stable")
+		}
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+	// Start REST API server if not already started
+	if qrMode != "http" {
+		startRESTServer(client, messageStore, httpPort)
 	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	fmt.Printf("REST server is running on port %d. Press Ctrl+C to disconnect and exit.\n", httpPort)
 
 	// Wait for termination signal
 	<-exitChan
@@ -973,7 +1565,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1580,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1007,7 +1599,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	conversationCount := len(historySync.Data.Conversations)
+	fmt.Printf("Received history sync event with %d conversations\n", conversationCount)
+
+	// Update sync status
+	authState.Lock()
+	authState.HistorySyncInProgress = true
+	if authState.HistorySyncStarted.IsZero() {
+		authState.HistorySyncStarted = time.Now()
+	}
+	authState.HistorySyncConversations += conversationCount
+	authState.Unlock()
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1144,7 +1746,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	// Update sync status
+	authState.Lock()
+	authState.HistorySyncMessages += syncedCount
+	// Mark complete if we've processed conversations (sync comes in batches)
+	if conversationCount > 0 {
+		authState.HistorySyncComplete = true
+		authState.HistorySyncInProgress = false
+	}
+	authState.Unlock()
+
+	fmt.Printf("History sync complete. Stored %d messages (total: %d).\n", syncedCount, authState.HistorySyncMessages)
 }
 
 // Request history sync from the server
