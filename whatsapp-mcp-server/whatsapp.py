@@ -6,6 +6,7 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import re
 import audio
 
 
@@ -17,6 +18,40 @@ def normalize_text(text: str) -> str:
         return ""
     nfkd = unicodedata.normalize('NFKD', text)
     return ''.join(c for c in nfkd if not unicodedata.category(c).startswith('M')).lower()
+
+
+_TS_RE = re.compile(
+    r"^\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+    r"(?:\s*([+-]\d{2}:?\d{2}))?"
+    r"(?:\s+[A-Za-z]{2,8})?\s*$"
+)
+
+
+def parse_db_timestamp(value):
+    """Parse a timestamp as stored by the Go bridge (e.g. '2026-08-29 11:07:27 +0200 CEST')
+    or a standard ISO-8601 string. Returns a datetime, or None for empty/blank values.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    m = _TS_RE.match(s)
+    if m:
+        core = m.group(1).replace(' ', 'T')
+        offset = m.group(2)
+        if offset:
+            if len(offset) == 5 and offset[0] in '+-':
+                offset = offset[0] + offset[1:3] + ':' + offset[3:5]
+            core = core + offset
+        try:
+            return datetime.fromisoformat(core)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00').replace(' ', 'T', 1))
+    except ValueError:
+        return None
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
@@ -327,7 +362,7 @@ def list_messages(
         result = []
         for msg in messages:
             message = Message(
-                timestamp=datetime.fromisoformat(msg[0]),
+                timestamp=parse_db_timestamp(msg[0]),
                 sender=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
@@ -399,7 +434,7 @@ def get_message_context(
             raise ValueError(f"Message with ID {message_id} not found")
             
         target_message = Message(
-            timestamp=datetime.fromisoformat(msg_data[0]),
+            timestamp=parse_db_timestamp(msg_data[0]),
             sender=msg_data[1],
             chat_name=msg_data[2],
             content=msg_data[3],
@@ -422,7 +457,7 @@ def get_message_context(
         before_messages = []
         for msg in cursor.fetchall():
             before_messages.append(Message(
-                timestamp=datetime.fromisoformat(msg[0]),
+                timestamp=parse_db_timestamp(msg[0]),
                 sender=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
@@ -445,7 +480,7 @@ def get_message_context(
         after_messages = []
         for msg in cursor.fetchall():
             after_messages.append(Message(
-                timestamp=datetime.fromisoformat(msg[0]),
+                timestamp=parse_db_timestamp(msg[0]),
                 sender=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
@@ -544,7 +579,7 @@ def list_chats(
             chat = Chat(
                 jid=jid,
                 name=name,
-                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
+                last_message_time=parse_db_timestamp(chat_data[2]),
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
@@ -648,7 +683,7 @@ def get_chat(
             return Chat(
                 jid=row[0],
                 name=row[1],
-                last_message_time=datetime.fromisoformat(row[2]) if row[2] else None,
+                last_message_time=parse_db_timestamp(row[2]),
                 last_message=row[3],
                 last_sender=row[4],
                 last_is_from_me=row[5]
