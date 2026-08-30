@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -54,7 +54,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite", "file:store/messages.db?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -641,7 +641,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -666,13 +666,12 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the FULL path INCLUDING the query string: the query carries the
+	// signed parameters (oe expiry, oh origin hash, mms3, ...) that
+	// mmg.whatsapp.net requires. Stripping them makes the server answer 403
+	// even for valid, fresh media. whatsmeow appends its own
+	// "&hash=...&mms-type=...&__wa-mms=" params after it, which is fine.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -774,6 +773,54 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for triggering on-demand history sync for a specific chat
+	http.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
+			// No specific chat - request general sync
+			requestHistorySync(client, messageStore)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "General history sync requested.",
+			})
+			return
+		}
+
+		// Request on-demand sync for a specific chat
+		err := requestChatSync(client, messageStore, req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to sync chat: %v", err),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("On-demand sync requested for %s. Messages will arrive shortly.", req.ChatJID),
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -784,6 +831,34 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+// waitForConnection blocks until the client reports a live, logged-in
+// connection or the timeout elapses. It tolerates transient websocket drops
+// (e.g. close 1006) by relying on whatsmeow's automatic reconnection: instead
+// of failing on the first unsuccessful check, it keeps polling and also wakes
+// up immediately whenever a Connected event is delivered on connected.
+func waitForConnection(client *whatsmeow.Client, connected <-chan bool, timeout time.Duration, logger waLog.Logger) bool {
+	fmt.Println("Waiting for a stable connection to WhatsApp...")
+
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if client.IsConnected() && client.IsLoggedIn() {
+			return true
+		}
+
+		select {
+		case <-connected:
+			// A Connected event arrived; loop around to re-check the state.
+		case <-ticker.C:
+			// Periodic poll while auto-reconnect works in the background.
+		case <-deadline:
+			return client.IsConnected() && client.IsLoggedIn()
+		}
+	}
 }
 
 func main() {
@@ -800,14 +875,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -834,6 +909,10 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Create channel to track connection success. Buffered so the event
+	// handler never blocks when signalling a (re)connection.
+	connected := make(chan bool, 1)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -847,14 +926,37 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Signal that the connection is up (non-blocking).
+			select {
+			case connected <- true:
+			default:
+			}
+
+		case *events.Disconnected:
+			// A clean disconnect. whatsmeow's automatic reconnection is
+			// enabled by default and will re-establish the socket, so this
+			// is informational rather than fatal.
+			logger.Warnf("Disconnected from WhatsApp; automatic reconnection will be attempted")
+
+		case *events.ConnectFailure:
+			logger.Errorf("Connection failure: %v", v.Reason)
+
+		case *events.StreamReplaced:
+			logger.Errorf("Stream replaced: the session was opened on another device")
+
+		case *events.KeepAliveTimeout:
+			// Keepalive pings to WhatsApp are timing out. This is the usual
+			// precursor to a "websocket: close 1006 (abnormal closure)" read
+			// error; the connection will be torn down and reconnected.
+			logger.Warnf("Keepalive timeout, connection is unstable; reconnecting")
+
+		case *events.KeepAliveRestored:
+			logger.Infof("Keepalive restored, connection is healthy again")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
 	})
-
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
@@ -867,23 +969,37 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		var firstQR *whatsmeow.QRChannelItem
+		if item, ok := <-qrChan; ok {
+			firstQR = &item
+		}
+		if firstQR != nil && firstQR.Event == "code" {
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			fmt.Printf("RAW_QR:%s\n", firstQR.Code)
+			qrterminal.GenerateHalfBlock(firstQR.Code, qrterminal.L, os.Stdout)
+			if phone := os.Getenv("WA_PAIR_PHONE"); phone != "" {
+				go func() {
+					for client.Store.ID == nil {
+						pairCode, pairErr := client.PairPhone(context.Background(), phone, false, whatsmeow.PairClientChrome, "Chrome (Windows)")
+						if pairErr != nil {
+							logger.Errorf("PairPhone failed: %v", pairErr)
+							return
+						}
+						fmt.Printf("\nPAIR_CODE:%s\n", pairCode)
+						time.Sleep(80 * time.Second)
+					}
+				}()
+			}
+		}
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Printf("RAW_QR:%s\n", evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
-				connected <- true
+				fmt.Println("\nSuccessfully paired with WhatsApp!")
 				break
 			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
 		}
 	} else {
 		// Already logged in, just connect
@@ -892,18 +1008,27 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
+	// Wait for a stable connection before starting the REST server.
+	//
+	// whatsmeow enables automatic reconnection by default, so transient
+	// startup failures such as
+	//   "Error reading from websocket: websocket: close 1006 (abnormal
+	//    closure): unexpected EOF"
+	// are recovered from in the background. Rather than checking
+	// IsConnected() once and bailing out, poll until the client reports a
+	// live, logged-in session (or until we give up after a generous
+	// timeout), giving the reconnect logic time to do its job.
+	if !waitForConnection(client, connected, 3*time.Minute, logger) {
+		logger.Errorf("Failed to establish a stable WhatsApp connection")
 		return
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Send presence to ensure WhatsApp knows we're online and pushes pending sync data
+	client.SendPresence(context.Background(), types.PresenceAvailable)
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
@@ -973,7 +1098,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,15 +1112,28 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		// Try contact info (full name)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		}
+
+		// If no name found and this is a LID, try resolving via LID map
+		if name == "" && jid.Server == "lid" {
+			phoneJID, resolveErr := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if resolveErr == nil && phoneJID.User != "" {
+				phoneContact, phoneErr := client.Store.Contacts.GetContact(context.Background(), phoneJID)
+				if phoneErr == nil && phoneContact.FullName != "" {
+					name = phoneContact.FullName
+				} else if phoneErr == nil && phoneContact.PushName != "" {
+					name = phoneContact.PushName
+				}
+			}
+		}
+
+		if name == "" && sender != "" {
 			name = sender
-		} else {
-			// Last fallback to JID
+		} else if name == "" {
 			name = jid.User
 		}
 
@@ -1148,39 +1286,119 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		fmt.Println("Cannot request history sync: client not ready")
 		return
 	}
 
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
-	}
-
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	// Request recent messages for every chat we already know, anchoring on
+	// "now". This fetches messages that arrived while the bridge was
+	// offline, which is what a user means by "sync" — the old behaviour
+	// (anchor on the oldest stored message, ask for history *before* it)
+	// only ever fetched older history, never recent missed messages.
+	chats, err := messageStore.GetChats()
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		fmt.Printf("Failed to load chats for history sync: %v\n", err)
+		return
 	}
+
+	requested := 0
+	for chatJIDStr := range chats {
+		chatJID, err := types.ParseJID(chatJIDStr)
+		if err != nil {
+			fmt.Printf("Failed to parse JID %s for history sync: %v\n", chatJIDStr, err)
+			continue
+		}
+
+		// Synthetic anchor at "now" (same pattern as requestChatSync for
+		// chats without stored messages): the server then replies with the
+		// most recent messages of that chat.
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: false,
+			},
+			ID:        "FFFFFFFFFFFFFFFF",
+			Timestamp: time.Now(),
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			fmt.Printf("Failed to request history sync for %s: %v\n", chatJIDStr, err)
+			continue
+		}
+		requested++
+	}
+
+	fmt.Printf("Requested recent history sync for %d chats.\n", requested)
+}
+
+func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJIDStr string) error {
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	chatJID, err := types.ParseJID(chatJIDStr)
+	if err != nil {
+		return fmt.Errorf("invalid JID: %v", err)
+	}
+
+	// Check if we have any messages in this chat already
+	var oldestID string
+	var oldestTimestamp time.Time
+	var oldestIsFromMe bool
+
+	err = messageStore.db.QueryRow(`
+		SELECT id, timestamp, is_from_me
+		FROM messages
+		WHERE chat_jid = ?
+		ORDER BY timestamp ASC
+		LIMIT 1
+	`, chatJIDStr).Scan(&oldestID, &oldestTimestamp, &oldestIsFromMe)
+
+	if err == nil {
+		// We have messages, request more history before the oldest
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: oldestIsFromMe,
+			},
+			ID:        oldestID,
+			Timestamp: oldestTimestamp,
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send sync request: %v", err)
+		}
+		fmt.Printf("Requested on-demand sync for chat %s (before msg %s)\n", chatJIDStr, oldestID)
+	} else {
+		// No messages yet - create a synthetic anchor at "now" to get recent messages
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: false,
+			},
+			ID:        "FFFFFFFFFFFFFFFF",
+			Timestamp: time.Now(),
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send sync request: %v", err)
+		}
+		fmt.Printf("Requested on-demand sync for new chat %s\n", chatJIDStr)
+	}
+
+	// Also ensure the chat exists in our database with the contact name
+	contact, cerr := client.Store.Contacts.GetContact(context.Background(), chatJID)
+	if cerr == nil && contact.FullName != "" {
+		messageStore.StoreChat(chatJIDStr, contact.FullName, time.Now())
+		fmt.Printf("Stored chat entry for %s (%s)\n", chatJIDStr, contact.FullName)
+	}
+
+	return nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
