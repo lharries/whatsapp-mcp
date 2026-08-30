@@ -1292,45 +1292,46 @@ func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 		return
 	}
 
-	// Get the oldest message we have to request more history before it
-	var oldestID, oldestChatJID string
-	var oldestTimestamp time.Time
-	var oldestIsFromMe bool
-
-	err := messageStore.db.QueryRow(`
-		SELECT id, chat_jid, timestamp, is_from_me
-		FROM messages
-		ORDER BY timestamp ASC
-		LIMIT 1
-	`).Scan(&oldestID, &oldestChatJID, &oldestTimestamp, &oldestIsFromMe)
-
+	// Request recent messages for every chat we already know, anchoring on
+	// "now". This fetches messages that arrived while the bridge was
+	// offline, which is what a user means by "sync" — the old behaviour
+	// (anchor on the oldest stored message, ask for history *before* it)
+	// only ever fetched older history, never recent missed messages.
+	chats, err := messageStore.GetChats()
 	if err != nil {
-		fmt.Printf("No messages found for history sync anchor: %v\n", err)
+		fmt.Printf("Failed to load chats for history sync: %v\n", err)
 		return
 	}
 
-	chatJID, err := types.ParseJID(oldestChatJID)
-	if err != nil {
-		fmt.Printf("Failed to parse JID for history sync: %v\n", err)
-		return
+	requested := 0
+	for chatJIDStr := range chats {
+		chatJID, err := types.ParseJID(chatJIDStr)
+		if err != nil {
+			fmt.Printf("Failed to parse JID %s for history sync: %v\n", chatJIDStr, err)
+			continue
+		}
+
+		// Synthetic anchor at "now" (same pattern as requestChatSync for
+		// chats without stored messages): the server then replies with the
+		// most recent messages of that chat.
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: false,
+			},
+			ID:        "FFFFFFFFFFFFFFFF",
+			Timestamp: time.Now(),
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			fmt.Printf("Failed to request history sync for %s: %v\n", chatJIDStr, err)
+			continue
+		}
+		requested++
 	}
 
-	msgInfo := &types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     chatJID,
-			IsFromMe: oldestIsFromMe,
-		},
-		ID:        oldestID,
-		Timestamp: oldestTimestamp,
-	}
-
-	historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
-	_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested.")
-	}
+	fmt.Printf("Requested recent history sync for %d chats.\n", requested)
 }
 
 func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJIDStr string) error {
