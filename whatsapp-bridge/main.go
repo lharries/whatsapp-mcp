@@ -178,14 +178,119 @@ func extractTextContent(msg *waProto.Message) string {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text first — the common case.
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Non-text messages used to return "" here, which made StoreMessage drop
+	// them entirely (it skips when content and mediaType are both empty).
+	// StoreChat still ran first and bumped chats.last_message_time, so a chat
+	// could look active while holding no rows for that activity — 35 of 102
+	// recently-active chats were affected. Render a short text form instead so
+	// the message is stored and readable.
+	//
+	// Prefixes are bracketed and stable so downstream consumers can recognise
+	// them without parsing free text.
+	if r := msg.GetReactionMessage(); r != nil {
+		if t := r.GetText(); t != "" {
+			return fmt.Sprintf("[reaction: %s]", t)
+		}
+		return "[reaction removed]"
+	}
+
+	if p := msg.GetPollCreationMessage(); p != nil {
+		opts := make([]string, 0, len(p.GetOptions()))
+		for _, o := range p.GetOptions() {
+			if n := o.GetOptionName(); n != "" {
+				opts = append(opts, n)
+			}
+		}
+		if len(opts) > 0 {
+			return fmt.Sprintf("[poll: %s — options: %s]", p.GetName(), strings.Join(opts, " | "))
+		}
+		return fmt.Sprintf("[poll: %s]", p.GetName())
+	}
+
+	if msg.GetPollUpdateMessage() != nil {
+		// The vote itself is encrypted; record that a vote happened.
+		return "[poll vote]"
+	}
+
+	if l := msg.GetLocationMessage(); l != nil {
+		if n := l.GetName(); n != "" {
+			return fmt.Sprintf("[location: %s (%.6f, %.6f)]", n, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if l := msg.GetLiveLocationMessage(); l != nil {
+		if c := l.GetCaption(); c != "" {
+			return fmt.Sprintf("[live location: %s (%.6f, %.6f)]", c, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[live location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if c := msg.GetContactMessage(); c != nil {
+		return fmt.Sprintf("[contact: %s]", c.GetDisplayName())
+	}
+
+	if ca := msg.GetContactsArrayMessage(); ca != nil {
+		names := make([]string, 0, len(ca.GetContacts()))
+		for _, c := range ca.GetContacts() {
+			if n := c.GetDisplayName(); n != "" {
+				names = append(names, n)
+			}
+		}
+		return fmt.Sprintf("[contacts: %s]", strings.Join(names, ", "))
+	}
+
+	// Edits and revokes arrive as ProtocolMessage. An edit carries the new
+	// message, so recurse into it rather than losing the corrected text.
+	if p := msg.GetProtocolMessage(); p != nil {
+		switch p.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			if inner := extractTextContent(p.GetEditedMessage()); inner != "" {
+				return fmt.Sprintf("[edited] %s", inner)
+			}
+			return "[edited message]"
+		case waProto.ProtocolMessage_REVOKE:
+			return "[message deleted]"
+		}
+	}
+
+	// View-once wraps a real message; unwrap so the caption is not lost.
+	if v := msg.GetViewOnceMessage(); v != nil {
+		if inner := extractTextContent(v.GetMessage()); inner != "" {
+			return fmt.Sprintf("[view once] %s", inner)
+		}
+		return "[view once message]"
+	}
+	if v := msg.GetViewOnceMessageV2(); v != nil {
+		if inner := extractTextContent(v.GetMessage()); inner != "" {
+			return fmt.Sprintf("[view once] %s", inner)
+		}
+		return "[view once message]"
+	}
+
+	// Ephemeral ("disappearing") messages also wrap the real payload.
+	if e := msg.GetEphemeralMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return inner
+		}
+	}
+
+	// Stickers carry no text; extractMediaInfo handles them as media, but give
+	// them content too so they are never silently dropped.
+	if msg.GetStickerMessage() != nil {
+		return "[sticker]"
+	}
+
 	return ""
 }
 
@@ -641,7 +746,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,7 +880,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +905,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1078,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1093,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
