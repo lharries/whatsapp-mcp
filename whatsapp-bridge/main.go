@@ -29,6 +29,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -204,7 +205,29 @@ func extractTextContent(msg *waProto.Message) string {
 		return "[reaction removed]"
 	}
 
-	if p := msg.GetPollCreationMessage(); p != nil {
+	// WhatsApp has migrated polls through V2..V6; a client that only reads V1
+	// silently drops every modern poll. Most variants return the poll directly;
+	// V4 wraps it in a FutureProofMessage. Signatures verified against the
+	// whatsmeow version in go.mod — they differ between releases.
+	poll := msg.GetPollCreationMessage()
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV2()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV3()
+	}
+	if poll == nil {
+		if fp := msg.GetPollCreationMessageV4(); fp != nil {
+			poll = fp.GetMessage().GetPollCreationMessage()
+		}
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV5()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV6()
+	}
+	if p := poll; p != nil {
 		opts := make([]string, 0, len(p.GetOptions()))
 		for _, o := range p.GetOptions() {
 			if n := o.GetOptionName(); n != "" {
@@ -248,6 +271,15 @@ func extractTextContent(msg *waProto.Message) string {
 			}
 		}
 		return fmt.Sprintf("[contacts: %s]", strings.Join(names, ", "))
+	}
+
+	// An edit can arrive as a top-level EditedMessage rather than wrapped in
+	// ProtocolMessage, depending on client version.
+	if e := msg.GetEditedMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return fmt.Sprintf("[edited] %s", inner)
+		}
+		return "[edited message]"
 	}
 
 	// Edits and revokes arrive as ProtocolMessage. An edit carries the new
@@ -531,11 +563,47 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Edits (and some other updates) arrive as an opaque secretEncryptedMessage
+	// envelope rather than as EditedMessage or ProtocolMessage — observed live on
+	// 2026-09-06, where an edit logged only "messageContextInfo,
+	// secretEncryptedMessage" and was dropped. Decrypt it and re-extract from the
+	// inner message. msg.IsEdit is set by whatsmeow when the payload was an edit.
+	if content == "" && msg.Message.GetSecretEncryptedMessage() != nil {
+		if inner, err := client.DecryptSecretEncryptedMessage(context.Background(), msg); err != nil {
+			logger.Warnf("Failed to decrypt secretEncryptedMessage %s: %v", msg.Info.ID, err)
+		} else if inner != nil {
+			if decrypted := extractTextContent(inner); decrypted != "" {
+				if msg.IsEdit {
+					content = fmt.Sprintf("[edited] %s", decrypted)
+				} else {
+					content = decrypted
+				}
+			}
+		}
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media.
+	//
+	// This gate is where unhandled message types disappear, and it used to do so
+	// invisibly — the "→"/"←" log line below only prints for messages that get
+	// stored, so a type extractTextContent does not understand left no trace at
+	// all. Log the populated proto fields before returning, so an unrecognised
+	// type is discoverable instead of being silently lost.
 	if content == "" && mediaType == "" {
+		if msg.Message != nil {
+			var fields []string
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+				fields = append(fields, string(fd.Name()))
+				return true
+			})
+			if len(fields) > 0 {
+				logger.Warnf("Dropping message %s in %s: no text or media extracted. Populated fields: %s",
+					msg.Info.ID, chatJID, strings.Join(fields, ", "))
+			}
+		}
 		return
 	}
 

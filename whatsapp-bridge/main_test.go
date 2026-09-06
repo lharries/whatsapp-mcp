@@ -180,3 +180,43 @@ func TestNonTextMessagesAreNeverEmpty(t *testing.T) {
 		}
 	}
 }
+
+// The production test on 2026-09-06 showed a real poll being dropped: only V1
+// was handled while WhatsApp had moved to a later variant. V4 wraps the poll in
+// a FutureProofMessage; the others return it directly. Signatures differ
+// between whatsmeow releases, so these pin the ones in go.mod.
+func TestPollVariants(t *testing.T) {
+	p := func() *waProto.PollCreationMessage {
+		return &waProto.PollCreationMessage{
+			Name:    proto.String("Lunch?"),
+			Options: []*waProto.PollCreationMessage_Option{{OptionName: proto.String("Pizza")}},
+		}
+	}
+	want := "[poll: Lunch? — options: Pizza]"
+	cases := map[string]*waProto.Message{
+		"V1": {PollCreationMessage: p()},
+		"V2": {PollCreationMessageV2: p()},
+		"V3": {PollCreationMessageV3: p()},
+		"V4": {PollCreationMessageV4: &waProto.FutureProofMessage{Message: &waProto.Message{PollCreationMessage: p()}}},
+		"V5": {PollCreationMessageV5: p()},
+		"V6": {PollCreationMessageV6: p()},
+	}
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := extractTextContent(m); got != want {
+				t.Errorf("poll %s\n  got:  %q\n  want: %q", name, got, want)
+			}
+		})
+	}
+}
+
+// An edit can arrive as a top-level EditedMessage rather than inside a
+// ProtocolMessage, depending on the sending client.
+func TestTopLevelEditedMessage(t *testing.T) {
+	m := &waProto.Message{EditedMessage: &waProto.FutureProofMessage{
+		Message: &waProto.Message{Conversation: proto.String("corrected")},
+	}}
+	if got, want := extractTextContent(m), "[edited] corrected"; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
