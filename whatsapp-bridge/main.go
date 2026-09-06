@@ -29,6 +29,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -178,14 +179,150 @@ func extractTextContent(msg *waProto.Message) string {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text first — the common case.
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Non-text messages used to return "" here, which made StoreMessage drop
+	// them entirely (it skips when content and mediaType are both empty).
+	// StoreChat still ran first and bumped chats.last_message_time, so a chat
+	// could look active while holding no rows for that activity — 35 of 102
+	// recently-active chats were affected. Render a short text form instead so
+	// the message is stored and readable.
+	//
+	// Prefixes are bracketed and stable so downstream consumers can recognise
+	// them without parsing free text.
+	if r := msg.GetReactionMessage(); r != nil {
+		if t := r.GetText(); t != "" {
+			return fmt.Sprintf("[reaction: %s]", t)
+		}
+		return "[reaction removed]"
+	}
+
+	// WhatsApp has migrated polls through V2..V6; a client that only reads V1
+	// silently drops every modern poll. Most variants return the poll directly;
+	// V4 wraps it in a FutureProofMessage. Signatures verified against the
+	// whatsmeow version in go.mod — they differ between releases.
+	poll := msg.GetPollCreationMessage()
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV2()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV3()
+	}
+	if poll == nil {
+		if fp := msg.GetPollCreationMessageV4(); fp != nil {
+			poll = fp.GetMessage().GetPollCreationMessage()
+		}
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV5()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV6()
+	}
+	if p := poll; p != nil {
+		opts := make([]string, 0, len(p.GetOptions()))
+		for _, o := range p.GetOptions() {
+			if n := o.GetOptionName(); n != "" {
+				opts = append(opts, n)
+			}
+		}
+		if len(opts) > 0 {
+			return fmt.Sprintf("[poll: %s — options: %s]", p.GetName(), strings.Join(opts, " | "))
+		}
+		return fmt.Sprintf("[poll: %s]", p.GetName())
+	}
+
+	if msg.GetPollUpdateMessage() != nil {
+		// The vote itself is encrypted; record that a vote happened.
+		return "[poll vote]"
+	}
+
+	if l := msg.GetLocationMessage(); l != nil {
+		if n := l.GetName(); n != "" {
+			return fmt.Sprintf("[location: %s (%.6f, %.6f)]", n, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if l := msg.GetLiveLocationMessage(); l != nil {
+		if c := l.GetCaption(); c != "" {
+			return fmt.Sprintf("[live location: %s (%.6f, %.6f)]", c, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[live location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if c := msg.GetContactMessage(); c != nil {
+		return fmt.Sprintf("[contact: %s]", c.GetDisplayName())
+	}
+
+	if ca := msg.GetContactsArrayMessage(); ca != nil {
+		names := make([]string, 0, len(ca.GetContacts()))
+		for _, c := range ca.GetContacts() {
+			if n := c.GetDisplayName(); n != "" {
+				names = append(names, n)
+			}
+		}
+		return fmt.Sprintf("[contacts: %s]", strings.Join(names, ", "))
+	}
+
+	// An edit can arrive as a top-level EditedMessage rather than wrapped in
+	// ProtocolMessage, depending on client version.
+	if e := msg.GetEditedMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return fmt.Sprintf("[edited] %s", inner)
+		}
+		return "[edited message]"
+	}
+
+	// Edits and revokes arrive as ProtocolMessage. An edit carries the new
+	// message, so recurse into it rather than losing the corrected text.
+	if p := msg.GetProtocolMessage(); p != nil {
+		switch p.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			if inner := extractTextContent(p.GetEditedMessage()); inner != "" {
+				return fmt.Sprintf("[edited] %s", inner)
+			}
+			return "[edited message]"
+		case waProto.ProtocolMessage_REVOKE:
+			return "[message deleted]"
+		}
+	}
+
+	// View-once wraps a real message; unwrap so the caption is not lost.
+	if v := msg.GetViewOnceMessage(); v != nil {
+		if inner := extractTextContent(v.GetMessage()); inner != "" {
+			return fmt.Sprintf("[view once] %s", inner)
+		}
+		return "[view once message]"
+	}
+	if v := msg.GetViewOnceMessageV2(); v != nil {
+		if inner := extractTextContent(v.GetMessage()); inner != "" {
+			return fmt.Sprintf("[view once] %s", inner)
+		}
+		return "[view once message]"
+	}
+
+	// Ephemeral ("disappearing") messages also wrap the real payload.
+	if e := msg.GetEphemeralMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return inner
+		}
+	}
+
+	// Stickers carry no text; extractMediaInfo handles them as media, but give
+	// them content too so they are never silently dropped.
+	if msg.GetStickerMessage() != nil {
+		return "[sticker]"
+	}
+
 	return ""
 }
 
@@ -426,11 +563,47 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Edits (and some other updates) arrive as an opaque secretEncryptedMessage
+	// envelope rather than as EditedMessage or ProtocolMessage — observed live on
+	// 2026-09-06, where an edit logged only "messageContextInfo,
+	// secretEncryptedMessage" and was dropped. Decrypt it and re-extract from the
+	// inner message. msg.IsEdit is set by whatsmeow when the payload was an edit.
+	if content == "" && msg.Message.GetSecretEncryptedMessage() != nil {
+		if inner, err := client.DecryptSecretEncryptedMessage(context.Background(), msg); err != nil {
+			logger.Warnf("Failed to decrypt secretEncryptedMessage %s: %v", msg.Info.ID, err)
+		} else if inner != nil {
+			if decrypted := extractTextContent(inner); decrypted != "" {
+				if msg.IsEdit {
+					content = fmt.Sprintf("[edited] %s", decrypted)
+				} else {
+					content = decrypted
+				}
+			}
+		}
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media.
+	//
+	// This gate is where unhandled message types disappear, and it used to do so
+	// invisibly — the "→"/"←" log line below only prints for messages that get
+	// stored, so a type extractTextContent does not understand left no trace at
+	// all. Log the populated proto fields before returning, so an unrecognised
+	// type is discoverable instead of being silently lost.
 	if content == "" && mediaType == "" {
+		if msg.Message != nil {
+			var fields []string
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+				fields = append(fields, string(fd.Name()))
+				return true
+			})
+			if len(fields) > 0 {
+				logger.Warnf("Dropping message %s in %s: no text or media extracted. Populated fields: %s",
+					msg.Info.ID, chatJID, strings.Join(fields, ", "))
+			}
+		}
 		return
 	}
 
@@ -641,7 +814,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,7 +948,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +973,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1146,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1161,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
