@@ -289,7 +289,22 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Las imagenes, videos y documentos llevan su texto en el campo Caption.
+	// Sin esto se perdia la nota que acompana a cada factura enviada como foto.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	// Un documento con pie de foto viene envuelto en otro mensaje.
+	if wrapped := msg.GetDocumentWithCaptionMessage().GetMessage(); wrapped != nil {
+		return extractTextContent(wrapped)
+	}
+
 	return ""
 }
 
@@ -483,26 +498,42 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// sufijoUnico devuelve un trozo del id del mensaje para que dos archivos que
+// llegan en el mismo segundo no terminen con el mismo nombre. Antes se usaba
+// solo la hora con resolucion de segundos, y varias fotos enviadas juntas se
+// pisaban entre si al descargarlas.
+func sufijoUnico(msgID string) string {
+	if msgID == "" {
+		return ""
+	}
+	if len(msgID) > 8 {
+		msgID = msgID[len(msgID)-8:]
+	}
+	return "_" + msgID
+}
+
+func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	sello := time.Now().Format("20060102_150405") + sufijoUnico(msgID)
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + sello + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + sello + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + sello + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -510,10 +541,16 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + sello
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+	}
+
+	// Un documento enviado con pie de foto viene envuelto en otro mensaje y
+	// antes se descartaba entero: ni el archivo ni la nota llegaban a la base.
+	if wrapped := msg.GetDocumentWithCaptionMessage().GetMessage(); wrapped != nil {
+		return extractMediaInfo(wrapped, msgID)
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -608,7 +645,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -1316,15 +1353,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
+				// Id del mensaje, necesario para el nombre de archivo unico.
+				idHistorial := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					idHistorial = *msg.Message.Key.ID
 				}
+
+				// Extract text content. Se usa la misma funcion que el camino
+				// normal para no volver a perder los pies de foto aqui.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1332,7 +1369,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, idHistorial)
 				}
 
 				// Log the message content for debugging
@@ -1362,10 +1399,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
+				msgID := idHistorial
 
 				// Get message timestamp
 				timestamp := time.Time{}
