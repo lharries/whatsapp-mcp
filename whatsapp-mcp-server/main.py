@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    send_reaction as whatsapp_send_reaction,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -178,6 +179,34 @@ def send_message(
     
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Dict[str, Any]:
+    """React to a WhatsApp message with an emoji (or remove an existing reaction).
+
+    Use this to mark a message as handled, e.g. reacting with a pin to a job
+    request that has already been uploaded elsewhere.
+
+    Args:
+        chat_jid: The JID of the chat containing the message (e.g. "123456789@g.us")
+        message_id: The ID of the message to react to (as returned by list_messages)
+        emoji: The emoji to react with, e.g. "\U0001F4CC". Pass an empty string to
+               remove your existing reaction from that message.
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not chat_jid or not message_id:
+        return {
+            "success": False,
+            "message": "chat_jid and message_id must be provided"
+        }
+
+    success, status_message = whatsapp_send_reaction(chat_jid, message_id, emoji)
     return {
         "success": success,
         "message": status_message

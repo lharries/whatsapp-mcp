@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import os.path
 import requests
 import json
@@ -91,22 +91,59 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
+def get_reactions_map(messages: List[Message]) -> Dict[Tuple[str, str], str]:
+    """
+    Devuelve {(chat_jid, message_id): "📌 ❌"} para los mensajes dados.
+    Una sola consulta para toda la lista en vez de una por mensaje.
+    """
+    pares = [(m.chat_jid, m.id) for m in messages
+             if getattr(m, "id", None) and getattr(m, "chat_jid", None)]
+    if not pares:
+        return {}
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        ids = list({p[1] for p in pares})
+        marcadores = ",".join("?" * len(ids))
+        cursor.execute(
+            f"SELECT chat_jid, message_id, emoji FROM reactions WHERE message_id IN ({marcadores})",
+            ids,
+        )
+        mapa: Dict[Tuple[str, str], List[str]] = {}
+        for chat_jid, message_id, emoji in cursor.fetchall():
+            if emoji:
+                mapa.setdefault((chat_jid, message_id), []).append(emoji)
+        conn.close()
+        return {k: " ".join(v) for k, v in mapa.items()}
+    except sqlite3.Error:
+        # La tabla puede no existir si el bridge es viejo: no romper por esto.
+        return {}
+
+def format_message(message: Message, show_chat_info: bool = True,
+                   reacciones: Optional[Dict[Tuple[str, str], str]] = None) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
+
     if show_chat_info and message.chat_name:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
-    content_prefix = ""
+
+    # El ID va siempre, no solo en mensajes con media: hace falta para poder
+    # reaccionar a un mensaje de texto con send_reaction.
+    content_prefix = f"[Message ID: {message.id}] "
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        sufijo = ""
+        if reacciones is None:
+            reacciones = get_reactions_map([message])
+        emojis = reacciones.get((message.chat_jid, message.id))
+        if emojis:
+            sufijo = f" [reacciones: {emojis}]"
+        output += f"From: {sender_name}: {content_prefix}{message.content}{sufijo}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -116,9 +153,10 @@ def format_messages_list(messages: List[Message], show_chat_info: bool = True) -
     if not messages:
         output += "No messages to display."
         return output
-    
+
+    reacciones = get_reactions_map(messages)
     for message in messages:
-        output += format_message(message, show_chat_info)
+        output += format_message(message, show_chat_info, reacciones)
     return output
 
 def list_messages(
@@ -643,6 +681,31 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Tuple[bool, str]:
+    """
+    Reacciona a un mensaje con un emoji. Un emoji vacio quita la reaccion.
+    Se usa para marcar con 📌 las llamadas ya subidas a CompanyCam.
+    """
+    try:
+        if not chat_jid or not message_id:
+            return False, "chat_jid y message_id son obligatorios"
+
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/react",
+            json={"chat_jid": chat_jid, "message_id": message_id, "emoji": emoji},
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
