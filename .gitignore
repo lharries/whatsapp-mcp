@@ -1,3 +1,8 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Compiled bridge binary. `go build` names it after the module
+# (whatsapp-client); building it as a service names it whatsapp-bridge.
+whatsapp-bridge/whatsapp-client
+whatsapp-bridge/whatsapp-bridge
