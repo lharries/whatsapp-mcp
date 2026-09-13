@@ -172,8 +172,43 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// unwrapMessage returns the message that actually carries the content.
+//
+// View-once, ephemeral and document-with-caption messages are envelopes: the
+// real Message sits one level down. Live events are already unwrapped by
+// whatsmeow, but history sync payloads are not, so without this a captioned
+// image in a disappearing-messages chat is stored as if it were empty.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	// Envelopes do nest (ephemeral wrapping view-once), but the chain is short.
+	// The bound is only there so a malformed payload cannot loop forever.
+	for i := 0; i < 4 && msg != nil; i++ {
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
 // Extract text content from a message
+//
+// A caption is text, not decoration: when someone sends a screenshot and types
+// what to do with it underneath, the caption IS the message. While only
+// Conversation and ExtendedTextMessage were read, such a message was stored
+// with an empty content column — indistinguishable from an image sent with no
+// words at all. Audio messages have no caption field in the protocol.
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return ""
 	}
@@ -185,7 +220,17 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
 	return ""
 }
 
@@ -373,6 +418,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	// Same envelopes as in extractTextContent: a document sent with a caption
+	// arrives as DocumentWithCaptionMessage, and without unwrapping it would be
+	// stored as a message with no attachment at all.
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
@@ -1054,14 +1103,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Same path as live messages. Duplicating the extraction here
+				// meant captions were dropped only for history-synced messages,
+				// which is the harder half of the bug to notice.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
