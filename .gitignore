@@ -8,3 +8,5 @@ qr.png
 qr_raw.txt
 store/
 *.bak
+*.bak-*
+*.previo

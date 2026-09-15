@@ -864,7 +864,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
+	// whatsmeow descarga SOLO a partir de DirectPath (ignora URL), asi que no hay
+	// "reintento sin URL" que valga: si falla, es el path o la firma vencida.
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
@@ -880,23 +881,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 }
 
 // Extract direct path from a WhatsApp media URL
+// El "direct path" es todo lo que sigue al host, CON su query string. Ejemplo:
+//   https://mmg.whatsapp.net/v/t62.7118-24/xxx.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...
+//   -> /v/t62.7118-24/xxx.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...
+//
+// Los parametros oh/oe/ccb SON la firma que autoriza la descarga. whatsmeow arma
+// la URL final como "https://<host><directPath>&hash=...": asume que el path ya
+// trae su "?" y le pega mas parametros con "&". La version anterior de esta
+// funcion recortaba el query string "para limpiar", y el CDN respondia 403 a
+// TODAS las descargas (fotos, videos, audios) desde el 10/09/2026. Es el mismo
+// valor que devuelve GetDirectPath() del mensaje original.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url
 	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
