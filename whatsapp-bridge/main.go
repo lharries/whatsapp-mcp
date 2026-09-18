@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -84,11 +85,25 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS reactions (
+			message_id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (message_id, chat_jid, sender)
+		);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+
+	// Columna agregada despues del esquema original: guarda el JID completo del
+	// remitente para poder construir la clave de una reaccion saliente. Falla si
+	// ya existe, y en ese caso el error se ignora a proposito.
+	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN sender_jid TEXT`)
 
 	return &MessageStore{db: db}, nil
 }
@@ -122,6 +137,76 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// Guarda el JID completo del remitente de un mensaje ya almacenado.
+func (store *MessageStore) StoreSenderJID(id, chatJID, senderJID string) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET sender_jid = ? WHERE id = ? AND chat_jid = ?",
+		senderJID, id, chatJID,
+	)
+	return err
+}
+
+// Devuelve el JID del remitente y si el mensaje es propio. Lo necesita /api/react
+// para construir la clave de la reaccion.
+func (store *MessageStore) GetMessageSender(id, chatJID string) (string, bool, error) {
+	var senderJID sql.NullString
+	var isFromMe bool
+	err := store.db.QueryRow(
+		"SELECT sender_jid, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&senderJID, &isFromMe)
+	if err != nil {
+		return "", false, err
+	}
+	return senderJID.String, isFromMe, nil
+}
+
+// Devuelve solo la parte numerica del remitente, para poder reconstruir el JID
+// de mensajes guardados antes de que existiera la columna sender_jid.
+func (store *MessageStore) GetMessageSenderUser(id, chatJID string) (string, error) {
+	var sender string
+	err := store.db.QueryRow(
+		"SELECT sender FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&sender)
+	return sender, err
+}
+
+// Guarda una reaccion. Una reaccion por (mensaje, chat, quien reacciona):
+// si la misma persona cambia de emoji, reemplaza la anterior.
+func (store *MessageStore) StoreReaction(messageID, chatJID, sender, emoji string, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO reactions (message_id, chat_jid, sender, emoji, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		messageID, chatJID, sender, emoji, timestamp,
+	)
+	return err
+}
+
+// Borra una reaccion. WhatsApp manda una reaccion con texto vacio cuando alguien
+// la quita, y en ese caso hay que borrar la fila y no guardar un emoji vacio.
+func (store *MessageStore) DeleteReaction(messageID, chatJID, sender string) error {
+	_, err := store.db.Exec(
+		"DELETE FROM reactions WHERE message_id = ? AND chat_jid = ? AND sender = ?",
+		messageID, chatJID, sender,
+	)
+	return err
+}
+
+// Reemplaza el texto de un mensaje que fue editado. Devuelve false si el mensaje
+// original no estaba en la base (por ejemplo si es anterior a este bridge).
+func (store *MessageStore) UpdateMessageContent(messageID, chatJID, content string) (bool, error) {
+	res, err := store.db.Exec(
+		"UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?",
+		content, messageID, chatJID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // Get messages from a chat
@@ -173,6 +258,25 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 }
 
 // Extract text content from a message
+// El mensaje descifrado de una edicion puede venir en varias envolturas segun
+// el cliente que la haya hecho. Se prueban todas antes de darse por vencido.
+func extractEditedText(msg *waProto.Message, logger waLog.Logger) string {
+	if msg == nil {
+		return ""
+	}
+	if texto := extractTextContent(msg); texto != "" {
+		return texto
+	}
+	if texto := extractTextContent(msg.GetEditedMessage().GetMessage()); texto != "" {
+		return texto
+	}
+	if texto := extractTextContent(msg.GetProtocolMessage().GetEditedMessage()); texto != "" {
+		return texto
+	}
+	logger.Warnf("Edicion descifrada pero sin texto reconocible. Estructura: %.700s", msg.String())
+	return ""
+}
+
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
@@ -185,7 +289,22 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Las imagenes, videos y documentos llevan su texto en el campo Caption.
+	// Sin esto se perdia la nota que acompana a cada factura enviada como foto.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	// Un documento con pie de foto viene envuelto en otro mensaje.
+	if wrapped := msg.GetDocumentWithCaptionMessage().GetMessage(); wrapped != nil {
+		return extractTextContent(wrapped)
+	}
+
 	return ""
 }
 
@@ -193,6 +312,13 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+}
+
+// ReactRequest es el cuerpo de /api/react. Emoji vacio quita la reaccion.
+type ReactRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	Emoji     string `json:"emoji"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -372,26 +498,42 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// sufijoUnico devuelve un trozo del id del mensaje para que dos archivos que
+// llegan en el mismo segundo no terminen con el mismo nombre. Antes se usaba
+// solo la hora con resolucion de segundos, y varias fotos enviadas juntas se
+// pisaban entre si al descargarlas.
+func sufijoUnico(msgID string) string {
+	if msgID == "" {
+		return ""
+	}
+	if len(msgID) > 8 {
+		msgID = msgID[len(msgID)-8:]
+	}
+	return "_" + msgID
+}
+
+func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	sello := time.Now().Format("20060102_150405") + sufijoUnico(msgID)
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + sello + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + sello + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + sello + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -399,10 +541,16 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + sello
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+	}
+
+	// Un documento enviado con pie de foto viene envuelto en otro mensaje y
+	// antes se descartaba entero: ni el archivo ni la nota llegaban a la base.
+	if wrapped := msg.GetDocumentWithCaptionMessage().GetMessage(); wrapped != nil {
+		return extractMediaInfo(wrapped, msgID)
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -413,6 +561,76 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+
+	// Reacciones: llegan envueltas en un Message normal. Antes se perdian aqui,
+	// porque extractTextContent devuelve "" y mas abajo se descarta todo lo que
+	// no tenga texto ni media.
+	reaction := msg.Message.GetReactionMessage()
+	if reaction == nil && msg.Message.GetEncReactionMessage() != nil {
+		// En algunos chats la reaccion viaja cifrada, igual que las ediciones.
+		if descifrada, err := client.DecryptReaction(context.Background(), msg); err != nil {
+			logger.Warnf("No se pudo descifrar una reaccion: %v", err)
+		} else {
+			reaction = descifrada
+		}
+	}
+	if reaction != nil {
+		targetID := reaction.GetKey().GetID()
+		emoji := reaction.GetText()
+		if targetID == "" {
+			return
+		}
+		var err error
+		if emoji == "" {
+			// Texto vacio = la persona quito su reaccion.
+			err = messageStore.DeleteReaction(targetID, chatJID, sender)
+		} else {
+			err = messageStore.StoreReaction(targetID, chatJID, sender, emoji, msg.Info.Timestamp)
+		}
+		if err != nil {
+			logger.Warnf("Failed to store reaction: %v", err)
+		} else {
+			fmt.Printf("[%s] reaccion %q de %s sobre %s\n",
+				msg.Info.Timestamp.Format("2006-01-02 15:04:05"), emoji, sender, targetID)
+		}
+		return
+	}
+
+	// Ediciones: hay que reemplazar el texto viejo, o la base queda mintiendo.
+	// WhatsApp manda el texto nuevo CIFRADO en un secretEncryptedMessage aparte,
+	// con el mensaje original apuntado por targetMessageKey (ojo: msg.Info.ID es
+	// el id del evento de edicion, no el del mensaje editado). Se contempla
+	// tambien la forma antigua en claro, por si algun cliente la sigue usando.
+	targetID, newContent := "", ""
+	if enc := msg.Message.GetSecretEncryptedMessage(); enc != nil &&
+		enc.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		targetID = enc.GetTargetMessageKey().GetID()
+		descifrado, err := client.DecryptSecretEncryptedMessage(context.Background(), msg)
+		if err != nil {
+			logger.Warnf("No se pudo descifrar la edicion de %s: %v", targetID, err)
+		} else {
+			newContent = extractEditedText(descifrado, logger)
+		}
+	} else if pm := msg.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		targetID = pm.GetKey().GetID()
+		newContent = extractTextContent(pm.GetEditedMessage())
+	}
+	if targetID != "" {
+		if newContent == "" {
+			logger.Warnf("Edicion de %s sin texto utilizable, se ignora", targetID)
+			return
+		}
+		encontrado, err := messageStore.UpdateMessageContent(targetID, chatJID, newContent)
+		if err != nil {
+			logger.Warnf("Failed to update edited message: %v", err)
+		} else if encontrado {
+			fmt.Printf("[%s] editado %s -> %s\n",
+				msg.Info.Timestamp.Format("2006-01-02 15:04:05"), targetID, newContent)
+		} else {
+			logger.Warnf("Edicion de un mensaje que no esta en la base: %s", targetID)
+		}
+		return
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -427,7 +645,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -454,6 +672,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
+		// Guardar el JID completo: hace falta para poder reaccionar a este
+		// mensaje mas tarde, y msg.Info.Sender.User solo trae la parte numerica.
+		if err := messageStore.StoreSenderJID(msg.Info.ID, chatJID, msg.Info.Sender.String()); err != nil {
+			logger.Warnf("Failed to store sender JID: %v", err)
+		}
+
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 		direction := "←"
@@ -640,8 +864,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	// whatsmeow descarga SOLO a partir de DirectPath (ignora URL), asi que no hay
+	// "reintento sin URL" que valga: si falla, es el path o la firma vencida.
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -656,23 +881,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 }
 
 // Extract direct path from a WhatsApp media URL
+// El "direct path" es todo lo que sigue al host, CON su query string. Ejemplo:
+//   https://mmg.whatsapp.net/v/t62.7118-24/xxx.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...
+//   -> /v/t62.7118-24/xxx.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...
+//
+// Los parametros oh/oe/ccb SON la firma que autoriza la descarga. whatsmeow arma
+// la URL final como "https://<host><directPath>&hash=...": asume que el path ya
+// trae su "?" y le pega mas parametros con "&". La version anterior de esta
+// funcion recortaba el query string "para limpiar", y el CDN respondia 403 a
+// TODAS las descargas (fotos, videos, audios) desde el 10/09/2026. Es el mismo
+// valor que devuelve GetDirectPath() del mensaje original.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url
 	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -721,6 +945,81 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Handler para reaccionar a un mensaje (poner o quitar un emoji).
+	// Es lo que permite marcar con 📌 una llamada ya subida a CompanyCam.
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ReactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		responder := func(ok bool, msg string) {
+			if !ok {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: ok, Message: msg})
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			responder(false, fmt.Sprintf("chat_jid invalido: %v", err))
+			return
+		}
+
+		// El JID del remitente original define la clave de la reaccion.
+		senderStr, isFromMe, err := messageStore.GetMessageSender(req.MessageID, req.ChatJID)
+		if err != nil {
+			responder(false, fmt.Sprintf("no encuentro el mensaje %s en la base: %v", req.MessageID, err))
+			return
+		}
+		var senderJID types.JID
+		if isFromMe {
+			senderJID = *client.Store.ID
+		} else if senderStr != "" {
+			senderJID, err = types.ParseJID(senderStr)
+			if err != nil {
+				responder(false, fmt.Sprintf("sender_jid invalido: %v", err))
+				return
+			}
+		} else {
+			// Mensajes anteriores a esta version no guardaron el JID completo.
+			// Se reconstruye desde la parte numerica: los identificadores largos
+			// son LIDs, los cortos son numeros de telefono.
+			senderNum, err := messageStore.GetMessageSenderUser(req.MessageID, req.ChatJID)
+			if err != nil || senderNum == "" {
+				responder(false, "el mensaje no tiene remitente guardado y no se puede reconstruir")
+				return
+			}
+			servidor := types.DefaultUserServer
+			if len(senderNum) > 13 {
+				servidor = types.HiddenUserServer
+			}
+			senderJID = types.NewJID(senderNum, servidor)
+			fmt.Printf("sender_jid reconstruido para %s: %s\n", req.MessageID, senderJID)
+		}
+
+		// Emoji vacio = quitar la reaccion.
+		reaction := client.BuildReaction(chatJID, senderJID, req.MessageID, req.Emoji)
+		if _, err := client.SendMessage(context.Background(), chatJID, reaction); err != nil {
+			responder(false, fmt.Sprintf("fallo al enviar la reaccion: %v", err))
+			return
+		}
+
+		fmt.Printf("Reaccion %q enviada sobre %s en %s\n", req.Emoji, req.MessageID, req.ChatJID)
+		responder(true, "Reaccion enviada")
 	})
 
 	// Handler for downloading media
@@ -800,14 +1099,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -871,6 +1170,7 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				os.WriteFile("qr_raw.txt", []byte(evt.Code), 0644)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -973,7 +1273,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1288,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1053,15 +1353,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
+				// Id del mensaje, necesario para el nombre de archivo unico.
+				idHistorial := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					idHistorial = *msg.Message.Key.ID
 				}
+
+				// Extract text content. Se usa la misma funcion que el camino
+				// normal para no volver a perder los pies de foto aqui.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1069,7 +1369,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, idHistorial)
 				}
 
 				// Log the message content for debugging
@@ -1099,10 +1399,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
+				msgID := idHistorial
 
 				// Get message timestamp
 				timestamp := time.Time{}
