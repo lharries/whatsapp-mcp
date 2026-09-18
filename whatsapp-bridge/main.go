@@ -276,7 +276,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "txt", "doc", "docx", "xls", "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = getMimeType(fileExt)
+
+		// Generic document for any other file type
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -590,8 +598,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// The stored filename comes from time.Now() at processing time, not from
+	// the message. During history sync dozens of messages are processed within
+	// the same second and all get the same "audio_<ts>.ogg" name. Since the
+	// cache check below returns the file whenever it exists, every audio in a
+	// chat would resolve to the first one downloaded. Key the path on the
+	// message ID, which is unique per message.
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, messageID, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -640,10 +653,28 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	// The stored URL is signed and expires; URLs that arrive through history
+	// sync are often already invalid. The direct path does not expire —
+	// whatsmeow re-signs a fresh URL from it — so try that first and only fall
+	// back to Download(), which prefers the stored URL.
+	ctx := context.Background()
+	var mediaData []byte
+
+	if directPath != "" && strings.HasPrefix(directPath, "/") {
+		mediaData, err = client.DownloadMediaWithPath(
+			ctx, directPath, fileEncSHA256, fileSHA256, mediaKey, waMediaType, "", false,
+		)
+	} else {
+		err = fmt.Errorf("no usable direct path")
+	}
+
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		var fallbackErr error
+		mediaData, fallbackErr = client.Download(ctx, downloader)
+		if fallbackErr != nil {
+			return false, "", "", "", fmt.Errorf(
+				"failed to download media: via direct path: %v; via url: %v", err, fallbackErr)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -666,13 +697,12 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query string. It carries oh/oe/_nc_sid/mms3, which are the
+	// CDN's authentication parameters. whatsmeow also builds the final URL by
+	// appending "&hash=..." directly to the direct path (see download.go), so
+	// it expects the query to already be there. Stripping it produces a URL
+	// with no "?" and a dangling "&", which the CDN rejects with 403.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -800,14 +830,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1003,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1018,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1180,6 +1210,26 @@ func requestHistorySync(client *whatsmeow.Client) {
 		fmt.Printf("Failed to request history sync: %v\n", err)
 	} else {
 		fmt.Println("History sync requested. Waiting for server response...")
+	}
+}
+
+// getMimeType returns the MIME type for a given file extension
+func getMimeType(ext string) string {
+	switch strings.ToLower(ext) {
+	case "pdf":
+		return "application/pdf"
+	case "txt":
+		return "text/plain"
+	case "doc":
+		return "application/msword"
+	case "docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case "xls":
+		return "application/vnd.ms-excel"
+	case "xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	default:
+		return "application/octet-stream"
 	}
 }
 
