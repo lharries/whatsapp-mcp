@@ -1,3 +1,15 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Session credentials, message history, downloaded media and local backups.
+# Never commit this directory.
+whatsapp-bridge/store/
+
+# Local configuration: contains real group JIDs once filled in.
+# Copy welcome.example.json to welcome.json and edit that instead.
+whatsapp-bridge/welcome.json
+
+# Build artefacts and local backups
+*.exe
+*.bak
