@@ -834,6 +834,9 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Welcome messages + join/leave tracking
+	initWelcome(client, messageStore, logger)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -847,6 +850,10 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+
+		case *events.GroupInfo:
+			// Joins and leaves: records them, and triggers the welcome message
+			handleGroupInfo(v, messageStore, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")

@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "debounce_seconds": 120,
+  "only_invite_joins": false,
+  "groups": {
+    "REPLACE_WITH_GROUP_JID@g.us": {
+      "message": "Welcome to the {count} new members!\n\nWhat's happening right now:\n{recap}\n\nSay hi, we're around.",
+      "cooldown_minutes": 30
+    }
+  }
+}

@@ -14,6 +14,81 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+## What this fork adds
+
+This fork keeps the upstream feature set and adds group management, plus join/leave
+tracking and an automatic welcome message. It also updates `whatsmeow`, which fixes a
+connection failure that affects the upstream repository.
+
+### Fixed: the bridge could no longer connect
+
+Upstream pins `whatsmeow` to a March 2025 revision. WhatsApp now rejects that client:
+the bridge starts, the websocket closes immediately with
+`close 1006 (abnormal closure): unexpected EOF`, and the QR code is never displayed.
+
+This fork upgrades `whatsmeow` and adapts the five call sites whose signatures changed
+(`Download`, `sqlstore.New`, `GetFirstDevice`, `GetGroupInfo`, `Contacts.GetContact`
+now all take a `context.Context`). If your bridge fails with a 1006 close right after
+`Starting WhatsApp client...`, this is the fix.
+
+### Join and leave tracking
+
+Upstream handles four events only: `Message`, `HistorySync`, `Connected`, `LoggedOut`.
+Membership changes are invisible to it.
+
+This fork handles `events.GroupInfo` and records every join and leave in a new
+`group_events` table, with the JID, the event type, the timestamp and the join reason
+(`invite` when the member arrived through an invite link). This makes retention
+measurable rather than a matter of impression.
+
+### Automatic welcome message
+
+Members who join a group cannot see messages posted before they arrived. A message sent
+*after* they join is visible to them, so the welcome is sent from the Go bridge itself,
+within a second of the join event, and works whether or not an MCP client is running.
+
+Configure it by copying `welcome.example.json` to `welcome.json`. It is disabled by
+default and nothing is sent until you enable it and name a group.
+
+| Field | Purpose |
+|---|---|
+| `enabled` | Master switch, off by default |
+| `debounce_seconds` | Joins arriving within this window produce a single message |
+| `only_invite_joins` | Restrict to members who joined via an invite link |
+| `groups` | Per group: message template and `cooldown_minutes` |
+
+The template accepts `{count}` (number of new members), `{names}` (their numbers) and
+`{recap}`, which is read from `store/recap.txt` at send time so the text can be refreshed
+without restarting the bridge.
+
+### Group management endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/groups` | GET | Group metadata: name, topic, participant count, `is_announce`, `is_community`, `is_default_subgroup`, `linked_parent_jid` |
+| `/api/group_events` | GET | Recorded joins and leaves, filterable by `group` and `days` |
+| `/api/set_name` | POST | Rename a group |
+| `/api/set_description` | POST | Set a group description |
+| `/api/set_photo` | POST | Set a group picture from a local JPEG, or remove it |
+| `/api/picture` | GET | The picture a group currently shows |
+
+### Notes on WhatsApp Communities
+
+These behaviours are undocumented and were established by testing against a live
+community. They are worth knowing before writing code against them.
+
+- **Descriptions are independent.** Setting the community description does not change
+  the announcement group description. They are separate values that happen to be
+  identical when the community is created.
+- **Names propagate.** Renaming the community renames the announcement group too.
+  Calling `/api/set_name` on the announcement group returns `400 bad-request` even
+  though the resulting name is correct.
+- **The announcement group picture cannot be set.** `/api/set_photo` returns
+  `401 not-authorized`, and the WhatsApp app does not allow it either.
+- Joining a community adds the member to the announcement group automatically. Other
+  subgroups are opt-in, so a member is only guaranteed to see the announcement group,
+  which is read-only for everyone except admins.
+
 ## Installation
 
 ### Prerequisites
