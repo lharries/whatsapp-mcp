@@ -7,8 +7,10 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+_DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Overridable per account so several bridges (one per phone number) can run side by side.
+MESSAGES_DB_PATH = os.environ.get("WHATSAPP_MESSAGES_DB", _DEFAULT_DB)
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
 
 @dataclass
 class Message:

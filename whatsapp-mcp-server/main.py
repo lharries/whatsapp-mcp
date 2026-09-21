@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import os
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -16,7 +17,7 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP(os.environ.get("WHATSAPP_MCP_NAME", "whatsapp"))
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:

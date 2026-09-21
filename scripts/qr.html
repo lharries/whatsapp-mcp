@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WhatsApp QR</title>
+<meta http-equiv="refresh" content="4">
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:system-ui;background:#f4f4f4;color:#222}
+  img{width:min(70vw,420px);height:auto;image-rendering:pixelated;background:#fff;padding:16px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.12)}
+  h1{font-size:20px;margin:0 0 12px} p{font-size:14px;color:#555;margin:12px 0 0}
+</style>
+<h1 id="t">Escaneá con WhatsApp</h1>
+<img id="qr" alt="QR todavía no generado…">
+<p>WhatsApp › Dispositivos vinculados › Vincular un dispositivo. La página se actualiza sola cada 4s.</p>
+<script>
+  const a = new URLSearchParams(location.search).get("account") || "";
+  document.getElementById("t").textContent = "Escaneá con WhatsApp — cuenta: " + a;
+  document.getElementById("qr").src = "../accounts/" + a + "/store/qr.png?t=" + Date.now();
+</script>

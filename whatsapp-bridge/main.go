@@ -13,17 +13,21 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -101,7 +105,11 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = excluded.name,
+			last_message_time = CASE WHEN excluded.last_message_time > chats.last_message_time
+				THEN excluded.last_message_time ELSE chats.last_message_time END`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -641,7 +649,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +782,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	registerBackfillRoutes(client, messageStore)
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +810,33 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	// Ask the phone for as much history as it will give when pairing (default is ~1 year).
+	// Only takes effect on a fresh pairing; WHATSAPP_FULL_SYNC_DAYS=0 disables it.
+	fullSyncDays := uint32(3650)
+	if v := os.Getenv("WHATSAPP_FULL_SYNC_DAYS"); v != "" {
+		parsed, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			logger.Errorf("Invalid WHATSAPP_FULL_SYNC_DAYS %q", v)
+			return
+		}
+		fullSyncDays = uint32(parsed)
+	}
+	if fullSyncDays > 0 {
+		store.DeviceProps.RequireFullSync = proto.Bool(true)
+		store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(fullSyncDays)
+		store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(10240)
+		store.DeviceProps.HistorySyncConfig.StorageQuotaMb = proto.Uint32(20480)
+		logger.Infof("Requesting full history sync on pairing: %d days", fullSyncDays)
+	}
+
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -866,14 +895,39 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Optional: pair with an 8-character code instead of scanning a QR.
+		// Set WHATSAPP_PAIR_PHONE to the full international number (digits only).
+		pairPhone := os.Getenv("WHATSAPP_PAIR_PHONE")
+		pairRequested := false
+
+		// Print QR code for pairing with phone (also saved as store/qr.png)
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				if err := qrcode.WriteFile(evt.Code, qrcode.Medium, 512, "store/qr.png"); err != nil {
+					logger.Warnf("Failed to write QR PNG: %v", err)
+				}
+				if pairPhone != "" && !pairRequested {
+					pairRequested = true
+					code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+					if err != nil {
+						logger.Errorf("Failed to request pairing code: %v", err)
+					} else {
+						fmt.Printf("\nPAIRING CODE for %s: %s\n", pairPhone, code)
+						fmt.Println("On your phone: WhatsApp > Linked devices > Link a device > Link with phone number instead")
+						if err := os.WriteFile("store/pair_code.txt", []byte(code), 0600); err != nil {
+							logger.Warnf("Failed to write pairing code file: %v", err)
+						}
+					}
+				}
 			} else if evt.Event == "success" {
+				os.Remove("store/qr.png")
+				os.Remove("store/pair_code.txt")
 				connected <- true
 				break
+			} else {
+				fmt.Printf("QR channel event: %s\n", evt.Event)
 			}
 		}
 
@@ -892,6 +946,16 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
+		if os.Getenv("WHATSAPP_LOGOUT") == "1" {
+			// Unlink this device from the phone and exit; the store can then be deleted safely.
+			time.Sleep(2 * time.Second)
+			if err := client.Logout(context.Background()); err != nil {
+				logger.Errorf("Logout failed: %v", err)
+				os.Exit(1)
+			}
+			fmt.Println("Device unlinked from phone. Exiting.")
+			return
+		}
 		connected <- true
 	}
 
@@ -905,8 +969,17 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (port from WHATSAPP_PORT, default 8080)
+	port := 8080
+	if p := os.Getenv("WHATSAPP_PORT"); p != "" {
+		parsed, err := strconv.Atoi(p)
+		if err != nil || parsed <= 0 || parsed > 65535 {
+			logger.Errorf("Invalid WHATSAPP_PORT %q", p)
+			return
+		}
+		port = parsed
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1046,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1061,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1060,6 +1133,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						content = conv
 					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
 						content = ext.GetText()
+					} else if img := msg.Message.Message.GetImageMessage(); img != nil {
+						content = img.GetCaption()
+					} else if vid := msg.Message.Message.GetVideoMessage(); vid != nil {
+						content = vid.GetCaption()
+					} else if doc := msg.Message.Message.GetDocumentMessage(); doc != nil {
+						content = doc.GetCaption()
 					}
 				}
 
@@ -1075,9 +1154,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
-				// Skip messages with no content and no media
+				// Keep messages with no text/media as typed placeholders so nothing is lost
+				// and the backfill always has an anchor to page back from.
 				if content == "" && mediaType == "" {
-					continue
+					mediaType = messageKind(msg.Message.Message)
+					if mediaType == "unknown" {
+						logger.Infof("Untyped history message: %s", msg.Message.String())
+					}
 				}
 
 				// Determine sender
@@ -1145,6 +1228,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+
+	if historySync.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+		select {
+		case onDemandSyncCh <- summarizeOnDemand(historySync):
+		default:
+		}
+	}
 }
 
 // Request history sync from the server
