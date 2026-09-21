@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -656,23 +657,28 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 }
 
 // Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+//
+// The direct path must include the URL's query string byte-for-byte:
+// whatsmeow's downloader builds the actual CDN request as
+// directPath + "&hash=..." + more params, and that query carries the
+// request's signature (oh=/oe=/ccb=/etc). Stripping it (the previous
+// behavior here) produces an unsigned request that the CDN rejects with
+// a 403 -- in practice for every media message, since observed
+// production URLs of both known shapes carry a query string 100% of the
+// time. Do not rebuild this with u.String()/u.Query().Encode(): both can
+// re-escape or reorder the query and break the signature just as
+// thoroughly as dropping it outright.
+func extractDirectPathFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || u.EscapedPath() == "" {
+		return rawURL // fall back to the original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	directPath := u.EscapedPath()
+	if u.RawQuery != "" {
+		directPath += "?" + u.RawQuery
+	}
+	return directPath
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
