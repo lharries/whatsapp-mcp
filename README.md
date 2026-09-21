@@ -140,6 +140,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **transcribe_audio**: Transcribe a voice message from a chat to text, locally
+- **transcribe_audio_file**: Transcribe any local audio file to text, locally
 
 ### Media Handling Features
 
@@ -158,6 +160,38 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+
+#### Voice Message Transcription
+
+Voice messages can be transcribed to text locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so audio never leaves your machine and no API key is needed.
+
+- **transcribe_audio** takes a `message_id` and `chat_jid`, downloads the voice message and returns its transcript.
+- **transcribe_audio_file** does the same for any local audio file.
+
+Both accept an optional `language` hint (auto-detected otherwise), `translate_to_english`, `with_timestamps` for per-segment times, and `model_size` to override the model.
+
+FFmpeg is used to normalise the audio, and is already a prerequisite for sending voice messages.
+
+Whisper runs in a small worker process rather than inside the MCP server. That keeps the speech stack and its CUDA libraries out of the served process, and keeps a long decode off the event loop, where it would otherwise block every other tool call. The worker stays alive between requests, so the model is loaded once: the first call costs a few seconds more than later ones.
+
+Configuration via environment variables:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WHISPER_MODEL` | `large-v3-turbo` | Any faster-whisper model, e.g. `tiny`, `base`, `small`, `large-v3` |
+| `WHISPER_DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to try CUDA and fall back to CPU |
+| `WHISPER_COMPUTE_TYPE` | `float16` on CUDA, `int8` on CPU | CTranslate2 compute type |
+| `WHISPER_WORKER_TIMEOUT` | `900` | Seconds to wait for the worker before giving up |
+
+Transcription runs on the CPU out of the box. For GPU acceleration on an NVIDIA card, install the optional CUDA libraries:
+
+```bash
+cd whatsapp-mcp-server
+uv sync --extra cuda
+```
+
+The server locates these wheels itself, so no system-wide CUDA installation or `PATH` changes are required. If the GPU is unusable for any reason, it falls back to the CPU automatically.
 
 ## Technical Details
 

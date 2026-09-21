@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -14,6 +15,7 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from worker_client import transcribe as transcribe_file
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -245,6 +247,74 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    language: Optional[str] = None,
+    translate_to_english: bool = False,
+    with_timestamps: bool = False,
+    model_size: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Transcribe a WhatsApp voice message or audio file to text, locally.
+
+    Downloads the message media if needed, then runs speech-to-text with
+    faster-whisper. The first call loads the model and may take a while.
+
+    Args:
+        message_id: The ID of the message containing the voice/audio
+        chat_jid: The JID of the chat containing the message
+        language: Optional ISO code hint (e.g. "ru", "en", "kk"); auto-detected if omitted
+        translate_to_english: Return an English translation instead of the original language
+        with_timestamps: Include per-segment start/end times
+        model_size: Override the whisper model (e.g. "small", "large-v3")
+
+    Returns:
+        A dictionary with the transcript, detected language and run details
+    """
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "message": "Failed to download audio from the message"}
+
+    result = transcribe_file(
+        file_path,
+        language=language,
+        translate_to_english=translate_to_english,
+        model_size=model_size,
+        with_timestamps=with_timestamps,
+    )
+    result["file_path"] = file_path
+    return result
+
+
+@mcp.tool()
+def transcribe_audio_file(
+    audio_path: str,
+    language: Optional[str] = None,
+    translate_to_english: bool = False,
+    with_timestamps: bool = False,
+    model_size: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Transcribe a local audio file to text, without going through WhatsApp.
+
+    Args:
+        audio_path: Absolute path to an audio file (any format ffmpeg can read)
+        language: Optional ISO code hint (e.g. "ru", "en", "kk"); auto-detected if omitted
+        translate_to_english: Return an English translation instead of the original language
+        with_timestamps: Include per-segment start/end times
+        model_size: Override the whisper model (e.g. "small", "large-v3")
+
+    Returns:
+        A dictionary with the transcript, detected language and run details
+    """
+    return transcribe_file(
+        audio_path,
+        language=language,
+        translate_to_english=translate_to_english,
+        model_size=model_size,
+        with_timestamps=with_timestamps,
+    )
 
 if __name__ == "__main__":
     # Initialize and run the server

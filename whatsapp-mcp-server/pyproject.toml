@@ -5,7 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+]
+
+[project.optional-dependencies]
+# GPU acceleration for transcription. Optional: without it, faster-whisper
+# falls back to CPU. Only ships wheels for Linux/Windows x86_64.
+cuda = [
+    "nvidia-cublas-cu12>=12.4",
+    "nvidia-cudnn-cu12>=9.0",
 ]
