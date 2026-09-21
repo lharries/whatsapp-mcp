@@ -1,5 +1,6 @@
-from typing import List, Dict, Any, Optional
-from mcp.server.fastmcp import FastMCP
+import os
+from typing import List, Dict, Any, Optional, Union
+from mcp.server.fastmcp import FastMCP, Image
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -14,6 +15,8 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from worker_client import transcribe as transcribe_file
+from media import extract_frames, format_timestamp, load_image, probe as probe_video
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -245,6 +248,242 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    language: Optional[str] = None,
+    translate_to_english: bool = False,
+    with_timestamps: bool = False,
+    model_size: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Transcribe a WhatsApp voice message or audio file to text, locally.
+
+    Downloads the message media if needed, then runs speech-to-text with
+    faster-whisper. The first call loads the model and may take a while.
+
+    Args:
+        message_id: The ID of the message containing the voice/audio
+        chat_jid: The JID of the chat containing the message
+        language: Optional ISO code hint (e.g. "ru", "en", "kk"); auto-detected if omitted
+        translate_to_english: Return an English translation instead of the original language
+        with_timestamps: Include per-segment start/end times
+        model_size: Override the whisper model (e.g. "small", "large-v3")
+
+    Returns:
+        A dictionary with the transcript, detected language and run details
+    """
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "message": "Failed to download audio from the message"}
+
+    result = transcribe_file(
+        file_path,
+        language=language,
+        translate_to_english=translate_to_english,
+        model_size=model_size,
+        with_timestamps=with_timestamps,
+    )
+    result["file_path"] = file_path
+    return result
+
+
+@mcp.tool()
+def transcribe_audio_file(
+    audio_path: str,
+    language: Optional[str] = None,
+    translate_to_english: bool = False,
+    with_timestamps: bool = False,
+    model_size: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Transcribe a local audio file to text, without going through WhatsApp.
+
+    Args:
+        audio_path: Absolute path to an audio file (any format ffmpeg can read)
+        language: Optional ISO code hint (e.g. "ru", "en", "kk"); auto-detected if omitted
+        translate_to_english: Return an English translation instead of the original language
+        with_timestamps: Include per-segment start/end times
+        model_size: Override the whisper model (e.g. "small", "large-v3")
+
+    Returns:
+        A dictionary with the transcript, detected language and run details
+    """
+    return transcribe_file(
+        audio_path,
+        language=language,
+        translate_to_english=translate_to_english,
+        model_size=model_size,
+        with_timestamps=with_timestamps,
+    )
+
+
+def _render_image(path: str, max_dimension: int) -> List[Union[str, Image]]:
+    try:
+        loaded = load_image(path, max_dimension=max_dimension)
+    except Exception as e:
+        return [f"Could not read the image: {e}"]
+
+    size = (f"{loaded['width']}x{loaded['height']}"
+            if loaded["width"] else "unknown size")
+    return [f"Image ({size}, shown at up to {max_dimension}px):",
+            Image(data=loaded["jpeg"], format="jpeg")]
+
+
+def _render_video(path: str, max_frames: int, interval_seconds: Optional[float],
+                  max_dimension: int, transcribe: bool, language: Optional[str],
+                  mode: str) -> List[Union[str, Image]]:
+    """Build the mixed text/image reply that lets the model actually watch a video."""
+    result = extract_frames(
+        path,
+        max_frames=max_frames,
+        interval_seconds=interval_seconds,
+        max_dimension=max_dimension,
+        mode=mode,
+    )
+
+    header = (
+        f"Video: {result['duration_seconds']}s, {result['width']}x{result['height']}, "
+        f"{result['fps']} fps. Showing {result['frame_count']} frames "
+        f"({'at scene changes' if result['sampling'] == 'scenes' else 'sampled evenly'})."
+    )
+    parts: List[Union[str, Image]] = [header]
+
+    if transcribe:
+        if result["has_audio"]:
+            spoken = transcribe_file(path, language=language)
+            if spoken.get("success") and spoken.get("text"):
+                parts.append(f"Transcript ({spoken['language']}): {spoken['text']}")
+            elif spoken.get("success"):
+                parts.append("Transcript: no speech detected.")
+            else:
+                parts.append(f"Transcript failed: {spoken.get('message')}")
+        else:
+            parts.append("This video has no audio track.")
+
+    for frame in result["frames"]:
+        parts.append(f"[{format_timestamp(frame['time'])}]")
+        parts.append(Image(data=frame["jpeg"], format="jpeg"))
+
+    if not result["frames"]:
+        parts.append("No frames could be decoded from this video.")
+    return parts
+
+
+@mcp.tool()
+def view_video(
+    message_id: str,
+    chat_jid: str,
+    max_frames: int = 8,
+    interval_seconds: Optional[float] = None,
+    max_dimension: int = 640,
+    transcribe: bool = True,
+    language: Optional[str] = None,
+    mode: str = "auto",
+) -> List[Union[str, Image]]:
+    """Watch a video message: returns frames as images plus a transcript of its audio.
+
+    Frames are returned as image content rather than file paths, so the video can
+    be seen directly. By default frames are taken at scene changes, falling back
+    to even sampling for static or long videos.
+
+    Args:
+        message_id: The ID of the message containing the video
+        chat_jid: The JID of the chat containing the message
+        max_frames: Maximum number of frames to return (each one costs context)
+        interval_seconds: Force a fixed interval between frames instead of automatic selection
+        max_dimension: Longest side of each frame in pixels
+        transcribe: Also transcribe the video's audio track locally
+        language: Optional ISO code hint for the transcript (e.g. "ru", "en")
+        mode: "auto", "scenes" or "interval" frame selection
+
+    Returns:
+        A list of text labels and frame images, in chronological order
+    """
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return ["Failed to download the video from that message."]
+
+    try:
+        return _render_video(file_path, max_frames, interval_seconds, max_dimension,
+                             transcribe, language, mode)
+    except Exception as e:
+        return [f"Could not inspect the video: {e}"]
+
+
+@mcp.tool()
+def view_video_file(
+    video_path: str,
+    max_frames: int = 8,
+    interval_seconds: Optional[float] = None,
+    max_dimension: int = 640,
+    transcribe: bool = True,
+    language: Optional[str] = None,
+    mode: str = "auto",
+) -> List[Union[str, Image]]:
+    """Watch a local video file: returns frames as images plus a transcript of its audio.
+
+    Args:
+        video_path: Absolute path to a video file
+        max_frames: Maximum number of frames to return (each one costs context)
+        interval_seconds: Force a fixed interval between frames instead of automatic selection
+        max_dimension: Longest side of each frame in pixels
+        transcribe: Also transcribe the video's audio track locally
+        language: Optional ISO code hint for the transcript (e.g. "ru", "en")
+        mode: "auto", "scenes" or "interval" frame selection
+
+    Returns:
+        A list of text labels and frame images, in chronological order
+    """
+    if not os.path.isfile(video_path):
+        return [f"File not found: {video_path}"]
+    try:
+        return _render_video(video_path, max_frames, interval_seconds, max_dimension,
+                             transcribe, language, mode)
+    except Exception as e:
+        return [f"Could not inspect the video: {e}"]
+
+
+@mcp.tool()
+def view_image(
+    message_id: str,
+    chat_jid: str,
+    max_dimension: int = 1024,
+) -> List[Union[str, Image]]:
+    """Look at an image message: returns the picture itself, not a file path.
+
+    Args:
+        message_id: The ID of the message containing the image
+        chat_jid: The JID of the chat containing the message
+        max_dimension: Longest side of the returned image in pixels
+
+    Returns:
+        A short description followed by the image
+    """
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return ["Failed to download the image from that message."]
+    return _render_image(file_path, max_dimension)
+
+
+@mcp.tool()
+def view_image_file(
+    image_path: str,
+    max_dimension: int = 1024,
+) -> List[Union[str, Image]]:
+    """Look at a local image file: returns the picture itself, not a file path.
+
+    Args:
+        image_path: Absolute path to an image file
+        max_dimension: Longest side of the returned image in pixels
+
+    Returns:
+        A short description followed by the image
+    """
+    if not os.path.isfile(image_path):
+        return [f"File not found: {image_path}"]
+    return _render_image(image_path, max_dimension)
+
 
 if __name__ == "__main__":
     # Initialize and run the server

@@ -140,6 +140,12 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **transcribe_audio**: Transcribe a voice message from a chat to text, locally
+- **transcribe_audio_file**: Transcribe any local audio file to text, locally
+- **view_image**: Look at an image message - returns the picture itself, not a file path
+- **view_image_file**: The same for any local image file
+- **view_video**: Watch a video message - returns frames as images plus a transcript of its audio
+- **view_video_file**: The same for any local video file
 
 ### Media Handling Features
 
@@ -158,6 +164,58 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+
+#### Voice Message Transcription
+
+Voice messages can be transcribed to text locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so audio never leaves your machine and no API key is needed.
+
+- **transcribe_audio** takes a `message_id` and `chat_jid`, downloads the voice message and returns its transcript.
+- **transcribe_audio_file** does the same for any local audio file.
+
+Both accept an optional `language` hint (auto-detected otherwise), `translate_to_english`, `with_timestamps` for per-segment times, and `model_size` to override the model.
+
+The model is downloaded on first use and cached in memory afterwards, so only the first call is slow. FFmpeg is used to normalise the audio, and is already a prerequisite for sending voice messages.
+
+Configuration via environment variables:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WHISPER_MODEL` | `large-v3-turbo` | Any faster-whisper model, e.g. `tiny`, `base`, `small`, `large-v3` |
+| `WHISPER_DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to try CUDA and fall back to CPU |
+| `WHISPER_COMPUTE_TYPE` | `float16` on CUDA, `int8` on CPU | CTranslate2 compute type |
+
+Transcription runs on the CPU out of the box. For GPU acceleration on an NVIDIA card, install the optional CUDA libraries:
+
+```bash
+cd whatsapp-mcp-server
+uv sync --extra cuda
+```
+
+The server locates these wheels itself, so no system-wide CUDA installation or `PATH` changes are required. If the GPU is unusable for any reason, it falls back to the CPU automatically.
+
+
+#### Viewing Images
+
+**view_image** returns an image message as picture content instead of a file path, so the image can be seen directly by clients that have no filesystem access. **view_image_file** does the same for a local file. Images are downscaled to `max_dimension` (1024px by default) before being returned, since one full-resolution photo would otherwise cost far more context than it is worth.
+
+#### Watching Videos
+
+**view_video** turns a video message into something a model can actually look at: a set of frames returned as image content, plus a transcript of the audio. Frames come back as images rather than file paths, so clients with no filesystem access can see them too. **view_video_file** does the same for a local file.
+
+By default frames are taken **at scene changes**, which shows what actually happens in the video instead of whatever a fixed timer lands on. Videos with fewer than three detected cuts, and those longer than 10 minutes (where scene detection would mean decoding the whole file), fall back to even sampling.
+
+Because every frame costs context, the frame count is capped rather than the interval fixed: a ten-minute video sampled every five seconds would return 120 images.
+
+| Argument | Default | Notes |
+| --- | --- | --- |
+| `max_frames` | 8 | Upper bound on returned frames |
+| `interval_seconds` | auto | Force a fixed interval instead of automatic selection |
+| `max_dimension` | 640 | Longest side of each frame, in pixels |
+| `transcribe` | true | Also transcribe the audio track |
+| `mode` | `auto` | `auto`, `scenes` or `interval` |
+
+Videos with no audio track are reported as such rather than failing.
 
 ## Technical Details
 
