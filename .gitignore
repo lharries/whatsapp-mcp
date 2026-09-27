@@ -1,3 +1,10 @@
 *.db
+.env
 claude_desktop_config.json
 whatsapp.log
+
+# Runtime data and build output stay local
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-bridge
+.DS_Store
+.idea/
