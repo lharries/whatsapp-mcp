@@ -774,6 +774,75 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for requesting older history for one chat.
+	// WhatsApp only pushes a limited window of messages at first sync. This asks the phone for
+	// `count` messages older than the oldest one we have stored for the chat; the reply arrives
+	// as a normal HistorySync event and is stored by the existing handler.
+	http.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
+		chat := r.URL.Query().Get("chat")
+		count := 200
+		if c := r.URL.Query().Get("count"); c != "" {
+			fmt.Sscanf(c, "%d", &count)
+		}
+		jid, err := types.ParseJID(chat)
+		if err != nil || chat == "" {
+			http.Error(w, "valid chat JID required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() || client.Store.ID == nil {
+			http.Error(w, "client not connected", http.StatusServiceUnavailable)
+			return
+		}
+
+		var id, sender, tsText string
+		var fromMe bool
+		err = messageStore.db.QueryRow(
+			`SELECT id, sender, timestamp, is_from_me FROM messages WHERE chat_jid = ? AND id != '' ORDER BY timestamp ASC LIMIT 1`,
+			chat,
+		).Scan(&id, &sender, &tsText, &fromMe)
+		if err != nil {
+			http.Error(w, "no stored message for chat: "+err.Error(), http.StatusNotFound)
+			return
+		}
+		var ts time.Time
+		for _, layout := range []string{"2006-01-02 15:04:05-07:00", time.RFC3339, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02T15:04:05Z07:00"} {
+			if t, perr := time.Parse(layout, tsText); perr == nil {
+				ts = t
+				break
+			}
+		}
+		if ts.IsZero() {
+			http.Error(w, "unparseable timestamp "+tsText, http.StatusInternalServerError)
+			return
+		}
+
+		info := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: jid, IsFromMe: fromMe, IsGroup: jid.Server == types.GroupServer},
+			ID:            id,
+			Timestamp:     ts,
+		}
+		if fromMe {
+			info.Sender = client.Store.ID.ToNonAD()
+		} else if info.IsGroup {
+			info.Sender = types.NewJID(sender, types.DefaultUserServer)
+		} else {
+			info.Sender = jid
+		}
+		msg := client.BuildHistorySyncRequest(info, count)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), msg, whatsmeow.SendRequestExtra{Peer: true})
+		if err != nil {
+			http.Error(w, "request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"requested":    count,
+			"chat":         chat,
+			"oldest_known": ts.Format(time.RFC3339),
+			"oldest_id":    id,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
