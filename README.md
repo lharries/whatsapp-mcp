@@ -120,6 +120,18 @@ This application consists of two main components:
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
 
+### Loading older history
+
+WhatsApp only sends a limited window of past messages when the bridge first connects, so older conversations can look thin. The bridge exposes `GET /api/backfill?chat=<jid>&count=<n>` (default 200), which asks your phone for messages older than the oldest one already stored for that chat. The reply arrives through the normal history sync path and is written to the same database, so it can take a few seconds to show up.
+
+To walk a chat back to a date, run the helper from the `whatsapp-bridge/` directory while the bridge is running:
+
+```bash
+python3 backfill.py 2026-03-01 1234567890@s.whatsapp.net 120363000000000000@g.us
+```
+
+It repeats the request until the oldest stored message is on or before the date, or the phone stops returning anything older. The phone has to be online for this to work.
+
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
