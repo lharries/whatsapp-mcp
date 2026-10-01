@@ -4,21 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal"
 
 	"bytes"
 
@@ -49,7 +46,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -288,7 +285,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		// Do not log upload keys or metadata.
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -561,10 +558,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := ""
-
 	// Get media info from the database
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
 
@@ -584,33 +577,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	if mediaType == "" {
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
-
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
-	}
-
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
-
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		return true, mediaType, filename, absPath, nil
-	}
-
-	// If we don't have all the media info we need, we can't download
-	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
-	}
-
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -640,19 +606,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	path, err := cachedOrDownloadMedia("store/media", chatJID, messageID, mediaType, filename, func() ([]byte, error) {
+		if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+			return nil, fmt.Errorf("incomplete media information")
+		}
+		return client.Download(context.Background(), downloader)
+	})
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		return false, "", "", "", err
 	}
-
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
-	}
-
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, filename, path, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -675,118 +638,29 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
-	})
-
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req DownloadMediaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.MessageID == "" || req.ChatJID == "" {
-			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
-			return
-		}
-
-		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Handle download result
-		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
-			}
-
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
-			})
-			return
-		}
-
-		// Send successful response
-		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
-		})
-	})
-
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-
-	// Run server in a goroutine so it doesn't block
-	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
-		}
-	}()
-}
-
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "--initialize-tls" {
+		if err := initializeLocalTLS(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "Cannot initialize private TLS identity:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	apiToken := os.Getenv("WHATSAPP_API_TOKEN")
+	if len(apiToken) < 32 {
+		fmt.Fprintln(os.Stderr, "Bridge authentication token is missing")
+		return
+	}
+	apiPort := defaultAPIPort
+	if value := os.Getenv("WHATSAPP_API_PORT"); value != "" {
+		var err error
+		apiPort, err = strconv.Atoi(value)
+		if err != nil || apiPort < 1024 || apiPort > 65535 {
+			fmt.Fprintln(os.Stderr, "Invalid bridge port")
+			return
+		}
+	}
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -795,19 +669,19 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -833,6 +707,17 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	pairing.Lock()
+	pairing.Paired = client.Store.ID != nil
+	pairing.Unlock()
+	server, err := startRESTServer(client, messageStore, apiPort, apiToken)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Cannot start private bridge:", err)
+		return
+	}
+	defer server.Close()
+	exitChan := make(chan os.Signal, 1)
+	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -849,17 +734,26 @@ func main() {
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
+			pairing.Lock()
+			pairing.Paired = false
+			pairing.QR = ""
+			pairing.Unlock()
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			select {
+			case exitChan <- syscall.SIGTERM:
+			default:
+			}
 		}
 	})
-
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, qrErr := client.GetQRChannel(context.Background())
+		if qrErr != nil {
+			logger.Errorf("Cannot begin pairing: %v", qrErr)
+			return
+		}
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
@@ -870,19 +764,36 @@ func main() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				pairing.Lock()
+				pairing.QR = evt.Code
+				pairing.Error = ""
+				pairing.Unlock()
 			} else if evt.Event == "success" {
-				connected <- true
+				pairing.Lock()
+				pairing.Paired = true
+				pairing.QR = ""
+				pairing.Error = ""
+				pairing.Unlock()
 				break
+			} else if evt.Event == whatsmeow.QRChannelEventPasskeyRequest || evt.Event == whatsmeow.QRChannelEventPasskeyResponse {
+				// These events do not close the dependency's QR channel.
+				pairing.Lock()
+				pairing.QR = ""
+				pairing.Error = "Passkey pairing is not supported; use WhatsApp Linked devices QR pairing."
+				pairing.Unlock()
+			} else {
+				pairing.Lock()
+				pairing.QR = ""
+				pairing.Unlock()
+				logger.Warnf("Pairing ended: %s", evt.Event)
+				return
 			}
 		}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+		pairing.RLock()
+		paired := pairing.Paired
+		pairing.RUnlock()
+		if !paired {
 			return
 		}
 	} else {
@@ -892,7 +803,6 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -905,13 +815,9 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Authenticated loopback server is already running.
 
 	// Create a channel to keep the main goroutine alive
-	exitChan := make(chan os.Signal, 1)
-	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
 	// Wait for termination signal
@@ -973,7 +879,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +894,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1228,19 +1134,23 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 			pageSize += int(segLen)
 		}
 
+		if pageSize > len(data)-i {
+			return 0, nil, fmt.Errorf("truncated Ogg page")
+		}
+
 		// Check if we're looking at an OpusHead packet (should be in first few pages)
 		if !foundOpusHead && pageSeqNum <= 1 {
 			// Look for "OpusHead" marker in this page
 			pageData := data[i : i+pageSize]
 			headPos := bytes.Index(pageData, []byte("OpusHead"))
-			if headPos >= 0 && headPos+12 < len(pageData) {
+			if headPos >= 0 && headPos+19 <= len(pageData) {
 				// Found OpusHead, extract sample rate and pre-skip
 				// OpusHead format: Magic(8) + Version(1) + Channels(1) + PreSkip(2) + SampleRate(4) + ...
 				headPos += 8 // Skip "OpusHead" marker
 				// PreSkip is 2 bytes at offset 10
-				if headPos+12 <= len(pageData) {
-					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
-					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
+				if headPos+8 <= len(pageData) {
+					preSkip = binary.LittleEndian.Uint16(pageData[headPos+2 : headPos+4])
+					// Opus granule positions always use 48 kHz.
 					foundOpusHead = true
 					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
 				}

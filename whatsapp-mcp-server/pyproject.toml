@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]>=1.6.0,<2",
     "requests>=2.32.3",
+    "qrcode[pil]>=8.0",
 ]
