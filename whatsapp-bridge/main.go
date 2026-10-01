@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"flag"
 	"math"
 	"math/rand"
 	"net/http"
@@ -786,7 +787,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+var phonePair = flag.String("phone", "", "Phone number for code pairing (e.g. 90546xxxxxxx)")
+
 func main() {
+	flag.Parse()
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -867,13 +871,30 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		if *phonePair != "" {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					code, err := client.PairPhone(context.Background(), *phonePair, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+					if err != nil {
+						logger.Errorf("PairPhone failed: %v", err)
+					} else {
+						fmt.Printf("\n>>> WhatsApp Pairing Code: %s <<<\n", code)
+					}
+					break
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
+			}
+		} else {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
 			}
 		}
 
