@@ -590,8 +590,20 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file. Names come from the receive
+	// time to the second (or the sender's document name), so two photos sent
+	// together share one; give each such message its own file, suffixed with
+	// its id, or the second download silently returns the first one's bytes.
+	localName := filename
+	var sameName int
+	if err := messageStore.db.QueryRow(
+		"SELECT COUNT(*) FROM messages WHERE chat_jid = ? AND filename = ? AND id != ?",
+		chatJID, filename, messageID,
+	).Scan(&sameName); err == nil && sameName > 0 {
+		ext := filepath.Ext(filename)
+		localName = strings.TrimSuffix(filename, ext) + "_" + messageID + ext
+	}
+	localPath = fmt.Sprintf("%s/%s", chatDir, localName)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -602,7 +614,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, localName, absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -652,7 +664,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, localName, absPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
