@@ -20,7 +20,7 @@ Here's an example of what you can do when it's connected to Claude.
 
 - Go
 - Python 3.6+
-- Anthropic Claude Desktop app (or Cursor)
+- Anthropic Claude Desktop app (or Cursor, or Antigravity CLI)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
 
@@ -78,11 +78,39 @@ Here's an example of what you can do when it's connected to Claude.
    ~/.cursor/mcp.json
    ```
 
-4. **Restart Claude Desktop / Cursor**
+   For **Antigravity CLI** (`agy`), add it to the global config at:
+
+   ```
+   ~/.gemini/config/mcp_config.json
+   ```
+
+   or to `.agents/mcp_config.json` in a project if you only want WhatsApp available there. Antigravity expects plain JSON, so drop the `//` comments from the snippet above and use absolute paths (`~` isn't expanded). It should end up looking something like:
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "/home/you/.local/bin/uv",
+         "args": [
+           "--directory",
+           "/home/you/whatsapp-mcp/whatsapp-mcp-server",
+           "run",
+           "main.py"
+         ]
+       }
+     }
+   }
+   ```
+
+   If the file already has other servers in it, just add the `whatsapp` entry next to them under `mcpServers`.
+
+4. **Restart Claude Desktop / Cursor / Antigravity**
 
    Open Claude Desktop and you should now see WhatsApp as an available integration.
 
    Or restart Cursor.
+
+   For Antigravity CLI, restart `agy` and run `/mcp` to open the MCP manager. `whatsapp` should show up as active. If it's stuck on disconnected, the connection logs in that view usually point straight at a wrong `uv` or directory path.
 
 ### Windows Compatibility
 
@@ -179,5 +207,10 @@ By default, just the metadata of the media is stored in the local database. The 
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+
+### Antigravity CLI
+
+- **Server doesn't show up in `/mcp`**: Antigravity's own docs disagree on the global config path. Some point at `~/.gemini/antigravity/mcp_config.json` instead of `~/.gemini/config/mcp_config.json`. If your install ignores one location, try the other. Also check that the file is valid JSON (no comments or trailing commas).
+- **Tools fail with connection errors**: the MCP server talks to the bridge on `localhost:8080`, so `go run main.go` has to stay running in another terminal while you use `agy`.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
