@@ -193,6 +193,8 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	ID      string `json:"id,omitempty"`
+	ChatJID string `json:"chat_jid,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -203,9 +205,9 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", "", ""
 	}
 
 	// Create JID for recipient
@@ -219,7 +221,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), "", ""
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +238,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), "", ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +287,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), "", ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +317,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), "", ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -362,13 +364,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), "", ""
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID, recipientJID.String()
 }
 
 // Extract media info from a message
@@ -706,7 +708,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, sentID, sentChat := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -720,7 +722,57 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+			ID:      sentID,
+			ChatJID: sentChat,
 		})
+	})
+
+	// Handler for editing a sent text message (WhatsApp allows edits for ~15 minutes): {"chat_jid": "...", "id": "...", "message": "new text"}
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			ID      string `json:"id"`
+			Message string `json:"message"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil || req.ChatJID == "" || req.ID == "" || req.Message == "" {
+			http.Error(w, "POST {chat_jid, id, message}", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_, err = client.SendMessage(context.Background(), jid, client.BuildEdit(jid, req.ID, &waProto.Message{Conversation: proto.String(req.Message)}))
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": err == nil, "error": fmt.Sprint(err)})
+	})
+
+	// Handler for listing a group's members: {"jid": "...@g.us"}
+	http.HandleFunc("/api/group_info", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			JID string `json:"jid"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil || req.JID == "" {
+			http.Error(w, "POST {jid}", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.JID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		info, err := client.GetGroupInfo(jid)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+		parts := []map[string]interface{}{}
+		for _, p := range info.Participants {
+			parts = append(parts, map[string]interface{}{"jid": p.JID.String(), "admin": p.IsAdmin, "super_admin": p.IsSuperAdmin})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "name": info.Name, "count": len(parts), "participants": parts})
 	})
 
 	// Handler for downloading media
