@@ -181,3 +181,15 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+## Security hardening
+
+The bridge's REST API is now locked down. It refuses to start unless both sides share a secret, and it only sends files from one folder.
+
+- `WHATSAPP_BRIDGE_TOKEN`: a random secret of at least 32 characters. Set the same value for the bridge and for the MCP server. Every request must carry it in an `X-Bridge-Token` header.
+- `WHATSAPP_MEDIA_DIR`: the only directory `send_file` and `send_audio_message` may read from. Media sending is refused when it is unset.
+- The API listens on `127.0.0.1` only, and only accepts `Content-Type: application/json`.
+- Downloaded media filenames and chat IDs are sanitised, so a sender cannot write outside `store/`.
+- Message text is stripped of control characters before it is printed to the terminal.
+
+Generate a token with `head -c 32 /dev/urandom | base64`.
