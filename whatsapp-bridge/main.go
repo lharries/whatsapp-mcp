@@ -48,9 +48,12 @@ type MessageStore struct {
 
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	// Create directory for database if it doesn't exist, readable by the owner only
+	if err := ensurePrivateDir("store"); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	}
+	if err := ensurePrivateFile("store/messages.db"); err != nil {
+		return nil, fmt.Errorf("failed to create message database: %v", err)
 	}
 
 	// Open SQLite database for messages
@@ -586,7 +589,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	if err := ensurePrivateDir(chatDir); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
@@ -647,7 +650,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
@@ -794,9 +797,13 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	// Create directory for database if it doesn't exist, readable by the owner only
+	if err := ensurePrivateDir("store"); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
+		return
+	}
+	if err := ensurePrivateFile("store/whatsapp.db"); err != nil {
+		logger.Errorf("Failed to create session database: %v", err)
 		return
 	}
 
