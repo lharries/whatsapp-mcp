@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -17,6 +18,16 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# With WHATSAPP_MCP_READ_ONLY=1 the tools that send messages are not exposed to the model
+READ_ONLY = os.environ.get("WHATSAPP_MCP_READ_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def send_tool():
+    """Register a tool that sends messages, unless read-only mode is enabled."""
+    if READ_ONLY:
+        return lambda func: func
+    return mcp.tool()
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -154,7 +165,7 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+@send_tool()
 def send_message(
     recipient: str,
     message: str
@@ -183,7 +194,7 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
+@send_tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -203,7 +214,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
+@send_tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     

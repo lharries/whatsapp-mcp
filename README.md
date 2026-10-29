@@ -13,6 +13,7 @@ Here's an example of what you can do when it's connected to Claude.
 > To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
+> Any message you receive is untrusted input that the model reads: someone can send you a message containing instructions (prompt injection) that try to make the agent forward your private conversations or files to them. If you only need to read and search messages, enable [read-only mode](#read-only-mode).
 
 ## Installation
 
@@ -105,6 +106,24 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
 Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+
+## Security
+
+### Read-only mode
+
+Set `WHATSAPP_MCP_READ_ONLY=1` in the MCP server's environment to remove the tools that send messages (`send_message`, `send_file`, `send_audio_message`). The model can then still search and read your messages, but cannot send anything, which removes the exfiltration path of a prompt injection hidden in a received message:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "{{PATH_TO_UV}}",
+      "args": ["--directory", "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"],
+      "env": { "WHATSAPP_MCP_READ_ONLY": "1" }
+    }
+  }
+}
+```
 
 ## Architecture Overview
 
