@@ -7,8 +7,13 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+import os
+
+MESSAGES_DB_PATH = os.environ.get(
+    "WHATSAPP_DB_PATH",
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db'))
+)
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8741/api")
 
 @dataclass
 class Message:
@@ -172,8 +177,9 @@ def list_messages(
             params.append(chat_jid)
             
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
+            # instr() is Unicode-safe; LOWER() only handles ASCII in SQLite
+            where_clauses.append("(instr(LOWER(messages.content), LOWER(?)) > 0 OR instr(messages.content, ?) > 0)")
+            params.extend([query, query])
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -350,8 +356,9 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+            # Use instr() for Unicode-safe substring search (LOWER() only handles ASCII in SQLite)
+            where_clauses.append("(instr(LOWER(chats.name), LOWER(?)) > 0 OR instr(chats.name, ?) > 0 OR chats.jid LIKE ?)")
+            params.extend([query, query, f"%{query}%"])
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -396,20 +403,17 @@ def search_contacts(query: str) -> List[Contact]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
         cursor.execute("""
-            SELECT DISTINCT 
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            WHERE
+                (instr(LOWER(name), LOWER(?)) > 0 OR instr(name, ?) > 0 OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
+        """, (query, query, f"%{query}%"))
         
         contacts = cursor.fetchall()
         

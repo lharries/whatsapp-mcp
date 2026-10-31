@@ -167,6 +167,45 @@ By default, just the metadata of the media is stored in the local database. The 
 4. Data flows back through the chain to Claude
 5. When sending messages, the request flows from Claude through the MCP server to the Go bridge and to WhatsApp
 
+## Unicode, Hebrew, and RTL Support
+
+The MCP server fully supports non-Latin scripts (Hebrew, Arabic, CJK, emoji) in both message content and chat names. All search functions (`list_messages`, `list_chats`, `search_contacts`) use SQLite's `instr()` for substring matching rather than `LOWER()+LIKE`, because SQLite's built-in `LOWER()` only handles ASCII — it leaves non-ASCII characters unchanged, which caused silent failures for non-Latin queries.
+
+### Dual-Bridge Setup (Personal + Business)
+
+If you run both a personal and a WhatsApp Business account, you can run two bridge instances side by side:
+
+| Instance | Directory | Default port |
+|----------|-----------|--------------|
+| Personal | `whatsapp-bridge/` | 8741 |
+| Business | `whatsapp-bridge-business/` | 8742 |
+
+Configure each bridge via environment variables:
+
+```bash
+# Business bridge
+WHATSAPP_BRIDGE_PORT=8742 go run main.go
+```
+
+Configure the MCP server to point at the right bridge:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp-business": {
+      "command": "{{PATH_TO_UV}}",
+      "args": ["--directory", "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"],
+      "env": {
+        "WHATSAPP_DB_PATH": "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-bridge-business/store/messages.db",
+        "WHATSAPP_API_URL": "http://localhost:8742/api"
+      }
+    }
+  }
+}
+```
+
+> **Note:** `WHATSAPP_DB_PATH` must be set explicitly for the business bridge — the default always points to `whatsapp-bridge/store/messages.db` (personal). `WHATSAPP_API_URL` must include the `/api` suffix, e.g. `http://localhost:8742/api`.
+
 ## Troubleshooting
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
