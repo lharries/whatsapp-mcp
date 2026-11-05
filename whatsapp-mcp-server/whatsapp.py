@@ -8,7 +8,33 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://127.0.0.1:8080/api")
+# Shared secret for the bridge REST API (same value as the bridge's WHATSAPP_API_TOKEN).
+WHATSAPP_API_TOKEN = os.environ.get("WHATSAPP_API_TOKEN", "")
+# When set, files may only be sent from inside this directory (the bridge enforces it too).
+WHATSAPP_MEDIA_DIR = os.environ.get("WHATSAPP_MEDIA_DIR", "")
+REQUEST_TIMEOUT = 60
+
+
+def _api_post(path: str, payload: dict) -> "requests.Response":
+    headers = {}
+    if WHATSAPP_API_TOKEN:
+        headers["Authorization"] = f"Bearer {WHATSAPP_API_TOKEN}"
+    return requests.post(f"{WHATSAPP_API_BASE_URL}{path}", json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+
+
+def _check_outgoing_media_path(media_path: str) -> Tuple[bool, str]:
+    """Resolve the path the model asked to send and refuse anything outside WHATSAPP_MEDIA_DIR."""
+    if not media_path:
+        return False, "Media path must be provided"
+    resolved = os.path.realpath(media_path)
+    if not os.path.isfile(resolved):
+        return False, f"Media file not found: {media_path}"
+    if WHATSAPP_MEDIA_DIR:
+        allowed = os.path.realpath(WHATSAPP_MEDIA_DIR)
+        if os.path.commonpath([allowed, resolved]) != allowed:
+            return False, f"Media path is outside WHATSAPP_MEDIA_DIR: {media_path}"
+    return True, resolved
 
 @dataclass
 class Message:
@@ -628,13 +654,12 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = _api_post("/send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -656,19 +681,16 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        if not media_path:
-            return False, "Media path must be provided"
+        ok, media_path = _check_outgoing_media_path(media_path)
+        if not ok:
+            return False, media_path
         
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _api_post("/send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -690,25 +712,24 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+        ok, media_path = _check_outgoing_media_path(media_path)
+        if not ok:
+            return False, media_path
 
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
+                # The converted copy lands in WHATSAPP_MEDIA_DIR when set, so the bridge accepts it.
+                output_dir = WHATSAPP_MEDIA_DIR or None
+                media_path = audio.convert_to_opus_ogg_temp(media_path, output_dir=output_dir)
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _api_post("/send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -735,13 +756,12 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         The local file path if download was successful, None otherwise
     """
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = _api_post("/download", payload)
         
         if response.status_code == 200:
             result = response.json()
