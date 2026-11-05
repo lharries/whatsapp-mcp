@@ -106,6 +106,25 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+## Security
+
+The bridge links to your personal account, so a few defaults are deliberately strict. All of these are environment variables read by the bridge (`whatsapp-bridge`) or the MCP server (`whatsapp-mcp-server`):
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `WHATSAPP_BRIDGE_BIND` | bridge | Host the REST API listens on. Default `127.0.0.1`, so other machines on your network cannot send messages as you. Set to `0.0.0.0` only on purpose. |
+| `WHATSAPP_API_TOKEN` | both | When set, every call to the bridge's REST API must carry `Authorization: Bearer <token>`. Export the same value for the MCP server. Protects against other local processes using the bridge. |
+| `WHATSAPP_MEDIA_DIR` | both | When set, `send_file` and `send_audio_message` may only send files from inside this directory. Without it any file the bridge can read can be sent. |
+| `WHATSAPP_READ_ONLY` | MCP server | `1` hides `send_message`, `send_file` and `send_audio_message`, leaving a read-only server. |
+| `WHATSAPP_LOG_CONTENT` | bridge | `1` prints message text to the bridge's stdout. Off by default so a redirected log is not a second plaintext copy of your chats. |
+| `WHATSAPP_API_BASE_URL` | MCP server | Bridge URL. Default `http://127.0.0.1:8080/api`. |
+
+Other behaviours:
+
+- `store/` and the two databases in it are created private to your user (`0700` / `0600`). `store/whatsapp.db` holds the device keys: anyone with a copy of it is your linked device until you log it out from the phone. `store/messages.db` holds your message history in plain text. Keep both on an encrypted disk.
+- Downloaded media is saved under `store/<chat>/` using only the base name of the file, so a sender cannot pick a path outside that directory.
+- Incoming messages are untrusted text that reaches the model through the read tools. A server that can both read and send is exposed to prompt-injection exfiltration (the lethal trifecta above). Prefer `WHATSAPP_READ_ONLY=1` when you do not need to send, approve every send tool call by hand in your MCP client, and set `WHATSAPP_MEDIA_DIR` when you do send files.
+
 ## Architecture Overview
 
 This application consists of two main components:
