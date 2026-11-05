@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    check_business as whatsapp_check_business,
+    block_contacts as whatsapp_block_contacts,
+    delete_chats as whatsapp_delete_chats
 )
 
 # Initialize FastMCP server
@@ -245,6 +248,52 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def check_business(jids: List[str]) -> Dict[str, Any]:
+    """Check whether contacts are WhatsApp Business accounts.
+
+    Args:
+        jids: Contact JIDs (e.g., "123456789@s.whatsapp.net" or "123456789@lid")
+
+    Returns:
+        A dictionary containing success status and, per JID, is_business plus any
+        verified name, categories, email and address from the business profile
+    """
+    success, result = whatsapp_check_business(jids)
+    if success:
+        return {"success": True, "results": result}
+    return {"success": False, "message": result}
+
+@mcp.tool()
+def block_contacts(jids: List[str]) -> Dict[str, Any]:
+    """Block contacts on WhatsApp. They can be unblocked from the phone's privacy settings.
+
+    Args:
+        jids: Contact JIDs to block
+
+    Returns:
+        A dictionary containing success status and a per-JID ok/error result
+    """
+    success, result = whatsapp_block_contacts(jids)
+    if success:
+        return {"success": True, "results": result}
+    return {"success": False, "message": result}
+
+@mcp.tool()
+def delete_chats(jids: List[str]) -> Dict[str, Any]:
+    """Permanently delete chats (including media) on all linked devices and from the local database.
+
+    Args:
+        jids: Chat JIDs to delete
+
+    Returns:
+        A dictionary containing success status and a per-JID ok/error result
+    """
+    success, result = whatsapp_delete_chats(jids)
+    if success:
+        return {"success": True, "results": result}
+    return {"success": False, "message": result}
 
 if __name__ == "__main__":
     # Initialize and run the server
