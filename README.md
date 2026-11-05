@@ -140,6 +140,9 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **check_business**: Check whether contacts are WhatsApp Business accounts (verified name, category, email, address)
+- **block_contacts**: Block one or more contacts
+- **delete_chats**: Permanently delete one or more chats on all linked devices and from the local database
 
 ### Media Handling Features
 

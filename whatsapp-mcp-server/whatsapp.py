@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 import os.path
 import requests
 import json
@@ -765,3 +765,31 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def _post_jids(endpoint: str, jids: List[str]) -> Tuple[bool, Any]:
+    try:
+        if not jids:
+            return False, "At least one JID must be provided"
+
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/{endpoint}", json={"jids": jids})
+
+        if response.status_code == 200:
+            return True, response.json()
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def check_business(jids: List[str]) -> Tuple[bool, Any]:
+    return _post_jids("business-check", jids)
+
+def block_contacts(jids: List[str]) -> Tuple[bool, Any]:
+    return _post_jids("block", jids)
+
+def delete_chats(jids: List[str]) -> Tuple[bool, Any]:
+    return _post_jids("delete-chat", jids)
