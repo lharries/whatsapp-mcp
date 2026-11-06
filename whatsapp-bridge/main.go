@@ -1005,6 +1005,28 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
+// historySender returns the user part of a history-synced message's author,
+// matching what handleMessage stores for live messages. History sync puts a
+// group author in WebMessageInfo.Participant and usually leaves
+// Key.Participant empty, so reading only the key files every group message
+// under the group itself. The lookup order follows whatsmeow's ParseWebMessage.
+func historySender(chat types.JID, msg *waProto.WebMessageInfo, ownUser string) string {
+	if msg.GetKey().GetFromMe() {
+		return ownUser
+	}
+	if chat.Server == types.GroupServer {
+		for _, participant := range []string{msg.GetParticipant(), msg.GetKey().GetParticipant()} {
+			if participant == "" {
+				continue
+			}
+			if author, err := types.ParseJID(participant); err == nil && author.User != "" {
+				return author.User
+			}
+		}
+	}
+	return chat.User
+}
+
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
@@ -1080,23 +1102,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
-				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
-						sender = jid.User
-					}
-				} else {
-					sender = jid.User
-				}
+				isFromMe := msg.Message.GetKey().GetFromMe()
+				sender := historySender(jid, msg.Message, client.Store.ID.User)
 
 				// Store message
 				msgID := ""
