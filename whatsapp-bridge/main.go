@@ -590,8 +590,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localName := mediaLocalName(messageID, filename)
+	localPath = fmt.Sprintf("%s/%s", chatDir, localName)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -602,7 +602,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, localName, absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -652,7 +652,21 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, localName, absPath, nil
+}
+
+// mediaLocalName gives each message its own file in the chat folder. Stored
+// filenames come from the receive second (or the sender's document name), so
+// many messages share one, and without the message id prefix a download
+// returns whichever file already sits under that name.
+func mediaLocalName(messageID, filename string) string {
+	id := strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '_'
+	}, messageID)
+	return id + "_" + filepath.Base(strings.ReplaceAll(filename, `\`, "/"))
 }
 
 // Extract direct path from a WhatsApp media URL
