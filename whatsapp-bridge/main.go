@@ -63,6 +63,13 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
+	// WAL + a busy timeout so the MCP server's reads do not block on the bridge's
+	// writes, and a transient lock waits instead of failing with "database is
+	// locked".
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;"); err != nil {
+		fmt.Printf("warning: could not set sqlite pragmas on messages db: %v\n", err)
+	}
+
 	// Create tables if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
@@ -222,8 +229,16 @@ type clientSendResolver struct {
 	client *whatsmeow.Client
 }
 
+// apiCtx bounds a call to WhatsApp's servers. Without a deadline a stalled
+// connection would hang the request (and the MCP tool above it) indefinitely.
+func apiCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
 func (c clientSendResolver) PNForLID(lidUser string) (string, bool) {
-	pn, err := c.client.Store.LIDs.GetPNForLID(context.Background(), types.JID{User: lidUser, Server: types.HiddenUserServer})
+	ctx, cancel := apiCtx()
+	defer cancel()
+	pn, err := c.client.Store.LIDs.GetPNForLID(ctx, types.JID{User: lidUser, Server: types.HiddenUserServer})
 	if err != nil || pn.User == "" {
 		return "", false
 	}
@@ -231,7 +246,9 @@ func (c clientSendResolver) PNForLID(lidUser string) (string, bool) {
 }
 
 func (c clientSendResolver) IsOnWhatsApp(user string) (types.JID, bool, error) {
-	resp, err := c.client.IsOnWhatsApp(context.Background(), []string{user})
+	ctx, cancel := apiCtx()
+	defer cancel()
+	resp, err := c.client.IsOnWhatsApp(ctx, []string{user})
 	if err != nil {
 		return types.JID{}, false, err
 	}
@@ -239,6 +256,50 @@ func (c clientSendResolver) IsOnWhatsApp(user string) (types.JID, bool, error) {
 		return types.JID{}, false, nil
 	}
 	return resp[0].JID, resp[0].IsIn, nil
+}
+
+// sanitizePathComponent makes a string safe to use as a single path element. It
+// keeps [A-Za-z0-9@._-] and replaces everything else — including '/', '\' and
+// '..' — so a model-supplied JID or a filename from a message cannot traverse
+// out of the store directory.
+func sanitizePathComponent(s string) string {
+	s = strings.ReplaceAll(s, "..", "_")
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '@', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := b.String()
+	if out == "" || out == "." {
+		return "_"
+	}
+	return out
+}
+
+// safeStorePath joins sanitized components under the store directory and
+// verifies the result cannot escape it.
+func safeStorePath(parts ...string) (string, error) {
+	root, err := filepath.Abs("store")
+	if err != nil {
+		return "", err
+	}
+	all := append([]string{"store"}, parts...)
+	for i := 1; i < len(all); i++ {
+		all[i] = sanitizePathComponent(all[i])
+	}
+	full, err := filepath.Abs(filepath.Join(all...))
+	if err != nil {
+		return "", err
+	}
+	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes store directory: %s", parts)
+	}
+	return full, nil
 }
 
 // digitsOnly strips everything that is not a digit, so "+264 81 772 1286"
@@ -389,7 +450,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 
 		// Upload media to WhatsApp servers
-		resp, err := client.Upload(context.Background(), mediaData, mediaType)
+		uploadCtx, uploadCancel := apiCtx()
+		defer uploadCancel()
+		resp, err := client.Upload(uploadCtx, mediaData, mediaType)
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
@@ -468,7 +531,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	// Send message
-	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	sendCtx, sendCancel := apiCtx()
+	defer sendCancel()
+	resp, err := client.SendMessage(sendCtx, recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
@@ -683,8 +748,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	// First, check if we already have this file. The chat JID and the filename
+	// both come from outside (the model and the remote sender), so they are
+	// sanitized and confined to the store directory.
+	chatDir := filepath.Join("store", sanitizePathComponent(chatJID))
 	localPath := ""
 
 	// Get media info from the database
@@ -712,8 +779,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file, confined to the store directory.
+	localPath, err = safeStorePath(chatJID, filename)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("unsafe media path: %v", err)
+	}
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -763,7 +833,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	dlCtx, dlCancel := apiCtx()
+	defer dlCancel()
+	mediaData, err := client.Download(dlCtx, downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -933,8 +1005,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server. Loopback only: this API can read and send WhatsApp
+	// messages, so it must not be reachable from other machines on the network.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -975,6 +1048,12 @@ func main() {
 	if err := os.MkdirAll("store", 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
+	}
+
+	// WAL on the whatsmeow store too, which the MCP server also reads.
+	if waDB, err := sql.Open("sqlite3", "file:store/whatsapp.db?_foreign_keys=on"); err == nil {
+		_, _ = waDB.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;")
+		waDB.Close()
 	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)

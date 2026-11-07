@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow/types"
@@ -44,6 +46,54 @@ func TestDigitsOnly(t *testing.T) {
 	for in, want := range cases {
 		if got := digitsOnly(in); got != want {
 			t.Errorf("digitsOnly(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSanitizePathComponent(t *testing.T) {
+	cases := map[string]string{
+		"212558418043069@lid":         "212558418043069@lid",
+		"264817721286@s.whatsapp.net": "264817721286@s.whatsapp.net",
+		"../../etc/passwd":            "____etc_passwd",
+		"a/b\\c":                      "a_b_c",
+		"..":                          "_",
+		"":                            "_",
+		"file name.png":               "file_name.png",
+		"photo:2026.png":              "photo_2026.png",
+	}
+	for in, want := range cases {
+		if got := sanitizePathComponent(in); got != want {
+			t.Errorf("sanitizePathComponent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSanitizePathComponentNeverContainsTraversal(t *testing.T) {
+	for _, in := range []string{"..", "../..", "a/../../b", "....//....//etc"} {
+		got := sanitizePathComponent(in)
+		if strings.Contains(got, "..") || strings.ContainsAny(got, `/\`) {
+			t.Errorf("sanitizePathComponent(%q) = %q still unsafe", in, got)
+		}
+	}
+}
+
+func TestSafeStorePathStaysInsideStore(t *testing.T) {
+	root, err := filepath.Abs("store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, parts := range [][]string{
+		{"212558418043069@lid", "photo.png"},
+		{"../../etc", "passwd"},
+		{"..", ".."},
+		{"a/b", "c/d.txt"},
+	} {
+		got, err := safeStorePath(parts...)
+		if err != nil {
+			t.Fatalf("safeStorePath(%v) errored: %v", parts, err)
+		}
+		if got != root && !strings.HasPrefix(got, root+string(filepath.Separator)) {
+			t.Errorf("safeStorePath(%v) = %s escapes %s", parts, got, root)
 		}
 	}
 }
