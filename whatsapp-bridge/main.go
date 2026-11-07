@@ -233,6 +233,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 	}
 
+	// For personal phone number recipients, ensure fresh LID mapping so migrated/new accounts are reached
+	if recipientJID.Server == types.DefaultUserServer && recipientJID.User != "" {
+		_, _ = client.IsOnWhatsApp(context.Background(), []string{recipientJID.User})
+	}
+
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
@@ -775,6 +780,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	// Handler for resolving contacts, verifying registration, and checking new/canonical accounts
+	http.HandleFunc("/api/resolve_user", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("phone")
+		if query == "" {
+			http.Error(w, "phone query parameter is required", http.StatusBadRequest)
+			return
+		}
+		phone := strings.Split(query, "@")[0]
+		phone = strings.TrimPrefix(phone, "+")
+		phone = strings.ReplaceAll(phone, " ", "")
+
+		isOnResp, err := client.IsOnWhatsApp(context.Background(), []string{phone})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error checking WhatsApp status: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"results": isOnResp,
 		})
 	})
 
