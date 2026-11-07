@@ -318,7 +318,7 @@ func canonicalJID(r sendResolver, user, original string) (types.JID, error) {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -468,13 +468,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	// Persist our own outgoing message. whatsmeow does not echo messages sent
+	// through the API as events, so without this the history is missing everything
+	// we sent — including the baseline wait_for_reply needs to know a message is a
+	// reply.
+	if messageStore != nil {
+		mediaType := ""
+		if mediaPath != "" {
+			mediaType = "media"
+		}
+		sender := ""
+		if client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+		_ = messageStore.StoreMessage(string(resp.ID), recipientJID.String(), sender, message, time.Now(), true, mediaType, "", "", nil, nil, nil, 0)
+	}
+
+	return true, fmt.Sprintf("Message sent to %s", recipientJID.String())
 }
 
 // Extract media info from a message
@@ -812,7 +828,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
