@@ -206,36 +206,133 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// sendResolver abstracts the two live lookups the send path needs. Keeping it an
+// interface lets the recipient-resolution decision be unit-tested with a fake,
+// with no WhatsApp connection required.
+type sendResolver interface {
+	// PNForLID maps LID digits to phone-number digits (used to recover the PN
+	// behind a possibly-stale cached LID).
+	PNForLID(lidUser string) (string, bool)
+	// IsOnWhatsApp resolves a phone number to its current canonical JID.
+	IsOnWhatsApp(user string) (types.JID, bool, error)
+}
+
+// clientSendResolver is the real resolver, backed by a live WhatsApp client.
+type clientSendResolver struct {
+	client *whatsmeow.Client
+}
+
+func (c clientSendResolver) PNForLID(lidUser string) (string, bool) {
+	pn, err := c.client.Store.LIDs.GetPNForLID(context.Background(), types.JID{User: lidUser, Server: types.HiddenUserServer})
+	if err != nil || pn.User == "" {
+		return "", false
+	}
+	return pn.User, true
+}
+
+func (c clientSendResolver) IsOnWhatsApp(user string) (types.JID, bool, error) {
+	resp, err := c.client.IsOnWhatsApp(context.Background(), []string{user})
+	if err != nil {
+		return types.JID{}, false, err
+	}
+	if len(resp) == 0 {
+		return types.JID{}, false, nil
+	}
+	return resp[0].JID, resp[0].IsIn, nil
+}
+
+// digitsOnly strips everything that is not a digit, so "+264 81 772 1286"
+// and "264-817721286" both become "264817721286".
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// resolveSendTarget turns a raw recipient (JID, LID, or phone number) into the
+// canonical JID to send to.
+//
+// WhatsApp now addresses users by LID as well as phone number, and a LID cached
+// locally can be stale once the contact has migrated accounts. Sending to a stale
+// LID reaches the old account (WhatsApp then warns "this number is connected to a
+// new WhatsApp account"), so both PN and LID recipients are re-resolved live via
+// IsOnWhatsApp, which returns the current canonical JID.
+func resolveSendTarget(r sendResolver, recipient string) (types.JID, error) {
+	recipient = strings.TrimSpace(recipient)
+	if recipient == "" {
+		return types.JID{}, fmt.Errorf("recipient is empty")
+	}
+
+	// A bare phone number is a personal JID.
+	if !strings.Contains(recipient, "@") {
+		user := digitsOnly(recipient)
+		if user == "" {
+			return types.JID{}, fmt.Errorf("could not parse phone number: %q", recipient)
+		}
+		return canonicalJID(r, user, recipient)
+	}
+
+	jid, err := types.ParseJID(recipient)
+	if err != nil {
+		return types.JID{}, fmt.Errorf("error parsing JID: %v", err)
+	}
+
+	switch jid.Server {
+	case types.DefaultUserServer:
+		return canonicalJID(r, jid.User, recipient)
+	case types.HiddenUserServer:
+		// The cached LID may be stale; recover the PN and re-resolve live. If the
+		// mapping is unknown, resolve the LID digits themselves (WhatsApp can still
+		// return the current account).
+		user := jid.User
+		if pn, ok := r.PNForLID(jid.User); ok && pn != "" {
+			user = pn
+		}
+		return canonicalJID(r, user, recipient)
+	default:
+		// Groups, newsletters, status and broadcast lists are addressed directly.
+		return jid, nil
+	}
+}
+
+// canonicalJID resolves a phone-number user to its current canonical JID. A
+// resolution error is treated as best-effort (fall back to the phone JID) so a
+// transient network hiccup does not block an otherwise valid send.
+func canonicalJID(r sendResolver, user, original string) (types.JID, error) {
+	fallback := types.JID{User: user, Server: types.DefaultUserServer}
+	canonical, isIn, err := r.IsOnWhatsApp(user)
+	if err != nil {
+		return fallback, nil
+	}
+	if !isIn {
+		return types.JID{}, fmt.Errorf("%s is not registered on WhatsApp", original)
+	}
+	if canonical.IsEmpty() {
+		return fallback, nil
+	}
+	return canonical, nil
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
-	// Create JID for recipient
-	var recipientJID types.JID
-	var err error
-
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
-		}
-	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
-		}
+	// Resolve the recipient to its current canonical JID. This remaps migrated
+	// accounts, so a stale cached LID can no longer route to the wrong account.
+	recipientJID, err := resolveSendTarget(clientSendResolver{client: client}, recipient)
+	if err != nil {
+		return false, err.Error()
 	}
-
-	// For personal phone number recipients, ensure fresh LID mapping so migrated/new accounts are reached
-	if recipientJID.Server == types.DefaultUserServer && recipientJID.User != "" {
-		_, _ = client.IsOnWhatsApp(context.Background(), []string{recipientJID.User})
+	if recipientJID.Server == types.HiddenUserServer {
+		fmt.Printf("Resolved recipient %q -> %s (LID)\n", recipient, recipientJID.String())
+	} else {
+		fmt.Printf("Resolved recipient %q -> %s\n", recipient, recipientJID.String())
 	}
 
 	msg := &waProto.Message{}
@@ -787,14 +884,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	http.HandleFunc("/api/resolve_user", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("phone")
 		if query == "" {
-			http.Error(w, "phone query parameter is required", http.StatusBadRequest)
+			query = r.URL.Query().Get("user")
+		}
+		if query == "" {
+			http.Error(w, "phone (or user) query parameter is required", http.StatusBadRequest)
 			return
 		}
-		phone := strings.Split(query, "@")[0]
-		phone = strings.TrimPrefix(phone, "+")
-		phone = strings.ReplaceAll(phone, " ", "")
 
-		isOnResp, err := client.IsOnWhatsApp(context.Background(), []string{phone})
+		// Accept a phone number, a phone JID, or a LID. A LID is mapped back to
+		// its phone number first, because IsOnWhatsApp resolves from the PN.
+		user := digitsOnly(strings.Split(query, "@")[0])
+		if strings.HasSuffix(query, "@"+types.HiddenUserServer) {
+			if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), types.JID{User: user, Server: types.HiddenUserServer}); err == nil && pn.User != "" {
+				user = pn.User
+			}
+		}
+		if user == "" {
+			http.Error(w, "could not parse a phone number or LID from the query", http.StatusBadRequest)
+			return
+		}
+
+		isOnResp, err := client.IsOnWhatsApp(context.Background(), []string{user})
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Error checking WhatsApp status: %v", err), http.StatusInternalServerError)
 			return
@@ -930,7 +1040,7 @@ func main() {
 			fmt.Println(" On your phone: WhatsApp -> Settings -> Linked Devices")
 			fmt.Println(" -> Link with phone number instead")
 			fmt.Println(" Enter the pairing code shown above.")
-			fmt.Println("=======================================================\n")
+			fmt.Print("=======================================================\n\n")
 		} else {
 			// No ID stored, this is a new client, need to pair with phone
 			qrChan, _ := client.GetQRChannel(context.Background())
