@@ -54,7 +54,22 @@ get_last_interaction, wait_for_reply.
 - **Hardening**: loopback-only REST; WAL; LIKE-escaping; limit/page clamps (a
   negative SQL LIMIT means "no limit"); result caps.
 
+## Implemented since (roadmap phases 0–4)
+- **Private/proprietary** licensing with upstream attribution (LICENSE +
+  LICENSE-UPSTREAM), README rewrite.
+- **Deployable**: env config (`WA_ACCOUNT/WA_PORT/WA_DB_DIR/WA_TOKEN`,
+  `WEBHOOK_URL/SECRET`, `WA_OWNER_JID`), systemd template unit + install script,
+  Dockerfile/compose, `/healthz`.
+- **Multi-account** as one process per account (own store dir + port); MCP tools
+  take `account`, `list_accounts()`.
+- **Pair-by-link**: REST starts before pairing; `GET /pair` serves an HTML page
+  polling `/api/pair/status` for the live QR (data-URI PNG) or a pairing code.
+- **Webhook** on inbound messages (HMAC-SHA256 `X-WA-Signature`, retries).
+- **Inbox/outbox**: `list_outbox` (needs reply), `list_inbox`, `mark_handled`,
+  `get_thread`; `request_reply_approval` (human-in-the-loop).
+- `examples/webhook_agent.py` — agent-side consumer of the webhook.
+
 ## Known gaps (roadmap targets)
-Multi-account (2 numbers), pair-by-link (QR/code over HTTP), webhook on inbound
-messages, inbox/outbox ("needs reply"), human-in-the-loop approval, Linux/systemd
-deployment, MCP Tasks for long waits.
+MCP **Tasks** extension for long waits (currently capped polling), per-account
+retention windows, timestamp normalization, and the agent-side runner as a
+first-class service rather than an example.
