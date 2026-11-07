@@ -105,6 +105,13 @@ class ResolutionTest(unittest.TestCase):
         whatsapp.requests.get = self._old_get
         self.tmp.cleanup()
 
+    def test_sender_name_resolves_a_bare_lid(self):
+        # messages.sender stores the LID without the '@lid' suffix.
+        self.assertEqual(whatsapp.get_sender_name(STALE_LID), "Tysen")
+
+    def test_sender_name_resolves_a_lid_jid(self):
+        self.assertEqual(whatsapp.get_sender_name(f"{STALE_LID}@lid"), "Tysen")
+
     def test_resolve_recipient_still_finds_both_ids_for_history(self):
         _, name, all_jids = whatsapp.resolve_recipient("Tysen")
         self.assertEqual(name, "Tysen")

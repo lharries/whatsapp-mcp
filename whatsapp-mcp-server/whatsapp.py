@@ -357,8 +357,9 @@ def get_sender_name(sender_jid: str) -> str:
                 conn_wa.close()
                 return row[0]
             
-            # If sender is LID, check lid_map -> phone number -> contact
-            if '@lid' in sender_jid:
+            # The sender may be a LID, either as '...@lid' or as bare digits the
+            # way messages.sender stores it. Map LID -> phone number -> contact.
+            if '@lid' in sender_jid or '@' not in sender_jid:
                 lid = sender_jid.split('@')[0]
                 map_row = c_wa.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (lid,)).fetchone()
                 if map_row and map_row[0]:
