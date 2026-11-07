@@ -49,6 +49,61 @@ def _like(term: str) -> str:
     escaped = str(term).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
 
+
+# --- Accounts -------------------------------------------------------------
+# Each WhatsApp account is its own bridge process with its own store dir + port.
+# WA_ACCOUNTS maps them for the tools:
+#   WA_ACCOUNTS="main|http://127.0.0.1:8080|/var/lib/whatsapp-mcp/main;second|http://127.0.0.1:8081|/var/lib/whatsapp-mcp/second"
+# With it unset there is a single account, "main", using the local store.
+
+DEFAULT_ACCOUNT = "main"
+CURRENT_ACCOUNT = DEFAULT_ACCOUNT
+
+
+def _load_accounts() -> Dict[str, Dict[str, str]]:
+    default = {"url": WHATSAPP_API_BASE_URL, "messages_db": MESSAGES_DB_PATH, "whatsapp_db": WHATSAPP_DB_PATH}
+    raw = os.environ.get("WA_ACCOUNTS", "").strip()
+    if not raw:
+        return {DEFAULT_ACCOUNT: default}
+    accounts: Dict[str, Dict[str, str]] = {}
+    for spec in raw.split(";"):
+        parts = [p.strip() for p in spec.split("|")]
+        if not parts or not parts[0]:
+            continue
+        name = parts[0]
+        url = parts[1] if len(parts) > 1 and parts[1] else WHATSAPP_API_BASE_URL
+        dbdir = parts[2] if len(parts) > 2 and parts[2] else ""
+        mdb = os.path.join(dbdir, "messages.db") if dbdir else MESSAGES_DB_PATH
+        wdb = os.path.join(dbdir, "whatsapp.db") if dbdir else WHATSAPP_DB_PATH
+        accounts[name] = {"url": url, "messages_db": mdb, "whatsapp_db": wdb}
+    return accounts or {DEFAULT_ACCOUNT: default}
+
+
+ACCOUNTS = _load_accounts()
+
+
+def use_account(account: str = "") -> str:
+    """Point the data access at a given account. Called by the MCP tool wrappers,
+    so every tool can take an `account` argument. Returns the account in use."""
+    global MESSAGES_DB_PATH, WHATSAPP_DB_PATH, WHATSAPP_API_BASE_URL, CURRENT_ACCOUNT
+    acct = account or CURRENT_ACCOUNT or DEFAULT_ACCOUNT
+    cfg = ACCOUNTS.get(acct)
+    if not cfg:
+        raise ValueError(f"unknown account {acct!r}; known: {', '.join(ACCOUNTS)}")
+    MESSAGES_DB_PATH = cfg["messages_db"]
+    WHATSAPP_DB_PATH = cfg["whatsapp_db"]
+    WHATSAPP_API_BASE_URL = cfg["url"]
+    CURRENT_ACCOUNT = acct
+    return acct
+
+
+def list_accounts() -> List[Dict[str, Any]]:
+    """The configured accounts (one WhatsApp number each)."""
+    return [
+        {"account": name, "api": cfg["url"], "messages_db": cfg["messages_db"]}
+        for name, cfg in ACCOUNTS.items()
+    ]
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -1055,3 +1110,122 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Error downloading media: {e}")
         return None
+
+
+def _ensure_handled_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS handled (chat_jid TEXT PRIMARY KEY, handled_at TEXT)")
+
+
+def _latest_per_chat(conn: sqlite3.Connection) -> List[Any]:
+    return conn.execute(
+        """
+        SELECT m.chat_jid, c.name, m.timestamp, m.content, m.is_from_me, m.sender
+        FROM messages m
+        LEFT JOIN chats c ON c.jid = m.chat_jid
+        WHERE m.timestamp = (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.chat_jid = m.chat_jid)
+        ORDER BY m.timestamp DESC
+        LIMIT ?
+        """,
+        (MAX_LIMIT,),
+    ).fetchall()
+
+
+def list_outbox(limit: int = 50) -> List[Dict[str, Any]]:
+    """Chats that need a reply: the newest message in the chat is from the other
+    person (not you) and the chat has not been marked handled.
+
+    If you reply (a message is stored with is_from_me), the chat drops out on its
+    own; mark_handled() hides one you are deliberately ignoring."""
+    limit, _ = _clamp_limit_page(limit, 0, 50)
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        _ensure_handled_table(conn)
+        rows = _latest_per_chat(conn)
+        handled = {r[0] for r in conn.execute("SELECT chat_jid FROM handled").fetchall()}
+        conn.close()
+        out: List[Dict[str, Any]] = []
+        for jid, name, ts, content, is_from_me, sender in rows:
+            if is_from_me or jid in handled:
+                continue
+            out.append({
+                "chat_jid": jid,
+                "chat_name": name or get_sender_name(sender),
+                "last_message": content,
+                "last_message_time": str(ts),
+                "needs_reply": True,
+            })
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        print(f"Database error in list_outbox: {e}")
+        return []
+
+
+def list_inbox(limit: int = 50) -> List[Dict[str, Any]]:
+    """Recent conversations and where each stands: who spoke last and whether it
+    still needs a reply from you."""
+    limit, _ = _clamp_limit_page(limit, 0, 50)
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        _ensure_handled_table(conn)
+        rows = _latest_per_chat(conn)
+        handled = {r[0] for r in conn.execute("SELECT chat_jid FROM handled").fetchall()}
+        conn.close()
+        out: List[Dict[str, Any]] = []
+        for jid, name, ts, content, is_from_me, sender in rows:
+            out.append({
+                "chat_jid": jid,
+                "chat_name": name or (None if is_from_me else get_sender_name(sender)),
+                "last_message": content,
+                "last_message_time": str(ts),
+                "last_from_me": bool(is_from_me),
+                "needs_reply": (not is_from_me) and (jid not in handled),
+            })
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        print(f"Database error in list_inbox: {e}")
+        return []
+
+
+def mark_handled(chat: str, handled: bool = True) -> Dict[str, Any]:
+    """Mark a chat as handled (or clear it) so it leaves/returns to the outbox."""
+    target_jid, _, all_jids = resolve_recipient(chat)
+    targets = all_jids or ([target_jid] if target_jid else [chat])
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        _ensure_handled_table(conn)
+        for t in targets:
+            if handled:
+                conn.execute("INSERT OR REPLACE INTO handled (chat_jid, handled_at) VALUES (?, datetime('now'))", (t,))
+            else:
+                conn.execute("DELETE FROM handled WHERE chat_jid = ?", (t,))
+        conn.commit()
+        conn.close()
+        return {"chat": targets[0], "handled": handled}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_thread(chat_or_contact: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """The recent message thread with a person or group, newest first."""
+    return list_messages(chat_or_contact=chat_or_contact, limit=limit)
+
+
+def request_reply_approval(contact: str, draft: str) -> Dict[str, Any]:
+    """Ask you (the account owner, WA_OWNER_JID) to approve a draft reply before
+    it is sent. Sends the draft to your own WhatsApp; reply YES/NO/edited."""
+    owner = os.environ.get("WA_OWNER_JID", "").strip()
+    if not owner:
+        return {"sent": False, "error": "WA_OWNER_JID is not set for this account"}
+    body = (
+        f"[approval] Draft reply to {contact}:\n\n{draft}\n\n"
+        "Reply YES to send it, NO to cancel, or send an edited version."
+    )
+    ok, msg = send_message(owner, body)
+    return {"sent": ok, "message": msg, "awaiting": "your reply"}
