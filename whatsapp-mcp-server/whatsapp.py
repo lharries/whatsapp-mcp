@@ -18,6 +18,37 @@ WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 # that, so it is capped here and the caller polls again.
 MAX_WAIT_SECONDS = 55
 
+# Upper bound on rows a single tool call can return, so a large/negative limit
+# cannot dump the whole history into the model's context.
+MAX_LIMIT = 200
+
+
+def _clamp_limit_page(limit: Any, page: Any, default_limit: int = 20) -> Tuple[int, int]:
+    """Clamp limit to [1, MAX_LIMIT] and page to >= 0.
+
+    SQLite treats a negative LIMIT as 'no limit', so an unguarded -1 would return
+    the entire message history.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = default_limit
+    if limit < 1:
+        # A negative or zero limit is nonsense (and SQLite reads negative as
+        # "no limit"); fall back to the default rather than the whole history.
+        limit = default_limit
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    return min(limit, MAX_LIMIT), max(0, page)
+
+
+def _like(term: str) -> str:
+    """Build a LIKE pattern that treats %, _ and \\ in the term as literals."""
+    escaped = str(term).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -409,6 +440,7 @@ def format_messages_list(messages: List[Message], show_chat_info: bool = True) -
 
 def search_contacts(query: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number across both the address book and chat history."""
+    limit, _ = _clamp_limit_page(limit, 0, 50)
     pattern = f"%{query}%"
     contacts_map: Dict[str, Dict[str, Any]] = {}
 
@@ -525,16 +557,17 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("m.sender LIKE ?")
-            params.append(f"%{sender_phone_number}%")
+            where_clauses.append("m.sender LIKE ? ESCAPE '\\'")
+            params.append(_like(sender_phone_number))
 
         if query:
-            where_clauses.append("LOWER(m.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
+            where_clauses.append("LOWER(m.content) LIKE LOWER(?) ESCAPE '\\'")
+            params.append(_like(query))
 
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
+        limit, page = _clamp_limit_page(limit, page)
         offset = page * limit
         query_parts.append("ORDER BY m.timestamp DESC")
         query_parts.append("LIMIT ? OFFSET ?")
@@ -595,12 +628,13 @@ def list_chats(
         params: List[Any] = []
 
         if query:
-            query_parts.append("WHERE LOWER(c.name) LIKE LOWER(?) OR LOWER(c.jid) LIKE LOWER(?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+            query_parts.append("WHERE LOWER(c.name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(c.jid) LIKE LOWER(?) ESCAPE '\\'")
+            params.extend([_like(query), _like(query)])
 
         order_col = "c.name ASC" if sort_by == "name" else "c.last_message_time DESC"
         query_parts.append(f"ORDER BY {order_col}")
 
+        limit, page = _clamp_limit_page(limit, page)
         offset = page * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
@@ -855,6 +889,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
 
 def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Dict[str, Any]:
     """Get context around a specific message."""
+    try:
+        before = max(0, min(int(before), 50))
+        after = max(0, min(int(after), 50))
+    except (TypeError, ValueError):
+        before, after = 5, 5
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
