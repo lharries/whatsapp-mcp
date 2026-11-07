@@ -13,6 +13,11 @@ MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
+# MCP clients abort a tool call that runs too long (Command Code's default is 80s,
+# overridable via MCP_TOOL_TIMEOUT). A blocking wait must always return before
+# that, so it is capped here and the caller polls again.
+MAX_WAIT_SECONDS = 55
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -682,16 +687,28 @@ def get_last_interaction(contact: str) -> Optional[Dict[str, Any]]:
 
 def wait_for_reply(
     recipient: str,
-    timeout_seconds: int = 60,
+    timeout_seconds: int = 30,
     after_timestamp: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Wait for an incoming reply from a contact within timeout_seconds.
-    
+    """Wait for the next incoming message from a contact, up to timeout_seconds.
+
+    If the contact already replied after your last message, this returns that
+    reply immediately (it does not wait for a *newer* one). The blocking wait is
+    capped at MAX_WAIT_SECONDS so it always returns before an MCP client's tool
+    timeout; poll again to keep waiting.
+
     Args:
-        recipient: Contact name ('Tysen'), phone number ('0817721286'), or JID to wait for.
-        timeout_seconds: Max seconds to wait for a reply (default 60).
-        after_timestamp: Wait only for messages after this timestamp (defaults to current DB max timestamp).
+        recipient: Contact name ('Tysen'), phone number ('0817721286'), or JID.
+        timeout_seconds: Max seconds to wait (default 30, capped at MAX_WAIT_SECONDS).
+        after_timestamp: Only consider messages after this timestamp. Defaults to
+            the time of your last message in the chat. Pass the returned
+            ``next_after`` to fetch the reply *after* the current one.
     """
+    try:
+        timeout_seconds = max(0, min(int(timeout_seconds), MAX_WAIT_SECONDS))
+    except (TypeError, ValueError):
+        timeout_seconds = 30
+
     target_jid, display_name, all_jids = resolve_recipient(recipient)
     if not all_jids:
         all_jids = [target_jid] if target_jid else []
@@ -704,19 +721,22 @@ def wait_for_reply(
         c = conn.cursor()
         placeholders = ','.join(['?'] * len(all_jids))
 
-        # Baseline timestamp
+        # Baseline: the newest message WE sent. Anything the contact sends after
+        # that is a reply — including one that already arrived before this call.
         baseline = after_timestamp
         if not baseline:
             row = c.execute(
-                f"SELECT MAX(timestamp) FROM messages WHERE chat_jid IN ({placeholders})",
-                tuple(all_jids)
+                f"""SELECT MAX(timestamp) FROM messages
+                    WHERE (chat_jid IN ({placeholders}) OR sender IN ({placeholders}))
+                      AND is_from_me = 1""",
+                tuple(all_jids * 2)
             ).fetchone()
             baseline = row[0] if (row and row[0]) else "2000-01-01"
 
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            # Query incoming messages (is_from_me = 0) newer than baseline
-            rows = c.execute(
+        deadline = time.time() + timeout_seconds
+        while True:
+            # Oldest incoming message (is_from_me = 0) newer than the baseline.
+            r = c.execute(
                 f"""
                 SELECT m.timestamp, m.sender, c.name, m.content, m.chat_jid, m.id, m.media_type
                 FROM messages m
@@ -728,10 +748,9 @@ def wait_for_reply(
                 LIMIT 1
                 """,
                 tuple(all_jids * 2 + [baseline])
-            ).fetchall()
+            ).fetchone()
 
-            if rows:
-                r = rows[0]
+            if r:
                 sender_name = display_name or get_sender_name(r[1])
                 return {
                     "status": "received",
@@ -741,15 +760,17 @@ def wait_for_reply(
                     "timestamp": str(r[0]),
                     "chat_jid": r[4],
                     "id": r[5],
-                    "media_type": r[6]
+                    "media_type": r[6],
+                    "next_after": str(r[0]),
                 }
 
+            if time.time() >= deadline:
+                return {
+                    "status": "timeout",
+                    "message": f"No reply from {display_name or recipient} within {timeout_seconds}s.",
+                    "baseline_timestamp": baseline,
+                }
             time.sleep(1.5)
-
-        return {
-            "status": "timeout",
-            "message": f"No reply received from {display_name or recipient} within {timeout_seconds} seconds."
-        }
     except Exception as e:
         return {"status": "error", "message": f"Error waiting for reply: {e}"}
     finally:

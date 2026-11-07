@@ -128,15 +128,20 @@ def get_last_interaction(contact: str) -> Dict[str, Any]:
 @mcp.tool()
 def wait_for_reply(
     recipient: str,
-    timeout_seconds: int = 60,
+    timeout_seconds: int = 30,
     after_timestamp: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Wait for an incoming reply from a contact within timeout_seconds. Resolves names, numbers, or JIDs.
-    
+    """Wait for the next incoming reply from a contact. Resolves names, numbers, or JIDs.
+
+    Returns immediately if the contact already replied after your last message.
+    The wait is capped (55s) so it returns before the client's tool timeout — call
+    it again to keep waiting. Resumes from the returned ``next_after`` if given.
+
     Args:
         recipient: Contact name ('Tysen'), phone number ('0817721286'), or JID/LID to wait for.
-        timeout_seconds: Maximum seconds to wait (default 60).
-        after_timestamp: Only wait for messages received after this timestamp (defaults to current latest message).
+        timeout_seconds: Maximum seconds to wait (default 30, capped at 55).
+        after_timestamp: Only return messages after this timestamp (defaults to your
+            last message's time). Pass the previous call's ``next_after`` to continue.
     """
     return whatsapp_wait_for_reply(recipient, timeout_seconds, after_timestamp)
 
