@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -789,6 +790,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+func openFile(path string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "linux":
+		cmd = exec.Command("xdg-open", path)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
+	default:
+		return
+	}
+	_ = cmd.Start()
+}
+
 func main() {
 	phoneFlag := flag.String("phone", "", "Phone number to pair via 8-digit code (e.g. 26481xxxxxxx) instead of QR code")
 	flag.Parse()
@@ -902,15 +918,15 @@ func main() {
 					fmt.Println(" Scan this QR code with WhatsApp (Settings -> Linked Devices):")
 					fmt.Println("=======================================================")
 
-					// Save crisp PNG image and open it in Preview
+					// Save crisp PNG image and open it in default viewer
 					if qrCode, err := qr.Encode(evt.Code, qr.L); err == nil {
 						pngData := qrCode.PNG()
 						qrPath := filepath.Join("store", "qrcode.png")
 						if err := os.WriteFile(qrPath, pngData, 0644); err == nil {
 							absPath, _ := filepath.Abs(qrPath)
 							fmt.Printf("\n--> Saved high-res QR code image to: %s\n", absPath)
-							fmt.Println("--> Opened image in Preview for easy scanning!")
-							_ = exec.Command("open", absPath).Start()
+							fmt.Println("--> Opened image in viewer for easy phone scanning!")
+							openFile(absPath)
 						}
 					}
 
