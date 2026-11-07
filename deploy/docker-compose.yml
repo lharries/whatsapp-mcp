@@ -1,0 +1,28 @@
+# One service per account; each has its own volume (its own keys/session).
+#   cp deploy/env.example deploy/main.env   # then fill it in
+#   docker compose -f deploy/docker-compose.yml up -d --build
+services:
+  wa-bridge-main:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file: [./main.env]
+    volumes:
+      - wa-data-main:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # A second number: uncomment, give it its own env file + volume + port.
+  # wa-bridge-second:
+  #   build: { context: .., dockerfile: deploy/Dockerfile }
+  #   restart: unless-stopped
+  #   init: true
+  #   env_file: [./second.env]
+  #   volumes: [ "wa-data-second:/data" ]
+  #   ports: [ "127.0.0.1:8081:8080" ]
+
+volumes:
+  wa-data-main:
+  # wa-data-second:

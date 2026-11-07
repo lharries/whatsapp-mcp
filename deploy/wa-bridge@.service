@@ -1,0 +1,37 @@
+# systemd template unit for the WhatsApp bridge.
+# One instance per account: `systemctl enable --now wa-bridge@main`.
+# Per-account settings live in /etc/whatsapp-mcp/<account>.env.
+[Unit]
+Description=WhatsApp MCP bridge (account %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wa
+Group=wa
+WorkingDirectory=/opt/whatsapp-mcp
+ExecStart=/opt/whatsapp-mcp/whatsapp-bridge/wa-bridge
+
+# Account identity + per-account store dir (the store is the account's keys —
+# treat it like a database, back it up, never commit it).
+Environment=WA_ACCOUNT=%i
+Environment=WA_DB_DIR=/var/lib/whatsapp-mcp/%i
+EnvironmentFile=-/etc/whatsapp-mcp/%i.env
+
+StateDirectory=whatsapp-mcp
+Restart=on-failure
+RestartSec=5
+# SIGTERM goes to the process; give it time to disconnect cleanly.
+KillMode=mixed
+TimeoutStopSec=30
+
+# Hardening: this only needs to reach WhatsApp and write its store.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/whatsapp-mcp
+
+[Install]
+WantedBy=multi-user.target
