@@ -21,8 +21,6 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal"
-	"rsc.io/qr"
 
 	"bytes"
 
@@ -51,14 +49,14 @@ type MessageStore struct {
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
+func NewMessageStore(dbPath string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -284,11 +282,11 @@ func sanitizePathComponent(s string) string {
 // safeStorePath joins sanitized components under the store directory and
 // verifies the result cannot escape it.
 func safeStorePath(parts ...string) (string, error) {
-	root, err := filepath.Abs("store")
+	root, err := filepath.Abs(storeRoot)
 	if err != nil {
 		return "", err
 	}
-	all := append([]string{"store"}, parts...)
+	all := append([]string{storeRoot}, parts...)
 	for i := 1; i < len(all); i++ {
 		all[i] = sanitizePathComponent(all[i])
 	}
@@ -654,6 +652,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Fan out incoming messages to the configured webhook so an agent can
+		// react without polling.
+		if !msg.Info.IsFromMe {
+			appCfg.emitWebhook(WebhookPayload{
+				Account:   appCfg.Account,
+				Event:     "message.received",
+				ChatJID:   chatJID,
+				ChatName:  name,
+				Sender:    sender,
+				MessageID: msg.Info.ID,
+				Text:      content,
+				MediaType: mediaType,
+				Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
+				IsGroup:   msg.Info.Chat.Server == "g.us",
+			})
+		}
 	}
 }
 
@@ -751,7 +766,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// First, check if we already have this file. The chat JID and the filename
 	// both come from outside (the model and the remote sender), so they are
 	// sanitized and confined to the store directory.
-	chatDir := filepath.Join("store", sanitizePathComponent(chatJID))
+	chatDir := filepath.Join(storeRoot, sanitizePathComponent(chatJID))
 	localPath := ""
 
 	// Get media info from the database
@@ -870,9 +885,11 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg Config) {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -918,7 +935,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -969,7 +986,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for resolving contacts, verifying registration, and checking new/canonical accounts
-	http.HandleFunc("/api/resolve_user", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/resolve_user", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("phone")
 		if query == "" {
 			query = r.URL.Query().Get("user")
@@ -1005,14 +1022,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server. Loopback only: this API can read and send WhatsApp
-	// messages, so it must not be reachable from other machines on the network.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Health check for supervisors and uptime monitors (left open, no token).
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"connected": client.IsConnected(),
+			"paired":    client.Store.ID != nil,
+			"account":   cfg.Account,
+		})
+	})
 
-	// Run server in a goroutine so it doesn't block
+	// Pairing over a link: a remote browser watches the QR / pairing code.
+	mux.HandleFunc("/pair", pairing.HandlePairPage)
+	mux.HandleFunc("/api/pair/status", func(w http.ResponseWriter, r *http.Request) {
+		pairing.HandlePairStatus(client, w, r)
+	})
+
+	// Loopback only: this API can read and send WhatsApp messages, so it must not
+	// be reachable from other machines on the network. Use a reverse proxy
+	// (Tailscale/nginx/Caddy) in front for remote access.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	fmt.Printf("Starting REST API server on %s (account %q)...\n", serverAddr, cfg.Account)
+	srv := &http.Server{Addr: serverAddr, Handler: withAuth(mux, cfg)}
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1039,24 +1072,30 @@ func main() {
 
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+
+	// Configuration from the environment (defaults suit local development).
+	cfg := LoadConfig()
+	storeDir, err := cfg.StoreDir()
+	if err != nil {
+		logger.Errorf("Failed to create store directory: %v", err)
+		return
+	}
+	cfg.DBDir = storeDir
+	appCfg = cfg
+	storeRoot = storeDir
+
+	logger.Infof("Starting WhatsApp client (account %q, store %s)...", appCfg.Account, storeDir)
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
-	}
-
 	// WAL on the whatsmeow store too, which the MCP server also reads.
-	if waDB, err := sql.Open("sqlite3", "file:store/whatsapp.db?_foreign_keys=on"); err == nil {
+	if waDB, err := sql.Open("sqlite3", "file:"+appCfg.whatsmeowDBPath()+"?_foreign_keys=on"); err == nil {
 		_, _ = waDB.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;")
 		waDB.Close()
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+appCfg.whatsmeowDBPath()+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -1068,7 +1107,7 @@ func main() {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
 			deviceStore = container.NewDevice()
-			logger.Infof("Created new device")
+			logger.Infof("Created new device (not yet paired)")
 		} else {
 			logger.Errorf("Failed to get device: %v", err)
 			return
@@ -1076,7 +1115,7 @@ func main() {
 	}
 	if deviceStore == nil {
 		deviceStore = container.NewDevice()
-		logger.Infof("Created new device")
+		logger.Infof("Created new device (not yet paired)")
 	}
 
 	// Create client instance
@@ -1087,7 +1126,7 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageStore, err := NewMessageStore(appCfg.messagesDBPath())
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -1109,106 +1148,29 @@ func main() {
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out — re-pair via the /pair link")
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start the REST server before pairing, so /pair and /healthz are reachable
+	// even when the account is not linked yet (a headless server has no terminal
+	// to show a QR code in).
+	startRESTServer(client, messageStore, appCfg)
 
-	// Connect to WhatsApp
-	if client.Store.ID == nil {
-		if *phoneFlag != "" {
-			err = client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
-			time.Sleep(1 * time.Second)
-			code, err := client.PairPhone(context.Background(), *phoneFlag, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
-			if err != nil {
-				logger.Errorf("Failed to generate pairing code: %v", err)
-				return
-			}
-			fmt.Println("\n=======================================================")
-			fmt.Printf(" WhatsApp Pairing Code: %s\n", code)
-			fmt.Println(" On your phone: WhatsApp -> Settings -> Linked Devices")
-			fmt.Println(" -> Link with phone number instead")
-			fmt.Println(" Enter the pairing code shown above.")
-			fmt.Print("=======================================================\n\n")
-		} else {
-			// No ID stored, this is a new client, need to pair with phone
-			qrChan, _ := client.GetQRChannel(context.Background())
-			err = client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
-
-			// Print QR code for pairing with phone
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					fmt.Println("\n=======================================================")
-					fmt.Println(" Scan this QR code with WhatsApp (Settings -> Linked Devices):")
-					fmt.Println("=======================================================")
-
-					// Save crisp PNG image and open it in default viewer
-					if qrCode, err := qr.Encode(evt.Code, qr.L); err == nil {
-						pngData := qrCode.PNG()
-						qrPath := filepath.Join("store", "qrcode.png")
-						if err := os.WriteFile(qrPath, pngData, 0644); err == nil {
-							absPath, _ := filepath.Abs(qrPath)
-							fmt.Printf("\n--> Saved high-res QR code image to: %s\n", absPath)
-							fmt.Println("--> Opened image in viewer for easy phone scanning!")
-							openFile(absPath)
-						}
-					}
-
-					// Also render in terminal using standard full ANSI blocks
-					qrterminal.GenerateWithConfig(evt.Code, qrterminal.Config{
-						Level:     qrterminal.L,
-						Writer:    os.Stdout,
-						BlackChar: qrterminal.WHITE,
-						WhiteChar: qrterminal.BLACK,
-						QuietZone: 2,
-					})
-				} else if evt.Event == "success" {
-					connected <- true
-					break
-				}
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for pairing/QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
+	if client.Store.ID != nil {
+		// Already paired: connect.
+		if err := client.Connect(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
-			return
+		} else {
+			fmt.Println("\n✓ Connected to WhatsApp.")
 		}
-		connected <- true
+	} else if *phoneFlag != "" {
+		// Pair with an 8-digit code (the /pair page offers the same flow).
+		pairing.StartPairCode(client, logger, *phoneFlag, nil)
+		fmt.Printf("\nPairing code requested for %s — see the bridge log, or open http://127.0.0.1:%d/pair\n", *phoneFlag, appCfg.Port)
+	} else {
+		fmt.Printf("\nNot paired. Open http://127.0.0.1:%d/pair to link this device.\n", appCfg.Port)
 	}
-
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
