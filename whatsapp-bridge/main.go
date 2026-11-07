@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -19,6 +21,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -787,6 +790,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	phoneFlag := flag.String("phone", "", "Phone number to pair via 8-digit code (e.g. 26481xxxxxxx) instead of QR code")
+	flag.Parse()
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -862,22 +868,64 @@ func main() {
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
+		if *phoneFlag != "" {
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			time.Sleep(1 * time.Second)
+			code, err := client.PairPhone(context.Background(), *phoneFlag, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+			if err != nil {
+				logger.Errorf("Failed to generate pairing code: %v", err)
+				return
+			}
+			fmt.Println("\n=======================================================")
+			fmt.Printf(" WhatsApp Pairing Code: %s\n", code)
+			fmt.Println(" On your phone: WhatsApp -> Settings -> Linked Devices")
+			fmt.Println(" -> Link with phone number instead")
+			fmt.Println(" Enter the pairing code shown above.")
+			fmt.Println("=======================================================\n")
+		} else {
+			// No ID stored, this is a new client, need to pair with phone
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+			// Print QR code for pairing with phone
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\n=======================================================")
+					fmt.Println(" Scan this QR code with WhatsApp (Settings -> Linked Devices):")
+					fmt.Println("=======================================================")
+
+					// Save crisp PNG image and open it in Preview
+					if qrCode, err := qr.Encode(evt.Code, qr.L); err == nil {
+						pngData := qrCode.PNG()
+						qrPath := filepath.Join("store", "qrcode.png")
+						if err := os.WriteFile(qrPath, pngData, 0644); err == nil {
+							absPath, _ := filepath.Abs(qrPath)
+							fmt.Printf("\n--> Saved high-res QR code image to: %s\n", absPath)
+							fmt.Println("--> Opened image in Preview for easy scanning!")
+							_ = exec.Command("open", absPath).Start()
+						}
+					}
+
+					// Also render in terminal using standard full ANSI blocks
+					qrterminal.GenerateWithConfig(evt.Code, qrterminal.Config{
+						Level:     qrterminal.L,
+						Writer:    os.Stdout,
+						BlackChar: qrterminal.WHITE,
+						WhiteChar: qrterminal.BLACK,
+						QuietZone: 2,
+					})
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
 			}
 		}
 
@@ -886,7 +934,7 @@ func main() {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+			logger.Errorf("Timeout waiting for pairing/QR code scan")
 			return
 		}
 	} else {
