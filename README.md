@@ -141,6 +141,16 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
+### Restricting recipients
+
+Any message you receive can contain instructions aimed at the agent. To limit where the agent can send messages and files, set `WHATSAPP_ALLOWED_RECIPIENTS` in the bridge's environment to a comma-separated list of phone numbers or JIDs. `self` stands for your own "Message yourself" chat:
+
+```bash
+WHATSAPP_ALLOWED_RECIPIENTS=self,447700900123,120363000000000000@g.us go run main.go
+```
+
+The bridge refuses to send anywhere else. When the variable is unset, it can send to anyone.
+
 ### Media Handling Features
 
 The MCP server supports both sending and receiving various media types:

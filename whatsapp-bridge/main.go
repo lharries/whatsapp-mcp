@@ -202,6 +202,32 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// recipientAllowed applies WHATSAPP_ALLOWED_RECIPIENTS, a comma-separated list
+// of phone numbers or JIDs that may receive messages, where "self" stands for
+// this account's own chat. Received messages can carry prompt injections aimed
+// at the agent, so this bounds where an agent can send data. Unset allows anyone.
+func recipientAllowed(client *whatsmeow.Client, jid types.JID) bool {
+	list, ok := os.LookupEnv("WHATSAPP_ALLOWED_RECIPIENTS")
+	if !ok {
+		return true
+	}
+	jid = jid.ToNonAD()
+	for _, allowed := range strings.Split(list, ",") {
+		switch allowed = strings.TrimSpace(allowed); allowed {
+		case "":
+		case "self":
+			if own := client.Store.ID; own != nil && jid.User == own.User && jid.Server == own.Server {
+				return true
+			}
+		default:
+			if allowed == jid.String() || (jid.Server == types.DefaultUserServer && allowed == jid.User) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -227,6 +253,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
 		}
+	}
+
+	if !recipientAllowed(client, recipientJID) {
+		return false, fmt.Sprintf("Recipient %s is not in WHATSAPP_ALLOWED_RECIPIENTS", recipientJID.ToNonAD())
 	}
 
 	msg := &waProto.Message{}
