@@ -183,10 +183,41 @@ func extractTextContent(msg *waProto.Message) string {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
+	} else if reaction := msg.GetReactionMessage(); reaction != nil {
+		if reaction.GetText() == "" {
+			return "[reaction removed]"
+		}
+		return fmt.Sprintf("[reaction: %s]", reaction.GetText())
+	} else if poll := extractPollCreationMessage(msg); poll != nil {
+		optionNames := make([]string, 0, len(poll.GetOptions()))
+		for _, opt := range poll.GetOptions() {
+			optionNames = append(optionNames, opt.GetOptionName())
+		}
+		return fmt.Sprintf("[poll: %s (options: %s)]", poll.GetName(), strings.Join(optionNames, ", "))
+	} else if msg.GetPollUpdateMessage() != nil {
+		// The actual selected option is end-to-end encrypted against the poll's
+		// EncKey, which we don't have access to here, so we can only note the vote.
+		return "[poll vote]"
 	}
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// extractPollCreationMessage returns the poll creation payload regardless of
+// which protocol version WhatsApp sent it as (the schema has been revised
+// more than once; clients keep adding new versioned fields for the same poll).
+func extractPollCreationMessage(msg *waProto.Message) *waProto.PollCreationMessage {
+	if poll := msg.GetPollCreationMessage(); poll != nil {
+		return poll
+	}
+	if poll := msg.GetPollCreationMessageV2(); poll != nil {
+		return poll
+	}
+	if poll := msg.GetPollCreationMessageV3(); poll != nil {
+		return poll
+	}
+	return nil
 }
 
 // SendMessageResponse represents the response for the send message API
