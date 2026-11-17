@@ -12,6 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
+    edit_message as whatsapp_edit_message,
+    delete_message as whatsapp_delete_message,
     download_media as whatsapp_download_media
 )
 
@@ -177,30 +179,33 @@ def send_message(
         }
     
     # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
+    success, status_message, message_id = whatsapp_send_message(recipient, message)
     return {
         "success": success,
-        "message": status_message
+        "message": status_message,
+        "message_id": message_id
     }
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str, caption: str = "") -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
+        caption: Optional text shown under the image, video or document
     
     Returns:
-        A dictionary containing success status and a status message
+        A dictionary containing success status, a status message and the ID of the sent message
     """
     
     # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    success, status_message, message_id = whatsapp_send_file(recipient, media_path, caption)
     return {
         "success": success,
-        "message": status_message
+        "message": status_message,
+        "message_id": message_id
     }
 
 @mcp.tool()
@@ -215,7 +220,44 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+    success, status_message, message_id = whatsapp_audio_voice_message(recipient, media_path)
+    return {
+        "success": success,
+        "message": status_message,
+        "message_id": message_id
+    }
+
+@mcp.tool()
+def edit_message(chat_jid: str, message_id: str, new_message: str) -> Dict[str, Any]:
+    """Edit the text of a message you sent. WhatsApp only allows edits for about 20 minutes after sending, and only for text messages.
+    
+    Args:
+        chat_jid: The JID of the chat the message is in (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        message_id: The ID of the message to edit (returned by send_message, or shown by list_messages)
+        new_message: The new text of the message
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_edit_message(chat_jid, message_id, new_message)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def delete_message(chat_jid: str, message_id: str, sender_jid: str = "") -> Dict[str, Any]:
+    """Delete a message for everyone in the chat. Works for messages you sent, and for other people's messages in groups where you are an admin.
+    
+    Args:
+        chat_jid: The JID of the chat the message is in (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        message_id: The ID of the message to delete (returned by send_message or send_file, or shown by list_messages)
+        sender_jid: Only for deleting someone else's message as a group admin: the JID of the person who sent it
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_delete_message(chat_jid, message_id, sender_jid)
     return {
         "success": success,
         "message": status_message
