@@ -7,8 +7,46 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store')
+MESSAGES_DB_PATH = os.path.join(BRIDGE_STORE_DIR, 'messages.db')
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://127.0.0.1:8080/api")
+
+# Files the bridge (and these tools) may send. Must match the bridge's WHATSAPP_SEND_MEDIA_DIR.
+SEND_MEDIA_DIR = os.path.realpath(
+    os.environ.get("WHATSAPP_SEND_MEDIA_DIR") or os.path.join(BRIDGE_STORE_DIR, "outbox")
+)
+
+
+def _api_token() -> str:
+    """Token for the bridge REST API: WHATSAPP_BRIDGE_TOKEN env var, else store/api_token."""
+    token = os.environ.get("WHATSAPP_BRIDGE_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        with open(os.path.join(BRIDGE_STORE_DIR, "api_token")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _post(url: str, payload: dict) -> requests.Response:
+    return requests.post(
+        url,
+        json=payload,
+        headers={"Authorization": f"Bearer {_api_token()}"},
+        timeout=60,
+    )
+
+
+def _resolve_media_path(media_path: str) -> Tuple[Optional[str], str]:
+    """Return (resolved_path, "") if media_path is a file inside SEND_MEDIA_DIR, else (None, error)."""
+    candidate = media_path if os.path.isabs(media_path) else os.path.join(SEND_MEDIA_DIR, media_path)
+    resolved = os.path.realpath(candidate)
+    if os.path.commonpath([SEND_MEDIA_DIR, resolved]) != SEND_MEDIA_DIR:
+        return None, f"Media file must be inside {SEND_MEDIA_DIR} (set WHATSAPP_SEND_MEDIA_DIR to change it)"
+    if not os.path.isfile(resolved):
+        return None, f"Media file not found: {media_path}"
+    return resolved, ""
 
 @dataclass
 class Message:
@@ -634,7 +672,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = _post(url, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -659,8 +697,9 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+        media_path, error = _resolve_media_path(media_path)
+        if media_path is None:
+            return False, error
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
@@ -668,7 +707,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _post(url, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -693,12 +732,13 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+        media_path, error = _resolve_media_path(media_path)
+        if media_path is None:
+            return False, error
 
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
+                media_path = audio.convert_to_opus_ogg_temp(media_path, output_dir=SEND_MEDIA_DIR)
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
@@ -708,7 +748,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _post(url, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -741,7 +781,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = _post(url, payload)
         
         if response.status_code == 200:
             result = response.json()

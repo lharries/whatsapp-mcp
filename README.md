@@ -106,6 +106,18 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+### Bridge API Security
+
+The bridge's REST API (`/api/send`, `/api/download`) can send messages as you, so it is locked down by default:
+
+- **Localhost only.** It listens on `127.0.0.1:8080`. Set `WHATSAPP_BRIDGE_HOST` (e.g. `0.0.0.0`) only if you really need LAN access.
+- **Token required.** On first start the bridge writes a random token to `whatsapp-bridge/store/api_token` (mode 0600), and every request must send `Authorization: Bearer <token>`. The MCP server reads that file automatically. To choose the token yourself, set `WHATSAPP_BRIDGE_TOKEN` for both processes.
+- **Media outbox.** `send_file` and `send_audio_message` only send files inside `whatsapp-bridge/store/outbox/`. Copy files there first, or set `WHATSAPP_SEND_MEDIA_DIR` to the same directory for both the bridge and the MCP server.
+- **Safe downloads.** Filenames of received media are reduced to a single path component, so a sender can't write outside `store/`.
+- **Private store.** `store/` (session keys and message history) is created with mode 0700, and downloaded media with 0600.
+
+Incoming messages are untrusted input to the LLM. Consider requiring manual approval for the `send_*` tools in your MCP client.
+
 ## Architecture Overview
 
 This application consists of two main components:
