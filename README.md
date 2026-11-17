@@ -136,9 +136,11 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
+- **send_message**: Send a WhatsApp message to a specified phone number or group JID (returns the ID of the sent message)
+- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient, with an optional caption
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **edit_message**: Edit the text of a message you sent
+- **delete_message**: Delete a message for everyone (your own messages, or other people's in groups you admin)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
 ### Media Handling Features
@@ -158,6 +160,15 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+### Editing and Deleting Messages
+
+Every send tool returns the ID of the message it sent, and `list_messages` shows the ID of every message, so a message can be changed or removed later:
+
+- **edit_message** takes the chat JID, the message ID and the new text. WhatsApp only allows editing your own text messages, and only for about 20 minutes after sending. The tool says so plainly when a message is too old, has media, or was sent by someone else.
+- **delete_message** takes the chat JID and the message ID and deletes it for everyone. To delete someone else's message in a group where you are an admin, also pass `sender_jid`.
+
+Messages sent through the MCP are now saved in the local database too, so they show up in `list_messages` straight away.
 
 ## Technical Details
 
