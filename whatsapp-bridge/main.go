@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -256,6 +257,22 @@ func parseRecipientJID(recipient string) (types.JID, error) {
 	}, nil
 }
 
+var mentionPattern = regexp.MustCompile(`@(\d{8,16})\b`)
+
+// mentionedJIDs turns each "@<digits>" in a message into a JID: 15 or more digits is a group member's hidden id
+// (@lid), fewer is a phone number with its country code.
+func mentionedJIDs(message string) []string {
+	var out []string
+	for _, m := range mentionPattern.FindAllStringSubmatch(message, -1) {
+		server := "s.whatsapp.net"
+		if len(m[1]) >= 15 {
+			server = "lid"
+		}
+		out = append(out, m[1]+"@"+server)
+	}
+	return out
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
@@ -427,6 +444,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if mentions := mentionedJIDs(message); len(mentions) > 0 {
+		// "@<id>" in the text becomes a real tag, so the person is notified.
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{Text: proto.String(message), ContextInfo: &waProto.ContextInfo{MentionedJID: mentions}}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
@@ -484,7 +504,11 @@ func editWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, c
 		return false, fmt.Sprintf("Error reading message: %v", err)
 	}
 
-	edit := client.BuildEdit(chat, messageID, &waProto.Message{Conversation: proto.String(newText)})
+	body := &waProto.Message{Conversation: proto.String(newText)}
+	if mentions := mentionedJIDs(newText); len(mentions) > 0 {
+		body = &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{Text: proto.String(newText), ContextInfo: &waProto.ContextInfo{MentionedJID: mentions}}}
+	}
+	edit := client.BuildEdit(chat, messageID, body)
 	if _, err := client.SendMessage(context.Background(), chat, edit); err != nil {
 		return false, fmt.Sprintf("Error editing message: %v", err)
 	}
